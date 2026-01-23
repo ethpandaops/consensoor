@@ -371,17 +371,23 @@ def process_operations(state: "BeaconState", body, is_gloas: bool = False) -> No
         f"Too many voluntary exits: {len(body.voluntary_exits)}"
     )
 
+    from ...crypto import hash_tree_root as _htr
+
     # Process proposer slashings
-    for proposer_slashing in body.proposer_slashings:
+    for i, proposer_slashing in enumerate(body.proposer_slashings):
         process_proposer_slashing(state, proposer_slashing)
+    print(f"    DEBUG ops: after {len(body.proposer_slashings)} prop_slash, state={_htr(state).hex()[:16]}")
 
     # Process attester slashings
-    for attester_slashing in body.attester_slashings:
+    for i, attester_slashing in enumerate(body.attester_slashings):
         process_attester_slashing(state, attester_slashing)
+    print(f"    DEBUG ops: after {len(body.attester_slashings)} att_slash, state={_htr(state).hex()[:16]}")
 
     # Process attestations
-    for attestation in body.attestations:
+    for i, attestation in enumerate(body.attestations):
         process_attestation(state, attestation)
+        if i < 3 or i == len(body.attestations) - 1:
+            print(f"    DEBUG ops: after att[{i}], state={_htr(state).hex()[:16]}")
 
     # Process deposits
     if hasattr(state, "deposit_requests_start_index"):
