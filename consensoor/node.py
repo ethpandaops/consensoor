@@ -393,8 +393,9 @@ class BeaconNode:
         epoch = slot // slots_per_epoch
         logger.info(f"Slot {slot} (epoch {epoch})")
 
-        # Update head slot to track chain progress
-        self.head_slot = slot
+        # NOTE: Don't update head_slot here - it should only be updated when we
+        # actually have a block for a slot (either produced locally or received via P2P)
+        # The head_slot tracks the slot of the actual chain head, not the current clock
 
         if slot % slots_per_epoch == 0:
             logger.info(f"New epoch: {epoch}")
@@ -664,26 +665,76 @@ class BeaconNode:
             signed_block = decode_signed_beacon_block(data)
             block = signed_block.message
             block_root = hash_tree_root(block)
+            parent_root = bytes(block.parent_root)
 
             logger.info(
                 f"P2P: Received block slot={block.slot}, "
-                f"root={block_root.hex()[:16]}, from={from_peer[:16]}"
+                f"root={block_root.hex()[:16]}, parent={parent_root.hex()[:16]}, "
+                f"from={from_peer[:16]}"
             )
 
             if self.store.get_block(block_root):
                 logger.debug(f"Block already known: {block_root.hex()[:16]}")
                 return
 
+            # Check if this block builds on our current head
+            # If not, we can't apply it without state regeneration
+            logger.debug(
+                f"P2P: Parent check: parent_root={parent_root.hex()[:16]}, "
+                f"head_root={self.head_root.hex()[:16] if self.head_root else 'None'}, "
+                f"match={parent_root == self.head_root if self.head_root else 'N/A'}"
+            )
+            if self.head_root and parent_root != self.head_root:
+                # Check if the parent is in our store (we know about it)
+                if not self.store.get_block(parent_root):
+                    logger.warning(
+                        f"P2P: Ignoring block slot={block.slot} - parent {parent_root.hex()[:16]} "
+                        f"not found (our head={self.head_root.hex()[:16] if self.head_root else 'None'})"
+                    )
+                    # Store the block anyway for later processing
+                    self.store.save_block(block_root, signed_block)
+                    return
+                else:
+                    logger.warning(
+                        f"P2P: Block slot={block.slot} builds on different chain "
+                        f"(parent={parent_root.hex()[:16]}, our head={self.head_root.hex()[:16]}). "
+                        f"Would need state regeneration to apply."
+                    )
+                    # Store the block anyway for later processing
+                    self.store.save_block(block_root, signed_block)
+                    return
+
             self.store.save_block(block_root, signed_block)
 
-            if int(block.slot) > self.head_slot:
-                self.head_slot = int(block.slot)
-                self.head_root = block_root
-                self.store.set_head(block_root)
+            logger.debug(
+                f"P2P: Block saved. slot={block.slot}, head_slot={self.head_slot}, "
+                f"head_root={self.head_root.hex()[:16] if self.head_root else 'None'}"
+            )
 
-                # Apply full state transition
-                await self._apply_block_to_state(block, block_root, signed_block)
-                await self._update_forkchoice()
+            if int(block.slot) > self.head_slot:
+                logger.info(f"P2P: Attempting to adopt block slot={block.slot} as new head")
+                # Apply state transition FIRST, only update head if successful
+                old_head = self.head_root
+                try:
+                    logger.debug(f"P2P: Calling _apply_block_to_state for slot={block.slot}")
+                    await self._apply_block_to_state(block, block_root, signed_block)
+                    logger.debug(f"P2P: _apply_block_to_state succeeded for slot={block.slot}")
+                    # State transition succeeded, update head
+                    self.head_slot = int(block.slot)
+                    self.head_root = block_root
+                    self.store.set_head(block_root)
+                    logger.info(
+                        f"P2P: Adopted block as new head: slot={block.slot}, "
+                        f"root={block_root.hex()[:16]}"
+                    )
+                    await self._update_forkchoice()
+                except Exception as e:
+                    logger.warning(
+                        f"P2P: Failed to apply block slot={block.slot}: {e}. "
+                        f"Keeping head at {old_head.hex()[:16] if old_head else 'None'}"
+                    )
+            else:
+                logger.debug(f"P2P: Block slot={block.slot} not newer than head_slot={self.head_slot}")
 
         except Exception as e:
             logger.error(f"Error processing P2P block: {e}")
@@ -703,63 +754,44 @@ class BeaconNode:
         """Apply a received block to the local state using full state transition.
 
         Executes the complete state transition function per the consensus specs.
+        Raises an exception if state transition fails.
 
         Args:
             block: Beacon block to apply
             block_root: Root hash of the block
             signed_block: Optional signed block for signature verification
+
+        Raises:
+            Exception: If state transition fails for any reason
         """
         if not self.state:
+            raise ValueError("No state available")
+
+        from .spec.state_transition import state_transition, process_slots, process_block
+
+        # If we have a signed block, use full state transition with signature verification
+        if signed_block is not None:
+            new_state = state_transition(
+                self.state, signed_block, validate_result=False
+            )
+            self.state = new_state
+            logger.info(
+                f"Full state transition applied: slot={block.slot}, "
+                f"block_hash={bytes(block.body.execution_payload.block_hash).hex()[:16] if hasattr(block.body, 'execution_payload') else 'N/A'}, "
+                f"latest_header_slot={self.state.latest_block_header.slot}"
+            )
             return
 
-        try:
-            from .spec.state_transition import state_transition, process_slots, process_block
-
-            # If we have a signed block, use full state transition with signature verification
-            if signed_block is not None:
-                try:
-                    new_state = state_transition(
-                        self.state, signed_block, validate_result=False
-                    )
-                    self.state = new_state
-                    logger.info(
-                        f"Full state transition applied: slot={block.slot}, "
-                        f"block_hash={bytes(block.body.execution_payload.block_hash).hex()[:16] if hasattr(block.body, 'execution_payload') else 'N/A'}, "
-                        f"latest_header_slot={self.state.latest_block_header.slot}"
-                    )
-                    return
-                except Exception as e:
-                    logger.warning(
-                        f"Full state transition failed, falling back to simplified: {e}"
-                    )
-
-            # Fallback: process slots to advance state, then process block
-            # This handles cases where we don't have the signed block
-            try:
-                target_slot = int(block.slot)
-                if target_slot > int(self.state.slot):
-                    process_slots(self.state, target_slot)
-                process_block(self.state, block)
-                logger.info(
-                    f"Block processed: slot={block.slot}, "
-                    f"block_hash={bytes(block.body.execution_payload.block_hash).hex()[:16] if hasattr(block.body, 'execution_payload') else 'N/A'}, "
-                    f"latest_header_slot={self.state.latest_block_header.slot}"
-                )
-            except AssertionError as e:
-                logger.warning(f"Block validation failed: {e}")
-                # Apply minimal state updates for chain tracking
-                await self._apply_minimal_block_update(block)
-            except Exception as e:
-                logger.warning(f"Block processing failed, applying minimal update: {e}")
-                await self._apply_minimal_block_update(block)
-
-        except ImportError as e:
-            logger.warning(f"State transition module not available: {e}")
-            await self._apply_minimal_block_update(block)
-        except Exception as e:
-            logger.error(f"Failed to apply block to state: {e}")
-            import traceback
-            traceback.print_exc()
+        # Fallback: process slots to advance state, then process block
+        target_slot = int(block.slot)
+        if target_slot > int(self.state.slot):
+            process_slots(self.state, target_slot)
+        process_block(self.state, block)
+        logger.info(
+            f"Block processed: slot={block.slot}, "
+            f"block_hash={bytes(block.body.execution_payload.block_hash).hex()[:16] if hasattr(block.body, 'execution_payload') else 'N/A'}, "
+            f"latest_header_slot={self.state.latest_block_header.slot}"
+        )
 
     async def _apply_minimal_block_update(self, block) -> None:
         """Apply minimal block updates when full state transition fails.

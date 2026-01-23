@@ -29,4 +29,6 @@ venv/
 .DS_Store
 data/
 tests/spec-tests
+py-libp2p-local/
 test-results/
+py-libp2p-local/
