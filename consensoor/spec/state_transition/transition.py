@@ -261,9 +261,11 @@ def process_block(state: "BeaconState", block: "BeaconBlock") -> None:
         process_payload_attestations,
     )
     from .helpers.predicates import is_execution_enabled
+    from ...crypto import hash_tree_root as _htr
 
     # Process block header
     process_block_header(state, block)
+    print(f"  DEBUG process_block: after header, state={_htr(state).hex()[:16]}")
 
     # Check if this is a Gloas block (ePBS)
     is_gloas_block = hasattr(block.body, "signed_execution_payload_bid")
@@ -281,19 +283,24 @@ def process_block(state: "BeaconState", block: "BeaconBlock") -> None:
                 process_withdrawals(state, block.body.execution_payload)
 
             process_execution_payload(state, block.body)
+            print(f"  DEBUG process_block: after exec_payload, state={_htr(state).hex()[:16]}")
 
     # Process randao
     process_randao(state, block.body)
+    print(f"  DEBUG process_block: after randao, state={_htr(state).hex()[:16]}")
 
     # Process eth1 data
     process_eth1_data(state, block.body)
+    print(f"  DEBUG process_block: after eth1, state={_htr(state).hex()[:16]}")
 
     # Process operations
     process_operations(state, block.body, is_gloas=is_gloas_block)
+    print(f"  DEBUG process_block: after operations, state={_htr(state).hex()[:16]}")
 
     # Process sync aggregate (Altair+)
     if hasattr(block.body, "sync_aggregate"):
         process_sync_aggregate(state, block.body.sync_aggregate)
+        print(f"  DEBUG process_block: after sync_agg, state={_htr(state).hex()[:16]}")
 
     # Process payload attestations (Gloas)
     if is_gloas_block and hasattr(block.body, "payload_attestations"):
