@@ -421,9 +421,12 @@ def process_operations(state: "BeaconState", body, is_gloas: bool = False) -> No
             f"expected {expected_deposits}"
         )
 
-    for deposit in body.deposits:
+    for i, deposit in enumerate(body.deposits):
+        before = _htr(state).hex()[:16]
         process_deposit(state, deposit)
-    print(f"    DEBUG ops: after {len(body.deposits)} deposits, state={_htr(state).hex()[:16]}")
+        after = _htr(state).hex()[:16]
+        if before != after or i < 3:
+            print(f"    DEBUG ops: deposit[{i}] {before} -> {after}")
 
     # Process voluntary exits
     for voluntary_exit in body.voluntary_exits:
