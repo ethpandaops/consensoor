@@ -115,9 +115,14 @@ def apply_deposit(
     is_electra = hasattr(state, "pending_deposits")
     validator_pubkeys = [bytes(v.pubkey) for v in state.validators]
 
-    if pubkey not in validator_pubkeys:
+    is_new = pubkey not in validator_pubkeys
+    print(f"      DEBUG deposit: pubkey={pubkey.hex()[:16]}, is_new={is_new}, validators={len(validator_pubkeys)}")
+
+    if is_new:
         # New validator - verify signature first
-        if is_valid_deposit_signature(pubkey, withdrawal_credentials, amount, signature):
+        sig_valid = is_valid_deposit_signature(pubkey, withdrawal_credentials, amount, signature)
+        print(f"      DEBUG deposit: new validator, sig_valid={sig_valid}")
+        if sig_valid:
             if is_electra:
                 add_validator_to_registry(state, pubkey, withdrawal_credentials, 0)
             else:
@@ -141,6 +146,7 @@ def apply_deposit(
         )
     elif pubkey in validator_pubkeys:
         index = validator_pubkeys.index(pubkey)
+        print(f"      DEBUG deposit: existing validator index={index}, adding {amount}")
         increase_balance(state, index, amount)
 
 

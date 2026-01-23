@@ -111,7 +111,6 @@ class BlockBuilder:
         execution_payload_dict: dict,
     ) -> Optional[AnySignedBeaconBlock]:
         """Build a complete signed beacon block."""
-        import copy
         from ..spec.state_transition import process_slots, process_block
 
         state = self.node.state
@@ -128,7 +127,8 @@ class BlockBuilder:
         logger.debug(f"Building block for fork: {fork}")
 
         # Work on a copy of the state to compute state_root
-        temp_state = copy.deepcopy(state)
+        # Use SSZ round-trip instead of copy.deepcopy for deterministic behavior across architectures
+        temp_state = state.__class__.decode_bytes(bytes(state.encode_bytes()))
 
         # Process slots to advance state (fills in latest_block_header.state_root)
         if slot > int(temp_state.slot):

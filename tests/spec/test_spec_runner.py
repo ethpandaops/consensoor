@@ -27,6 +27,13 @@ def load_ssz_snappy(path: Path, ssz_type: Type) -> Any:
     return ssz_type.decode_bytes(decompressed)
 
 
+def ssz_copy(obj: Any) -> Any:
+    """Create a deterministic copy of an SSZ object via encode/decode."""
+    if hasattr(obj, "encode_bytes"):
+        return obj.__class__.decode_bytes(bytes(obj.encode_bytes()))
+    return copy.deepcopy(obj)
+
+
 def get_spec_tests_dir(config) -> Path:
     """Get the spec tests directory, using preset-based default if not specified."""
     spec_dir = config.getoption("--spec-tests-dir")
@@ -537,10 +544,13 @@ def discover_shuffling_tests(spec_tests_dir: Path):
         shuffling_dir = fork_dir / "shuffling" / "core" / "shuffle"
         if not shuffling_dir.exists():
             continue
-        for case_file in sorted(shuffling_dir.glob("*.yaml")):
-            if case_file.name == "mapping.yaml":
+        for case_dir in sorted(shuffling_dir.iterdir()):
+            if not case_dir.is_dir():
                 continue
-            case_id = f"{fork}/shuffling/{case_file.stem}"
+            case_file = case_dir / "mapping.yaml"
+            if not case_file.exists():
+                continue
+            case_id = f"{fork}/shuffling/{case_dir.name}"
             test_cases.append((case_id, fork, case_file))
     return test_cases
 
@@ -710,7 +720,7 @@ class TestOperations:
         else:
             operation = load_ssz_snappy(op_file, op_type)
 
-        state_copy = copy.deepcopy(pre_state)
+        state_copy = ssz_copy(pre_state)
 
         try:
             if op_name == "block_header":
@@ -797,7 +807,7 @@ class TestEpochProcessing:
         expects_failure = not post_file.exists()
 
         pre_state = load_ssz_snappy(pre_file, state_type)
-        state_copy = copy.deepcopy(pre_state)
+        state_copy = ssz_copy(pre_state)
 
         try:
             processor(state_copy)
@@ -839,7 +849,7 @@ class TestSanityBlocks:
         bls_setting = meta.get("bls_setting", 1)
 
         pre_state = load_ssz_snappy(pre_file, state_type)
-        state = copy.deepcopy(pre_state)
+        state = ssz_copy(pre_state)
 
         block_files = sorted(
             case_path.glob("blocks_*.ssz_snappy"),
@@ -883,7 +893,7 @@ class TestSanitySlots:
         slots_file = case_path / "slots.yaml"
 
         pre_state = load_ssz_snappy(pre_file, state_type)
-        state = copy.deepcopy(pre_state)
+        state = ssz_copy(pre_state)
 
         slots_data = load_yaml(slots_file)
         target_slot = int(state.slot) + slots_data
@@ -924,7 +934,7 @@ class TestFinality:
         blocks_count = meta.get("blocks_count", 0)
 
         pre_state = load_ssz_snappy(pre_file, state_type)
-        state = copy.deepcopy(pre_state)
+        state = ssz_copy(pre_state)
 
         for i in range(blocks_count):
             block_file = case_path / f"blocks_{i}.ssz_snappy"
@@ -957,7 +967,7 @@ class TestRandom:
         post_file = case_path / "post.ssz_snappy"
 
         pre_state = load_ssz_snappy(pre_file, state_type)
-        state = copy.deepcopy(pre_state)
+        state = ssz_copy(pre_state)
 
         block_files = sorted(
             case_path.glob("blocks_*.ssz_snappy"),
