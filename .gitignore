@@ -28,5 +28,5 @@ venv/
 *.swo
 .DS_Store
 data/
-tests/
+tests/spec-tests
 test-results/
