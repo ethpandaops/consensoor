@@ -90,7 +90,9 @@ def is_valid_deposit_signature(
 
     domain = compute_domain(DOMAIN_DEPOSIT, get_config().genesis_fork_version, b"\x00" * 32)
     signing_root = compute_signing_root(deposit_message, domain)
-    return bls_verify([pubkey], signing_root, signature)
+    result = bls_verify([pubkey], signing_root, signature)
+    print(f"        DEBUG bls_verify: domain={domain.hex()[:16]}, signing_root={signing_root.hex()[:16]}, result={result}")
+    return result
 
 
 def apply_deposit(
