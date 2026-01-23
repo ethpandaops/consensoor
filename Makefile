@@ -4,6 +4,7 @@
 SPEC_VERSION ?= v1.7.0-alpha.1
 SPEC_TESTS_DIR := tests/spec-tests
 DEFAULT_PRESET := mainnet
+PYTEST_PARALLEL := -n auto
 
 # Supported forks and presets
 FORKS := phase0 altair bellatrix capella deneb electra fulu gloas
@@ -114,17 +115,17 @@ clean-cache:
 # Internal target to run tests
 _run-test: clean-cache fetch-tests-$(PRESET)
 	@if [ "$(FORK)" = "all" ]; then \
-		echo "Running ALL spec tests ($(PRESET))..."; \
-		python3 -m pytest tests/spec/ -v --preset=$(PRESET) \
+		echo "Running ALL spec tests ($(PRESET)) [parallel: $(PYTEST_PARALLEL)]..."; \
+		python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=$(PRESET) \
 			--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/$(PRESET) 2>&1; \
 	elif [ "$(FORK)" = "gloas" ] && [ ! -d "$(SPEC_TESTS_DIR)/tests/$(PRESET)/gloas" ]; then \
-		echo "Running gloas spec tests ($(PRESET))..."; \
+		echo "Running gloas spec tests ($(PRESET)) [parallel: $(PYTEST_PARALLEL)]..."; \
 		echo "Note: Gloas (ePBS) not in mainline spec tests yet."; \
 		echo "Running local gloas tests..."; \
-		python3 -m pytest tests/spec/test_gloas.py -v --preset=$(PRESET) 2>&1 || true; \
+		python3 -m pytest tests/spec/test_gloas.py -v $(PYTEST_PARALLEL) --preset=$(PRESET) 2>&1 || true; \
 	else \
-		echo "Running $(FORK) spec tests ($(PRESET))..."; \
-		python3 -m pytest tests/spec/ -v --preset=$(PRESET) \
+		echo "Running $(FORK) spec tests ($(PRESET)) [parallel: $(PYTEST_PARALLEL)]..."; \
+		python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=$(PRESET) \
 			--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/$(PRESET) \
 			-k "$(FORK)" 2>&1; \
 	fi

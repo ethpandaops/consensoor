@@ -34,6 +34,20 @@ from ...helpers.attestation import (
 )
 from ...helpers.misc import compute_epoch_at_slot
 
+
+def _is_gloas_state(state) -> bool:
+    """Check if state is a gloas (ePBS) state.
+
+    Uses try/except because remerkleable containers may raise exceptions
+    for unknown attributes instead of returning AttributeError.
+    """
+    try:
+        _ = state.builders
+        return True
+    except Exception:
+        return False
+
+
 if TYPE_CHECKING:
     from ....types import BeaconState
     from ....types.electra import Attestation
@@ -163,7 +177,7 @@ def process_attestation_altair(state: "BeaconState", attestation: "Attestation")
 
         # In Electra, data.index must be 0 (committee selection uses committee_bits)
         # In Gloas (ePBS), data.index can be 0 or 1
-        is_gloas = hasattr(state, "builders")
+        is_gloas = _is_gloas_state(state)
         if not is_gloas:
             assert int(data.index) == 0, (
                 f"Attestation data.index must be 0 in Electra, got {data.index}"
@@ -250,7 +264,7 @@ def process_attestation_altair(state: "BeaconState", attestation: "Attestation")
     # Update epoch participation
     proposer_reward_numerator = 0
     is_current_epoch = int(data.target.epoch) == current_epoch
-    is_gloas = hasattr(state, "builder_pending_payments")
+    is_gloas = _is_gloas_state(state)
 
     if is_gloas:
         if is_current_epoch:

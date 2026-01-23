@@ -110,7 +110,7 @@ def get_min_slashing_penalty_quotient(state: "BeaconState") -> int:
     """Get the minimum slashing penalty quotient for the current fork.
 
     Returns:
-        - Phase0: MIN_SLASHING_PENALTY_QUOTIENT (64)
+        - Phase0: MIN_SLASHING_PENALTY_QUOTIENT (128 on mainnet, 64 on minimal)
         - Altair: MIN_SLASHING_PENALTY_QUOTIENT_ALTAIR (64)
         - Bellatrix+Capella+Deneb: MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX (32)
         - Electra+: MIN_SLASHING_PENALTY_QUOTIENT_ELECTRA (4096)
@@ -121,7 +121,7 @@ def get_min_slashing_penalty_quotient(state: "BeaconState") -> int:
         return MIN_SLASHING_PENALTY_QUOTIENT_BELLATRIX
     if hasattr(state, "previous_epoch_participation"):
         return MIN_SLASHING_PENALTY_QUOTIENT_ALTAIR
-    return MIN_SLASHING_PENALTY_QUOTIENT
+    return MIN_SLASHING_PENALTY_QUOTIENT()
 
 
 def get_whistleblower_reward_quotient(state: "BeaconState") -> int:

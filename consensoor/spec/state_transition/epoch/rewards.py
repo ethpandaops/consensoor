@@ -227,7 +227,9 @@ def get_inactivity_penalty_deltas_phase0(state: "BeaconState") -> Tuple[Sequence
 
             if index not in matching_target_attesting_indices:
                 effective_balance = int(state.validators[index].effective_balance)
-                penalties[index] += effective_balance * get_finality_delay(state) // INACTIVITY_PENALTY_QUOTIENT
+                penalties[index] += (
+                    effective_balance * get_finality_delay(state) // INACTIVITY_PENALTY_QUOTIENT()
+                )
 
     return rewards, penalties
 

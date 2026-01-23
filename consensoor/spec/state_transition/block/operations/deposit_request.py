@@ -10,6 +10,19 @@ if TYPE_CHECKING:
     from ....types.electra import DepositRequest
 
 
+def _is_gloas_state(state) -> bool:
+    """Check if state is a gloas (ePBS) state.
+
+    Uses try/except because remerkleable containers may raise exceptions
+    for unknown attributes instead of returning AttributeError.
+    """
+    try:
+        _ = state.builders
+        return True
+    except Exception:
+        return False
+
+
 def process_deposit_request(
     state: "BeaconState", deposit_request: "DepositRequest"
 ) -> None:
@@ -69,27 +82,38 @@ def process_deposit_request(
                 int(state.builders[builder_index].balance) + int(amount)
             )
 
-    # Set deposit request start index on first deposit request (pre-Gloas)
-    if (
-        not hasattr(state, "builders")
-        and int(state.deposit_requests_start_index) == UNSET_DEPOSIT_REQUESTS_START_INDEX
-    ):
-        state.deposit_requests_start_index = int(deposit_request.index)
+    # Gloas: handle deposits differently (no deposit_requests_start_index update)
+    if _is_gloas_state(state):
+        builder_pubkeys = [b.pubkey for b in state.builders]
+        validator_pubkeys = [v.pubkey for v in state.validators]
+        is_builder = deposit_request.pubkey in builder_pubkeys
+        is_validator = deposit_request.pubkey in validator_pubkeys
+        is_builder_prefix = is_builder_withdrawal_credential(bytes(deposit_request.withdrawal_credentials))
 
-    builder_pubkeys = [b.pubkey for b in state.builders]
-    validator_pubkeys = [v.pubkey for v in state.validators]
-    is_builder = deposit_request.pubkey in builder_pubkeys
-    is_validator = deposit_request.pubkey in validator_pubkeys
-    is_builder_prefix = is_builder_withdrawal_credential(bytes(deposit_request.withdrawal_credentials))
+        if is_builder or (is_builder_prefix and not is_validator):
+            apply_deposit_for_builder(
+                deposit_request.pubkey,
+                deposit_request.withdrawal_credentials,
+                deposit_request.amount,
+                deposit_request.signature,
+            )
+            return
 
-    if is_builder or (is_builder_prefix and not is_validator):
-        apply_deposit_for_builder(
-            deposit_request.pubkey,
-            deposit_request.withdrawal_credentials,
-            deposit_request.amount,
-            deposit_request.signature,
+        # Gloas validator deposits: add to pending_deposits without setting start index
+        state.pending_deposits.append(
+            PendingDeposit(
+                pubkey=deposit_request.pubkey,
+                withdrawal_credentials=deposit_request.withdrawal_credentials,
+                amount=int(deposit_request.amount),
+                signature=deposit_request.signature,
+                slot=int(state.slot),
+            )
         )
         return
+
+    # Set deposit request start index on first deposit request (Electra/Fulu only)
+    if int(state.deposit_requests_start_index) == UNSET_DEPOSIT_REQUESTS_START_INDEX:
+        state.deposit_requests_start_index = int(deposit_request.index)
 
     state.pending_deposits.append(
         PendingDeposit(

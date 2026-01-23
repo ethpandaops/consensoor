@@ -126,8 +126,14 @@ HYSTERESIS_UPWARD_MULTIPLIER: Final[int] = 5
 BASE_REWARD_FACTOR: Final[int] = 64
 WHISTLEBLOWER_REWARD_QUOTIENT: Final[int] = 512
 PROPOSER_REWARD_QUOTIENT: Final[int] = 8
-INACTIVITY_PENALTY_QUOTIENT: Final[int] = 2**25  # 33554432
-MIN_SLASHING_PENALTY_QUOTIENT: Final[int] = 64
+
+
+def INACTIVITY_PENALTY_QUOTIENT() -> int:
+    return 2**26 if _config.preset == "mainnet" else 2**25
+
+
+def MIN_SLASHING_PENALTY_QUOTIENT() -> int:
+    return 128 if _config.preset == "mainnet" else 64
 
 
 def PROPORTIONAL_SLASHING_MULTIPLIER() -> int:
