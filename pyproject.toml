@@ -3,7 +3,7 @@ name = "consensoor"
 version = "0.1.0"
 description = "Lightweight Python consensus layer client for local testing"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.13"  # Python 3.13 breaks remerkleable SSZ hash_tree_root
 dependencies = [
     "remerkleable>=0.1.28",
     "py_ecc>=7.0.0",
