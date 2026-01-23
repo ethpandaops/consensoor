@@ -69,6 +69,7 @@ def state_transition(
             "State root mismatch"
         )
 
+    print(f"DEBUG: state_transition returning, state_hash={_htr(state).hex()}")
     return state
 
 
@@ -422,10 +423,12 @@ def process_operations(state: "BeaconState", body, is_gloas: bool = False) -> No
 
     for deposit in body.deposits:
         process_deposit(state, deposit)
+    print(f"    DEBUG ops: after {len(body.deposits)} deposits, state={_htr(state).hex()[:16]}")
 
     # Process voluntary exits
     for voluntary_exit in body.voluntary_exits:
         process_voluntary_exit(state, voluntary_exit)
+    print(f"    DEBUG ops: after {len(body.voluntary_exits)} exits, state={_htr(state).hex()[:16]}")
 
     # Process BLS to execution changes (Capella+)
     if hasattr(body, "bls_to_execution_changes"):
