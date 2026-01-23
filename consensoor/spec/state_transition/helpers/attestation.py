@@ -304,9 +304,12 @@ def get_matching_source_attestations_phase0(state: "BeaconState", epoch: int):
 
 def get_matching_target_attestations_phase0(state: "BeaconState", epoch: int):
     """Return attestations with matching target root (Phase0)."""
+    source_attestations = get_matching_source_attestations_phase0(state, epoch)
+    if not source_attestations:
+        return []
     target_root = get_block_root(state, epoch)
     return [
-        a for a in get_matching_source_attestations_phase0(state, epoch)
+        a for a in source_attestations
         if bytes(a.data.target.root) == target_root
     ]
 
