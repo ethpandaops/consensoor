@@ -1,0 +1,26 @@
+"""Ethereum consensus layer state transition implementation.
+
+This module implements the complete state transition function according to the
+Ethereum consensus specs (Phase 0 through Gloas/ePBS).
+"""
+
+from .transition import (
+    state_transition,
+    process_slots,
+    process_slot,
+    process_epoch,
+    process_block,
+)
+
+# Gloas (ePBS) - execution payload envelope processing (separate from block)
+from .block import process_execution_payload_envelope
+
+__all__ = [
+    "state_transition",
+    "process_slots",
+    "process_slot",
+    "process_epoch",
+    "process_block",
+    # Gloas (ePBS)
+    "process_execution_payload_envelope",
+]
