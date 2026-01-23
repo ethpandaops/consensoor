@@ -724,7 +724,8 @@ class BeaconNode:
                     self.state = new_state
                     logger.info(
                         f"Full state transition applied: slot={block.slot}, "
-                        f"block_hash={bytes(block.body.execution_payload.block_hash).hex()[:16] if hasattr(block.body, 'execution_payload') else 'N/A'}"
+                        f"block_hash={bytes(block.body.execution_payload.block_hash).hex()[:16] if hasattr(block.body, 'execution_payload') else 'N/A'}, "
+                        f"latest_header_slot={self.state.latest_block_header.slot}"
                     )
                     return
                 except Exception as e:
@@ -741,7 +742,8 @@ class BeaconNode:
                 process_block(self.state, block)
                 logger.info(
                     f"Block processed: slot={block.slot}, "
-                    f"block_hash={bytes(block.body.execution_payload.block_hash).hex()[:16] if hasattr(block.body, 'execution_payload') else 'N/A'}"
+                    f"block_hash={bytes(block.body.execution_payload.block_hash).hex()[:16] if hasattr(block.body, 'execution_payload') else 'N/A'}, "
+                    f"latest_header_slot={self.state.latest_block_header.slot}"
                 )
             except AssertionError as e:
                 logger.warning(f"Block validation failed: {e}")
@@ -787,6 +789,10 @@ class BeaconNode:
             parent_root=block.parent_root,
             state_root=b"\x00" * 32,  # Zero per spec, filled in by process_slot
             body_root=hash_tree_root(block.body),
+        )
+        logger.info(
+            f"Minimal block update applied: slot={block.slot}, "
+            f"latest_header_slot={self.state.latest_block_header.slot}"
         )
 
         # Update execution payload header if present

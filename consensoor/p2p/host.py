@@ -74,6 +74,7 @@ class P2PHost:
         self._subscribe_queue: queue.Queue = queue.Queue()
         self._peer_id: Optional[str] = None
         self._peer_count: int = 0
+        self._connected_peers: dict[str, dict] = {}  # peer_id -> peer_info
         self._asyncio_loop: Optional[asyncio.AbstractEventLoop] = None
         self._started_event = threading.Event()
         self._stop_event = threading.Event()
@@ -131,11 +132,21 @@ class P2PHost:
             self._private_key_bytes = secrets.token_bytes(32)
             key_pair = create_new_key_pair(self._private_key_bytes)
 
-            # Let new_host create the default security options with proper X25519 keys for Noise
-            # Don't override sec_opt - the default setup handles Noise correctly
+            # Use insecure transport for testing P2P connectivity
+            # TODO: Switch back to Noise for production
+            try:
+                from libp2p.security.insecure.transport import InsecureTransport
+                insecure = InsecureTransport(key_pair)
+                sec_opt = {"/plaintext/2.0.0": insecure}
+                logger.info("Using INSECURE transport for P2P (testing only)")
+            except Exception as e:
+                logger.warning(f"InsecureTransport config failed: {e}, using defaults")
+                sec_opt = None
+
             self._host = new_host(
                 key_pair=key_pair,
                 muxer_preference="MPLEX",
+                sec_opt=sec_opt,
             )
 
             advertised_ip = self.config.advertised_ip or get_local_ip()
@@ -200,9 +211,24 @@ class P2PHost:
 
                         # Start subscription message reader as a background task
                         async with trio.open_nursery() as nursery:
+                            last_reconnect_attempt = 0
+                            reconnect_interval = 10  # seconds
                             while not self._stop_event.is_set():
                                 await self._process_publish_queue_trio()
                                 await self._process_subscribe_queue_trio(nursery)
+
+                                # Periodically retry connecting to static peers
+                                import time
+                                now = time.time()
+                                if now - last_reconnect_attempt > reconnect_interval:
+                                    last_reconnect_attempt = now
+                                    if len(self._connected_peers) < len(self.config.static_peers):
+                                        for peer in self.config.static_peers:
+                                            try:
+                                                await self._connect_to_peer_trio(peer)
+                                            except Exception as e:
+                                                logger.debug(f"Reconnect to {peer[:30]}... failed: {e}")
+
                                 await trio.sleep(0.1)
 
         except ImportError as e:
@@ -217,6 +243,7 @@ class P2PHost:
     def _create_connection_notifier(self):
         """Create a notifier to track connection state changes."""
         from libp2p.abc import INotifee
+        host = self
 
         class ConnectionNotifier(INotifee):
             async def opened_stream(self, network, stream):
@@ -229,12 +256,23 @@ class P2PHost:
                 logger.info(f"Stream closed: peer={peer_id}")
 
             async def connected(self, network, conn):
-                peer_id = conn.muxed_conn.peer_id.to_base58()[:16]
+                full_peer_id = conn.muxed_conn.peer_id.to_base58()
+                peer_id = full_peer_id[:16]
                 logger.info(f"Notifier: peer connected: {peer_id}")
+                addrs = [str(a) for a in conn.muxed_conn.remote_addrs] if hasattr(conn.muxed_conn, 'remote_addrs') else []
+                host._connected_peers[full_peer_id] = {
+                    "peer_id": full_peer_id,
+                    "addrs": addrs,
+                    "direction": "inbound" if hasattr(conn, 'is_initiator') and not conn.is_initiator else "outbound"
+                }
+                host._peer_count = len(host._connected_peers)
 
             async def disconnected(self, network, conn):
-                peer_id = conn.muxed_conn.peer_id.to_base58()[:16]
+                full_peer_id = conn.muxed_conn.peer_id.to_base58()
+                peer_id = full_peer_id[:16]
                 logger.info(f"Notifier: peer disconnected: {peer_id}")
+                host._connected_peers.pop(full_peer_id, None)
+                host._peer_count = len(host._connected_peers)
 
             async def listen(self, network, multiaddr):
                 logger.info(f"Listening on: {multiaddr}")
@@ -548,9 +586,23 @@ class P2PHost:
                 )
                 return
 
+            full_peer_id = peer_info.peer_id.to_base58()
+
+            # Skip if already connected
+            if full_peer_id in self._connected_peers:
+                logger.debug(f"Already connected to peer: {full_peer_id[:16]}...")
+                return
+
             await self._host.connect(peer_info)
-            logger.info(f"Connected to peer: {peer_info.peer_id.to_base58()[:16]}...")
-            self._peer_count += 1
+            logger.info(f"Connected to peer: {full_peer_id[:16]}...")
+
+            # Track the connection (notifier should also do this, but be explicit)
+            self._connected_peers[full_peer_id] = {
+                "peer_id": full_peer_id,
+                "addrs": [str(a) for a in peer_info.addrs],
+                "direction": "outbound"
+            }
+            self._peer_count = len(self._connected_peers)
 
             # Try to open a status stream to keep connection alive and verify it works
             try:
@@ -722,6 +774,11 @@ class P2PHost:
     def peer_count(self) -> int:
         """Get the number of connected peers."""
         return self._peer_count
+
+    @property
+    def connected_peers(self) -> list[dict]:
+        """Get list of connected peers with their info."""
+        return list(self._connected_peers.values())
 
     @property
     def enr(self) -> Optional[str]:

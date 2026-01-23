@@ -7,7 +7,6 @@ Implements the complete state transition function for Ethereum consensus layer.
 """
 
 from typing import TYPE_CHECKING, Optional
-import copy
 
 from ..constants import SLOTS_PER_EPOCH, SLOTS_PER_HISTORICAL_ROOT
 from .helpers.misc import compute_epoch_at_slot
@@ -42,7 +41,8 @@ def state_transition(
         AssertionError: If validation fails
     """
     # Work on a copy to preserve original state
-    state = copy.deepcopy(state)
+    # Use SSZ round-trip instead of copy.deepcopy for deterministic behavior
+    state = state.__class__.decode_bytes(bytes(state.encode_bytes()))
 
     block = signed_block.message
 

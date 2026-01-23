@@ -123,20 +123,23 @@ class BeaconAPI:
     async def get_peers(self, request: web.Request) -> web.Response:
         """GET /eth/v1/node/peers"""
         peers = []
-        for peer_addr in self.node.config.peers:
-            if ":" in peer_addr:
-                host, port = peer_addr.rsplit(":", 1)
-            else:
-                host = peer_addr
-                port = "9000"
-            peer_id = generate_peer_id(f"peer-{host}-{port}")
-            peers.append({
-                "peer_id": peer_id,
-                "enr": "",
-                "last_seen_p2p_address": f"/ip4/{host}/tcp/{port}/p2p/{peer_id}",
-                "state": "connected",
-                "direction": "outbound",
-            })
+
+        # Get actual connected peers from P2P host
+        if self.node.beacon_gossip and hasattr(self.node.beacon_gossip, '_host'):
+            p2p_host = self.node.beacon_gossip._host
+            if p2p_host and hasattr(p2p_host, 'connected_peers'):
+                for peer_info in p2p_host.connected_peers:
+                    peer_id = peer_info.get("peer_id", "")
+                    addrs = peer_info.get("addrs", [])
+                    direction = peer_info.get("direction", "unknown")
+                    peers.append({
+                        "peer_id": peer_id,
+                        "enr": "",
+                        "last_seen_p2p_address": addrs[0] if addrs else "",
+                        "state": "connected",
+                        "direction": direction,
+                    })
+
         return web.json_response({
             "data": peers,
             "meta": {
@@ -190,8 +193,30 @@ class BeaconAPI:
         return web.json_response({"message": "State not found"}, status=404)
 
     async def get_headers(self, request: web.Request) -> web.Response:
-        """GET /eth/v1/beacon/headers"""
-        return web.json_response({"data": []})
+        """GET /eth/v1/beacon/headers
+
+        Returns the head header when called without parameters.
+        """
+        if not self.node.state or not self.node.head_root:
+            return web.json_response({"data": []})
+
+        header = self.node.state.latest_block_header
+        return web.json_response({
+            "data": [{
+                "root": "0x" + self.node.head_root.hex(),
+                "canonical": True,
+                "header": {
+                    "message": {
+                        "slot": str(header.slot),
+                        "proposer_index": str(header.proposer_index),
+                        "parent_root": "0x" + bytes(header.parent_root).hex(),
+                        "state_root": "0x" + bytes(header.state_root).hex(),
+                        "body_root": "0x" + bytes(header.body_root).hex(),
+                    },
+                    "signature": "0x" + "00" * 96,
+                }
+            }]
+        })
 
     def _resolve_block_id(self, block_id: str) -> tuple[Optional[bytes], Optional[object]]:
         """Resolve a block_id to (root, signed_block).

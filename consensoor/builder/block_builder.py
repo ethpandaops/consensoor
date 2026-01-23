@@ -129,6 +129,10 @@ class BlockBuilder:
         # Work on a copy of the state to compute state_root
         # Use SSZ round-trip instead of copy.deepcopy for deterministic behavior across architectures
         temp_state = state.__class__.decode_bytes(bytes(state.encode_bytes()))
+        logger.info(
+            f"Building block for slot={slot}: state_slot={state.slot}, "
+            f"latest_header_slot={state.latest_block_header.slot}"
+        )
 
         # Process slots to advance state (fills in latest_block_header.state_root)
         if slot > int(temp_state.slot):
