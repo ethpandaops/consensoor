@@ -132,27 +132,18 @@ class P2PHost:
             self._private_key_bytes = secrets.token_bytes(32)
             key_pair = create_new_key_pair(self._private_key_bytes)
 
-            # Use insecure transport for testing P2P connectivity
-            # TODO: Switch back to Noise for production
-            try:
-                from libp2p.security.insecure.transport import InsecureTransport
-                insecure = InsecureTransport(key_pair)
-                sec_opt = {"/plaintext/2.0.0": insecure}
-                logger.info("Using INSECURE transport for P2P (testing only)")
-            except Exception as e:
-                logger.warning(f"InsecureTransport config failed: {e}, using defaults")
-                sec_opt = None
+            # Use default security (Noise + TLS + SECIO + Plaintext)
+            # py-libp2p should negotiate the best common protocol
+            logger.info("Using DEFAULT security transports (Noise, TLS, SECIO, Plaintext)")
 
             self._host = new_host(
                 key_pair=key_pair,
                 muxer_preference="MPLEX",
-                sec_opt=sec_opt,
+                sec_opt=None,  # Use defaults
             )
 
             advertised_ip = self.config.advertised_ip or get_local_ip()
-            listen_host = self.config.listen_host
-            if listen_host == "0.0.0.0":
-                listen_host = advertised_ip
+            listen_host = self.config.listen_host  # Keep 0.0.0.0 for listening on all interfaces
             self._listen_ip = advertised_ip
             logger.info(f"P2P using IP: listen={listen_host}, advertised={advertised_ip}")
 

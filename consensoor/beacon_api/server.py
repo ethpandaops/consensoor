@@ -39,6 +39,9 @@ class BeaconAPI:
         self.app.router.add_get("/eth/v1/beacon/genesis", self.get_genesis)
         self.app.router.add_get("/eth/v1/beacon/states/{state_id}/root", self.get_state_root)
         self.app.router.add_get("/eth/v1/beacon/states/{state_id}/finality_checkpoints", self.get_finality_checkpoints)
+        self.app.router.add_get("/eth/v1/beacon/states/{state_id}/validators", self.get_validators)
+        self.app.router.add_get("/eth/v1/beacon/states/{state_id}/validators/{validator_id}", self.get_validator)
+        self.app.router.add_get("/eth/v1/beacon/states/{state_id}/validator_balances", self.get_validator_balances)
         self.app.router.add_get("/eth/v1/beacon/headers", self.get_headers)
         self.app.router.add_get("/eth/v1/beacon/headers/{block_id}", self.get_header)
         self.app.router.add_get("/eth/v2/beacon/blocks/{block_id}", self.get_block)
@@ -191,6 +194,163 @@ class BeaconAPI:
                 }
             })
         return web.json_response({"message": "State not found"}, status=404)
+
+    async def get_validators(self, request: web.Request) -> web.Response:
+        """GET /eth/v1/beacon/states/{state_id}/validators"""
+        state_id = request.match_info["state_id"]
+        if state_id not in ("head", "finalized", "justified", "genesis") and self.node.state:
+            pass  # Could handle slot/root lookups
+
+        if not self.node.state:
+            return web.json_response({"message": "State not found"}, status=404)
+
+        # Parse query params for filtering
+        id_param = request.query.getall("id", [])
+        status_param = request.query.getall("status", [])
+
+        validators_data = []
+        for i, validator in enumerate(self.node.state.validators):
+            # Filter by id if specified
+            if id_param:
+                if str(i) not in id_param and f"0x{bytes(validator.pubkey).hex()}" not in id_param:
+                    continue
+
+            # Determine validator status
+            balance = int(self.node.state.balances[i])
+            current_epoch = int(self.node.state.slot) // 8  # SLOTS_PER_EPOCH for minimal
+
+            if int(validator.activation_epoch) > current_epoch:
+                status = "pending_queued"
+            elif int(validator.exit_epoch) <= current_epoch:
+                if int(validator.withdrawable_epoch) <= current_epoch:
+                    status = "withdrawal_done" if balance == 0 else "withdrawal_possible"
+                else:
+                    status = "exited_slashed" if validator.slashed else "exited_unslashed"
+            elif validator.slashed:
+                status = "active_slashed"
+            elif int(validator.exit_epoch) < 2**64 - 1:
+                status = "active_exiting"
+            else:
+                status = "active_ongoing"
+
+            # Filter by status if specified
+            if status_param and status not in status_param:
+                continue
+
+            validators_data.append({
+                "index": str(i),
+                "balance": str(balance),
+                "status": status,
+                "validator": {
+                    "pubkey": "0x" + bytes(validator.pubkey).hex(),
+                    "withdrawal_credentials": "0x" + bytes(validator.withdrawal_credentials).hex(),
+                    "effective_balance": str(validator.effective_balance),
+                    "slashed": validator.slashed,
+                    "activation_eligibility_epoch": str(validator.activation_eligibility_epoch),
+                    "activation_epoch": str(validator.activation_epoch),
+                    "exit_epoch": str(validator.exit_epoch),
+                    "withdrawable_epoch": str(validator.withdrawable_epoch),
+                }
+            })
+
+        return web.json_response({
+            "execution_optimistic": False,
+            "finalized": False,
+            "data": validators_data
+        })
+
+    async def get_validator(self, request: web.Request) -> web.Response:
+        """GET /eth/v1/beacon/states/{state_id}/validators/{validator_id}"""
+        state_id = request.match_info["state_id"]
+        validator_id = request.match_info["validator_id"]
+
+        if not self.node.state:
+            return web.json_response({"message": "State not found"}, status=404)
+
+        # Find validator by index or pubkey
+        validator_index = None
+        if validator_id.startswith("0x"):
+            # Search by pubkey
+            pubkey_bytes = bytes.fromhex(validator_id[2:])
+            for i, v in enumerate(self.node.state.validators):
+                if bytes(v.pubkey) == pubkey_bytes:
+                    validator_index = i
+                    break
+        else:
+            try:
+                validator_index = int(validator_id)
+            except ValueError:
+                return web.json_response({"message": "Invalid validator id"}, status=400)
+
+        if validator_index is None or validator_index >= len(self.node.state.validators):
+            return web.json_response({"message": "Validator not found"}, status=404)
+
+        validator = self.node.state.validators[validator_index]
+        balance = int(self.node.state.balances[validator_index])
+        current_epoch = int(self.node.state.slot) // 8
+
+        if int(validator.activation_epoch) > current_epoch:
+            status = "pending_queued"
+        elif int(validator.exit_epoch) <= current_epoch:
+            if int(validator.withdrawable_epoch) <= current_epoch:
+                status = "withdrawal_done" if balance == 0 else "withdrawal_possible"
+            else:
+                status = "exited_slashed" if validator.slashed else "exited_unslashed"
+        elif validator.slashed:
+            status = "active_slashed"
+        elif int(validator.exit_epoch) < 2**64 - 1:
+            status = "active_exiting"
+        else:
+            status = "active_ongoing"
+
+        return web.json_response({
+            "execution_optimistic": False,
+            "finalized": False,
+            "data": {
+                "index": str(validator_index),
+                "balance": str(balance),
+                "status": status,
+                "validator": {
+                    "pubkey": "0x" + bytes(validator.pubkey).hex(),
+                    "withdrawal_credentials": "0x" + bytes(validator.withdrawal_credentials).hex(),
+                    "effective_balance": str(validator.effective_balance),
+                    "slashed": validator.slashed,
+                    "activation_eligibility_epoch": str(validator.activation_eligibility_epoch),
+                    "activation_epoch": str(validator.activation_epoch),
+                    "exit_epoch": str(validator.exit_epoch),
+                    "withdrawable_epoch": str(validator.withdrawable_epoch),
+                }
+            }
+        })
+
+    async def get_validator_balances(self, request: web.Request) -> web.Response:
+        """GET /eth/v1/beacon/states/{state_id}/validator_balances"""
+        state_id = request.match_info["state_id"]
+
+        if not self.node.state:
+            return web.json_response({"message": "State not found"}, status=404)
+
+        # Parse query params for filtering
+        id_param = request.query.getall("id", [])
+
+        balances_data = []
+        for i, balance in enumerate(self.node.state.balances):
+            # Filter by id if specified
+            if id_param:
+                validator = self.node.state.validators[i]
+                if str(i) not in id_param and f"0x{bytes(validator.pubkey).hex()}" not in id_param:
+                    continue
+
+            balances_data.append({
+                "index": str(i),
+                "balance": str(balance),
+            })
+
+        return web.json_response({
+            "execution_optimistic": False,
+            "finalized": False,
+            "data": balances_data
+        })
 
     async def get_headers(self, request: web.Request) -> web.Response:
         """GET /eth/v1/beacon/headers

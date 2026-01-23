@@ -84,7 +84,6 @@ class Gossip:
         self.handlers: dict[MessageType, MessageHandler] = {}
         self.transport: Optional[asyncio.DatagramTransport] = None
         self.protocol: Optional[UDPProtocol] = None
-        self._tcp_server: Optional[asyncio.Server] = None
         self._running = False
 
     def subscribe(self, msg_type: MessageType, handler: MessageHandler) -> None:
@@ -97,30 +96,20 @@ class Gossip:
         self.handlers.pop(msg_type, None)
 
     async def start(self) -> None:
-        """Start the gossip network."""
+        """Start the gossip network (UDP only - TCP handled by py-libp2p)."""
         loop = asyncio.get_event_loop()
         self.transport, self.protocol = await loop.create_datagram_endpoint(
             lambda: UDPProtocol(self),
             local_addr=(self.config.listen_host, self.config.listen_port),
         )
 
-        self._tcp_server = await asyncio.start_server(
-            self._handle_tcp_connection,
-            self.config.listen_host,
-            self.config.listen_port,
-        )
+        # NOTE: TCP server removed - py-libp2p handles TCP on port 9000
+        # The previous TCP server was a stub that just closed connections
 
         self._running = True
         logger.info(
-            f"Gossip listening on {self.config.listen_host}:{self.config.listen_port}"
+            f"Gossip (UDP) listening on {self.config.listen_host}:{self.config.listen_port}"
         )
-
-    async def _handle_tcp_connection(
-        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
-    ) -> None:
-        """Handle incoming TCP connections (for libp2p compatibility)."""
-        writer.close()
-        await writer.wait_closed()
 
     async def stop(self) -> None:
         """Stop the gossip network."""
@@ -128,10 +117,6 @@ class Gossip:
         if self.transport:
             self.transport.close()
             self.transport = None
-        if self._tcp_server:
-            self._tcp_server.close()
-            await self._tcp_server.wait_closed()
-            self._tcp_server = None
 
     async def broadcast(self, msg_type: MessageType, payload: bytes) -> None:
         """Broadcast a message to all peers."""
