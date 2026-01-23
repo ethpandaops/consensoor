@@ -43,10 +43,15 @@ def state_transition(
     """
     # Work on a copy to preserve original state
     state = copy.deepcopy(state)
+
+    # DEBUG
+    from ...crypto import hash_tree_root as _htr
+    print(f"DEBUG: state_transition entry, state type={type(state).__name__}, state_hash={_htr(state).hex()[:16]}")
     block = signed_block.message
 
     # Process slots (including missed slots)
     process_slots(state, int(block.slot))
+    print(f"DEBUG: after process_slots, state_hash={_htr(state).hex()[:16]}")
 
     # Verify block signature (if validating)
     if validate_result:
@@ -54,6 +59,9 @@ def state_transition(
 
     # Process block
     process_block(state, block)
+
+    # DEBUG
+    print(f"DEBUG: after process_block, state_hash={_htr(state).hex()[:16]}, latest_block_header_hash={_htr(state.latest_block_header).hex()[:16]}")
 
     # Verify state root (if validating)
     if validate_result:
