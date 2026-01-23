@@ -44,14 +44,10 @@ def state_transition(
     # Work on a copy to preserve original state
     state = copy.deepcopy(state)
 
-    # DEBUG
-    from ...crypto import hash_tree_root as _htr
-    print(f"DEBUG: state_transition entry, state type={type(state).__name__}, state_hash={_htr(state).hex()[:16]}")
     block = signed_block.message
 
     # Process slots (including missed slots)
     process_slots(state, int(block.slot))
-    print(f"DEBUG: after process_slots, state_hash={_htr(state).hex()[:16]}")
 
     # Verify block signature (if validating)
     if validate_result:
@@ -60,16 +56,12 @@ def state_transition(
     # Process block
     process_block(state, block)
 
-    # DEBUG
-    print(f"DEBUG: after process_block, state_hash={_htr(state).hex()[:16]}, latest_block_header_hash={_htr(state.latest_block_header).hex()[:16]}")
-
     # Verify state root (if validating)
     if validate_result:
         assert bytes(block.state_root) == hash_tree_root(state), (
             "State root mismatch"
         )
 
-    print(f"DEBUG: state_transition returning, state_hash={_htr(state).hex()}")
     return state
 
 
@@ -262,11 +254,9 @@ def process_block(state: "BeaconState", block: "BeaconBlock") -> None:
         process_payload_attestations,
     )
     from .helpers.predicates import is_execution_enabled
-    from ...crypto import hash_tree_root as _htr
 
     # Process block header
     process_block_header(state, block)
-    print(f"  DEBUG process_block: after header, state={_htr(state).hex()[:16]}")
 
     # Check if this is a Gloas block (ePBS)
     is_gloas_block = hasattr(block.body, "signed_execution_payload_bid")
@@ -284,24 +274,19 @@ def process_block(state: "BeaconState", block: "BeaconBlock") -> None:
                 process_withdrawals(state, block.body.execution_payload)
 
             process_execution_payload(state, block.body)
-            print(f"  DEBUG process_block: after exec_payload, state={_htr(state).hex()[:16]}")
 
     # Process randao
     process_randao(state, block.body)
-    print(f"  DEBUG process_block: after randao, state={_htr(state).hex()[:16]}")
 
     # Process eth1 data
     process_eth1_data(state, block.body)
-    print(f"  DEBUG process_block: after eth1, state={_htr(state).hex()[:16]}")
 
     # Process operations
     process_operations(state, block.body, is_gloas=is_gloas_block)
-    print(f"  DEBUG process_block: after operations, state={_htr(state).hex()[:16]}")
 
     # Process sync aggregate (Altair+)
     if hasattr(block.body, "sync_aggregate"):
         process_sync_aggregate(state, block.body.sync_aggregate)
-        print(f"  DEBUG process_block: after sync_agg, state={_htr(state).hex()[:16]}")
 
     # Process payload attestations (Gloas)
     if is_gloas_block and hasattr(block.body, "payload_attestations"):
@@ -372,23 +357,17 @@ def process_operations(state: "BeaconState", body, is_gloas: bool = False) -> No
         f"Too many voluntary exits: {len(body.voluntary_exits)}"
     )
 
-    from ...crypto import hash_tree_root as _htr
-
     # Process proposer slashings
-    for i, proposer_slashing in enumerate(body.proposer_slashings):
+    for proposer_slashing in body.proposer_slashings:
         process_proposer_slashing(state, proposer_slashing)
-    print(f"    DEBUG ops: after {len(body.proposer_slashings)} prop_slash, state={_htr(state).hex()[:16]}")
 
     # Process attester slashings
-    for i, attester_slashing in enumerate(body.attester_slashings):
+    for attester_slashing in body.attester_slashings:
         process_attester_slashing(state, attester_slashing)
-    print(f"    DEBUG ops: after {len(body.attester_slashings)} att_slash, state={_htr(state).hex()[:16]}")
 
     # Process attestations
-    for i, attestation in enumerate(body.attestations):
+    for attestation in body.attestations:
         process_attestation(state, attestation)
-        if i < 3 or i == len(body.attestations) - 1:
-            print(f"    DEBUG ops: after att[{i}], state={_htr(state).hex()[:16]}")
 
     # Process deposits
     if hasattr(state, "deposit_requests_start_index"):
@@ -421,17 +400,12 @@ def process_operations(state: "BeaconState", body, is_gloas: bool = False) -> No
             f"expected {expected_deposits}"
         )
 
-    for i, deposit in enumerate(body.deposits):
-        before = _htr(state).hex()[:16]
+    for deposit in body.deposits:
         process_deposit(state, deposit)
-        after = _htr(state).hex()[:16]
-        if before != after or i < 3:
-            print(f"    DEBUG ops: deposit[{i}] {before} -> {after}")
 
     # Process voluntary exits
     for voluntary_exit in body.voluntary_exits:
         process_voluntary_exit(state, voluntary_exit)
-    print(f"    DEBUG ops: after {len(body.voluntary_exits)} exits, state={_htr(state).hex()[:16]}")
 
     # Process BLS to execution changes (Capella+)
     if hasattr(body, "bls_to_execution_changes"):

@@ -89,12 +89,9 @@ def is_valid_deposit_signature(
     )
 
     config = get_config()
-    print(f"        DEBUG config: genesis_fork_version={config.genesis_fork_version.hex()}")
     domain = compute_domain(DOMAIN_DEPOSIT, config.genesis_fork_version, b"\x00" * 32)
     signing_root = compute_signing_root(deposit_message, domain)
-    result = bls_verify([pubkey], signing_root, signature)
-    print(f"        DEBUG bls_verify: domain={domain.hex()[:16]}, signing_root={signing_root.hex()[:16]}, result={result}")
-    return result
+    return bls_verify([pubkey], signing_root, signature)
 
 
 def apply_deposit(
@@ -120,13 +117,10 @@ def apply_deposit(
     validator_pubkeys = [bytes(v.pubkey) for v in state.validators]
 
     is_new = pubkey not in validator_pubkeys
-    print(f"      DEBUG deposit: pubkey={pubkey.hex()[:16]}, is_new={is_new}, validators={len(validator_pubkeys)}")
 
     if is_new:
         # New validator - verify signature first
-        sig_valid = is_valid_deposit_signature(pubkey, withdrawal_credentials, amount, signature)
-        print(f"      DEBUG deposit: new validator, sig_valid={sig_valid}")
-        if sig_valid:
+        if is_valid_deposit_signature(pubkey, withdrawal_credentials, amount, signature):
             if is_electra:
                 add_validator_to_registry(state, pubkey, withdrawal_credentials, 0)
             else:
@@ -150,7 +144,6 @@ def apply_deposit(
         )
     elif pubkey in validator_pubkeys:
         index = validator_pubkeys.index(pubkey)
-        print(f"      DEBUG deposit: existing validator index={index}, adding {amount}")
         increase_balance(state, index, amount)
 
 

@@ -111,6 +111,15 @@ class NetworkConfig:
         config.min_validator_withdrawability_delay = 256
         config.shard_committee_period = 64
         config.eth1_follow_distance = 16
+        # Minimal preset uses different fork versions (end in 01 instead of 00)
+        config.genesis_fork_version = bytes.fromhex("00000001")
+        config.altair_fork_version = bytes.fromhex("01000001")
+        config.bellatrix_fork_version = bytes.fromhex("02000001")
+        config.capella_fork_version = bytes.fromhex("03000001")
+        config.deneb_fork_version = bytes.fromhex("04000001")
+        config.electra_fork_version = bytes.fromhex("05000001")
+        config.fulu_fork_version = bytes.fromhex("06000001")
+        config.gloas_fork_version = bytes.fromhex("07000001")
         return config
 
     @classmethod

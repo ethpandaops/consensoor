@@ -1034,17 +1034,47 @@ class TestRewards:
         target_deltas_file = case_path / "target_deltas.ssz_snappy"
         head_deltas_file = case_path / "head_deltas.ssz_snappy"
         inactivity_penalty_deltas_file = case_path / "inactivity_penalty_deltas.ssz_snappy"
+        inclusion_delay_deltas_file = case_path / "inclusion_delay_deltas.ssz_snappy"
 
         from consensoor.spec.types.base import List, uint64
         from consensoor.spec.constants import VALIDATOR_REGISTRY_LIMIT
 
-        class Deltas:
-            def __init__(self, rewards, penalties):
-                self.rewards = rewards
-                self.penalties = penalties
+        DeltasList = List[List[uint64, VALIDATOR_REGISTRY_LIMIT], 2]
+
+        def check_deltas(name, actual_rewards, actual_penalties, expected_file):
+            if not expected_file.exists():
+                return
+            expected = load_ssz_snappy(expected_file, DeltasList)
+            for i in range(len(pre_state.validators)):
+                if i < len(expected[0]) and i < len(expected[1]):
+                    assert actual_rewards[i] == int(expected[0][i]), \
+                        f"{name} reward mismatch at {i}: {actual_rewards[i]} != {expected[0][i]}"
+                    assert actual_penalties[i] == int(expected[1][i]), \
+                        f"{name} penalty mismatch at {i}: {actual_penalties[i]} != {expected[1][i]}"
 
         if fork in {"phase0"}:
-            pytest.skip(f"Rewards tests for {fork} require legacy reward calculation")
+            from consensoor.spec.state_transition.epoch.rewards import (
+                get_source_deltas_phase0,
+                get_target_deltas_phase0,
+                get_head_deltas_phase0,
+                get_inclusion_delay_deltas_phase0,
+                get_inactivity_penalty_deltas_phase0,
+            )
+
+            source_rewards, source_penalties = get_source_deltas_phase0(pre_state)
+            check_deltas("Source", source_rewards, source_penalties, source_deltas_file)
+
+            target_rewards, target_penalties = get_target_deltas_phase0(pre_state)
+            check_deltas("Target", target_rewards, target_penalties, target_deltas_file)
+
+            head_rewards, head_penalties = get_head_deltas_phase0(pre_state)
+            check_deltas("Head", head_rewards, head_penalties, head_deltas_file)
+
+            inclusion_rewards, inclusion_penalties = get_inclusion_delay_deltas_phase0(pre_state)
+            check_deltas("Inclusion delay", inclusion_rewards, inclusion_penalties, inclusion_delay_deltas_file)
+
+            inactivity_rewards, inactivity_penalties = get_inactivity_penalty_deltas_phase0(pre_state)
+            check_deltas("Inactivity", inactivity_rewards, inactivity_penalties, inactivity_penalty_deltas_file)
         else:
             from consensoor.spec.state_transition.epoch.rewards import (
                 get_flag_index_deltas,
@@ -1056,13 +1086,14 @@ class TestRewards:
                 TIMELY_HEAD_FLAG_INDEX,
             )
 
-            if source_deltas_file.exists():
-                DeltasList = List[List[uint64, VALIDATOR_REGISTRY_LIMIT], 2]
-                expected = load_ssz_snappy(source_deltas_file, DeltasList)
-                actual_rewards, actual_penalties = get_flag_index_deltas(pre_state, TIMELY_SOURCE_FLAG_INDEX)
-                for i in range(len(pre_state.validators)):
-                    if i < len(expected[0]) and i < len(expected[1]):
-                        assert actual_rewards[i] == int(expected[0][i]), \
-                            f"Source reward mismatch at {i}: {actual_rewards[i]} != {expected[0][i]}"
-                        assert actual_penalties[i] == int(expected[1][i]), \
-                            f"Source penalty mismatch at {i}: {actual_penalties[i]} != {expected[1][i]}"
+            source_rewards, source_penalties = get_flag_index_deltas(pre_state, TIMELY_SOURCE_FLAG_INDEX)
+            check_deltas("Source", source_rewards, source_penalties, source_deltas_file)
+
+            target_rewards, target_penalties = get_flag_index_deltas(pre_state, TIMELY_TARGET_FLAG_INDEX)
+            check_deltas("Target", target_rewards, target_penalties, target_deltas_file)
+
+            head_rewards, head_penalties = get_flag_index_deltas(pre_state, TIMELY_HEAD_FLAG_INDEX)
+            check_deltas("Head", head_rewards, head_penalties, head_deltas_file)
+
+            inactivity_rewards, inactivity_penalties = get_inactivity_penalty_deltas(pre_state)
+            check_deltas("Inactivity", inactivity_rewards, inactivity_penalties, inactivity_penalty_deltas_file)
