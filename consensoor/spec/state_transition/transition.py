@@ -142,6 +142,10 @@ def process_slot(state: "BeaconState") -> None:
     previous_block_root = hash_tree_root(state.latest_block_header)
     state.block_roots[int(state.slot) % SLOTS_PER_HISTORICAL_ROOT()] = previous_block_root
 
+    if hasattr(state, "execution_payload_availability"):
+        next_slot_index = (int(state.slot) + 1) % SLOTS_PER_HISTORICAL_ROOT()
+        state.execution_payload_availability[next_slot_index] = 0
+
 
 def process_epoch(state: "BeaconState") -> None:
     """Process epoch transition.
@@ -181,6 +185,7 @@ def process_epoch(state: "BeaconState") -> None:
         process_historical_summaries_update,
         process_pending_deposits,
         process_pending_consolidations,
+        process_builder_pending_payments,
         process_proposer_lookahead,
     )
 
@@ -198,6 +203,8 @@ def process_epoch(state: "BeaconState") -> None:
         process_pending_deposits(state)
     if hasattr(state, "pending_consolidations"):
         process_pending_consolidations(state)
+    if hasattr(state, "builder_pending_payments"):
+        process_builder_pending_payments(state)
 
     process_effective_balance_updates(state)
     process_slashings_reset(state)

@@ -282,8 +282,8 @@ def get_inactivity_penalty_deltas(
     )
 
     # Use correct inactivity penalty quotient based on fork
-    # Bellatrix+ has latest_execution_payload_header, Altair doesn't
-    if hasattr(state, "latest_execution_payload_header"):
+    # Bellatrix+ has latest_execution_payload_header; Gloas has execution_payload_availability
+    if hasattr(state, "latest_execution_payload_header") or hasattr(state, "execution_payload_availability"):
         inactivity_penalty_quotient = INACTIVITY_PENALTY_QUOTIENT_BELLATRIX
     else:
         inactivity_penalty_quotient = INACTIVITY_PENALTY_QUOTIENT_ALTAIR

@@ -11,6 +11,7 @@ from ...constants import (
     MAX_WITHDRAWALS_PER_PAYLOAD,
     MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP,
     MAX_BUILDERS_PER_WITHDRAWALS_SWEEP,
+    SLOTS_PER_HISTORICAL_ROOT,
     FAR_FUTURE_EPOCH,
     MIN_ACTIVATION_BALANCE,
     MAX_EFFECTIVE_BALANCE,
@@ -291,6 +292,7 @@ def get_expected_withdrawals(state: "BeaconState") -> ExpectedWithdrawals:
     is_electra = hasattr(state, "pending_partial_withdrawals")
 
     if is_gloas:
+        withdrawal_index = 0
         builder_withdrawals, withdrawal_index, processed_builder_count = (
             get_builder_withdrawals(state, withdrawal_index, withdrawals)
         )
@@ -423,6 +425,12 @@ def process_withdrawals(state: "BeaconState", payload=None) -> None:
     Raises:
         AssertionError: If withdrawals don't match expected
     """
+    if hasattr(state, "execution_payload_availability"):
+        latest_bid_slot = int(state.latest_execution_payload_bid.slot)
+        slot_index = latest_bid_slot % SLOTS_PER_HISTORICAL_ROOT()
+        if latest_bid_slot != 0 and state.execution_payload_availability[slot_index] == 0:
+            return
+
     expected = get_expected_withdrawals(state)
 
     is_gloas = hasattr(state, "payload_expected_withdrawals")
@@ -469,15 +477,26 @@ def process_withdrawals(state: "BeaconState", payload=None) -> None:
         last_withdrawal = expected.withdrawals[-1]
         state.next_withdrawal_index = int(last_withdrawal.index) + 1
 
-    if len(expected.withdrawals) == MAX_WITHDRAWALS_PER_PAYLOAD():
-        next_index = (
-            int(expected.withdrawals[-1].validator_index) + 1
-        ) % len(state.validators)
-        state.next_withdrawal_validator_index = next_index
-    elif len(state.validators) > 0:
-        state.next_withdrawal_validator_index = (
-            int(state.next_withdrawal_validator_index) + MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP()
-        ) % len(state.validators)
+    if is_gloas:
+        if len(state.validators) > 0:
+            state.next_withdrawal_validator_index = (
+                int(state.next_withdrawal_validator_index) + expected.processed_validators_sweep_count
+            ) % len(state.validators)
+    elif hasattr(state, "pending_partial_withdrawals"):
+        if len(state.validators) > 0:
+            state.next_withdrawal_validator_index = (
+                int(state.next_withdrawal_validator_index) + expected.processed_validators_sweep_count
+            ) % len(state.validators)
+    else:
+        if len(expected.withdrawals) == MAX_WITHDRAWALS_PER_PAYLOAD():
+            next_index = (
+                int(expected.withdrawals[-1].validator_index) + 1
+            ) % len(state.validators)
+            state.next_withdrawal_validator_index = next_index
+        elif len(state.validators) > 0:
+            state.next_withdrawal_validator_index = (
+                int(state.next_withdrawal_validator_index) + MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP()
+            ) % len(state.validators)
 
     if hasattr(state, "pending_partial_withdrawals") and expected.processed_partial_withdrawals_count > 0:
         state.pending_partial_withdrawals = list(

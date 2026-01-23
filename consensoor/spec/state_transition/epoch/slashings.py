@@ -31,8 +31,8 @@ def get_proportional_slashing_multiplier(state: "BeaconState") -> int:
         - Altair: PROPORTIONAL_SLASHING_MULTIPLIER_ALTAIR (2)
         - Bellatrix+: PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX (3)
     """
-    # Check for Bellatrix+ (has latest_execution_payload_header)
-    if hasattr(state, "latest_execution_payload_header"):
+    # Check for Bellatrix+ (has latest_execution_payload_header) or Gloas (execution_payload_availability)
+    if hasattr(state, "latest_execution_payload_header") or hasattr(state, "execution_payload_availability"):
         return PROPORTIONAL_SLASHING_MULTIPLIER_BELLATRIX
     # Check for Altair+ (has previous_epoch_participation)
     if hasattr(state, "previous_epoch_participation"):

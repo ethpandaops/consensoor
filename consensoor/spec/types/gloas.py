@@ -48,8 +48,14 @@ from ..constants import (
 )
 from .base import Checkpoint, Fork
 
-# Gloas-specific type alias
+# Gloas-specific type aliases
 BuilderIndex = uint64
+PayloadStatus = uint8
+
+
+class ForkChoiceNode(Container):
+    root: Root
+    payload_status: PayloadStatus
 
 
 class GloasAttestation(Container):

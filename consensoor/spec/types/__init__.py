@@ -159,6 +159,8 @@ from .fulu import (
 # Gloas (ePBS)
 from .gloas import (
     BuilderIndex,
+    PayloadStatus,
+    ForkChoiceNode,
     Builder,
     BuilderPendingWithdrawal,
     BuilderPendingPayment,
@@ -230,7 +232,7 @@ __all__ = [
     "Cell", "DataColumnSidecar", "DataColumnsByRootIdentifier", "MatrixEntry",
     "FuluBeaconState",
     # Gloas
-    "BuilderIndex", "Builder",
+    "BuilderIndex", "PayloadStatus", "ForkChoiceNode", "Builder",
     "BuilderPendingPayment", "BuilderPendingWithdrawal",
     "PayloadAttestationData", "PayloadAttestation", "PayloadAttestationMessage",
     "IndexedPayloadAttestation",
