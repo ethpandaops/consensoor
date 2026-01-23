@@ -136,105 +136,105 @@ $(FORKS) all minimal mainnet:
 
 # Explicit targets for direct invocation (alternative syntax: make test-phase0-mainnet)
 test-phase0-minimal: fetch-tests-minimal
-	@echo "Running phase0 spec tests (minimal)..."
-	python3 -m pytest tests/spec/ -v --preset=minimal \
+	@echo "Running phase0 spec tests (minimal) [parallel: $(PYTEST_PARALLEL)]..."
+	python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=minimal \
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/minimal -k "phase0"
 
 test-phase0-mainnet: fetch-tests-mainnet
-	@echo "Running phase0 spec tests (mainnet)..."
-	python3 -m pytest tests/spec/ -v --preset=mainnet \
+	@echo "Running phase0 spec tests (mainnet) [parallel: $(PYTEST_PARALLEL)]..."
+	python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=mainnet \
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/mainnet -k "phase0"
 
 test-altair-minimal: fetch-tests-minimal
-	@echo "Running altair spec tests (minimal)..."
-	python3 -m pytest tests/spec/ -v --preset=minimal \
+	@echo "Running altair spec tests (minimal) [parallel: $(PYTEST_PARALLEL)]..."
+	python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=minimal \
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/minimal -k "altair"
 
 test-altair-mainnet: fetch-tests-mainnet
-	@echo "Running altair spec tests (mainnet)..."
-	python3 -m pytest tests/spec/ -v --preset=mainnet \
+	@echo "Running altair spec tests (mainnet) [parallel: $(PYTEST_PARALLEL)]..."
+	python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=mainnet \
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/mainnet -k "altair"
 
 test-bellatrix-minimal: fetch-tests-minimal
-	@echo "Running bellatrix spec tests (minimal)..."
-	python3 -m pytest tests/spec/ -v --preset=minimal \
+	@echo "Running bellatrix spec tests (minimal) [parallel: $(PYTEST_PARALLEL)]..."
+	python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=minimal \
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/minimal -k "bellatrix"
 
 test-bellatrix-mainnet: fetch-tests-mainnet
-	@echo "Running bellatrix spec tests (mainnet)..."
-	python3 -m pytest tests/spec/ -v --preset=mainnet \
+	@echo "Running bellatrix spec tests (mainnet) [parallel: $(PYTEST_PARALLEL)]..."
+	python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=mainnet \
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/mainnet -k "bellatrix"
 
 test-capella-minimal: fetch-tests-minimal
-	@echo "Running capella spec tests (minimal)..."
-	python3 -m pytest tests/spec/ -v --preset=minimal \
+	@echo "Running capella spec tests (minimal) [parallel: $(PYTEST_PARALLEL)]..."
+	python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=minimal \
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/minimal -k "capella"
 
 test-capella-mainnet: fetch-tests-mainnet
-	@echo "Running capella spec tests (mainnet)..."
-	python3 -m pytest tests/spec/ -v --preset=mainnet \
+	@echo "Running capella spec tests (mainnet) [parallel: $(PYTEST_PARALLEL)]..."
+	python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=mainnet \
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/mainnet -k "capella"
 
 test-deneb-minimal: fetch-tests-minimal
-	@echo "Running deneb spec tests (minimal)..."
-	python3 -m pytest tests/spec/ -v --preset=minimal \
+	@echo "Running deneb spec tests (minimal) [parallel: $(PYTEST_PARALLEL)]..."
+	python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=minimal \
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/minimal -k "deneb"
 
 test-deneb-mainnet: fetch-tests-mainnet
-	@echo "Running deneb spec tests (mainnet)..."
-	python3 -m pytest tests/spec/ -v --preset=mainnet \
+	@echo "Running deneb spec tests (mainnet) [parallel: $(PYTEST_PARALLEL)]..."
+	python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=mainnet \
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/mainnet -k "deneb"
 
 test-electra-minimal: fetch-tests-minimal
-	@echo "Running electra spec tests (minimal)..."
-	python3 -m pytest tests/spec/ -v --preset=minimal \
+	@echo "Running electra spec tests (minimal) [parallel: $(PYTEST_PARALLEL)]..."
+	python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=minimal \
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/minimal -k "electra"
 
 test-electra-mainnet: fetch-tests-mainnet
-	@echo "Running electra spec tests (mainnet)..."
-	python3 -m pytest tests/spec/ -v --preset=mainnet \
+	@echo "Running electra spec tests (mainnet) [parallel: $(PYTEST_PARALLEL)]..."
+	python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=mainnet \
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/mainnet -k "electra"
 
 test-fulu-minimal: fetch-tests-minimal
-	@echo "Running fulu spec tests (minimal)..."
-	python3 -m pytest tests/spec/ -v --preset=minimal \
+	@echo "Running fulu spec tests (minimal) [parallel: $(PYTEST_PARALLEL)]..."
+	python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=minimal \
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/minimal -k "fulu"
 
 test-fulu-mainnet: fetch-tests-mainnet
-	@echo "Running fulu spec tests (mainnet)..."
-	python3 -m pytest tests/spec/ -v --preset=mainnet \
+	@echo "Running fulu spec tests (mainnet) [parallel: $(PYTEST_PARALLEL)]..."
+	python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=mainnet \
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/mainnet -k "fulu"
 
 test-gloas-minimal: fetch-tests-minimal
-	@echo "Running gloas spec tests (minimal)..."
+	@echo "Running gloas spec tests (minimal) [parallel: $(PYTEST_PARALLEL)]..."
 	@if [ -d "$(SPEC_TESTS_DIR)/tests/minimal/gloas" ]; then \
-		python3 -m pytest tests/spec/ -v --preset=minimal \
+		python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=minimal \
 			--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/minimal -k "gloas"; \
 	else \
 		echo "Note: Gloas (ePBS) not in mainline spec tests yet."; \
 		echo "Running local gloas tests..."; \
-		python3 -m pytest tests/spec/test_gloas.py -v --preset=minimal || true; \
+		python3 -m pytest tests/spec/test_gloas.py -v $(PYTEST_PARALLEL) --preset=minimal || true; \
 	fi
 
 test-gloas-mainnet: fetch-tests-mainnet
-	@echo "Running gloas spec tests (mainnet)..."
+	@echo "Running gloas spec tests (mainnet) [parallel: $(PYTEST_PARALLEL)]..."
 	@if [ -d "$(SPEC_TESTS_DIR)/tests/mainnet/gloas" ]; then \
-		python3 -m pytest tests/spec/ -v --preset=mainnet \
+		python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=mainnet \
 			--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/mainnet -k "gloas"; \
 	else \
 		echo "Note: Gloas (ePBS) not in mainline spec tests yet."; \
 		echo "Running local gloas tests..."; \
-		python3 -m pytest tests/spec/test_gloas.py -v --preset=mainnet || true; \
+		python3 -m pytest tests/spec/test_gloas.py -v $(PYTEST_PARALLEL) --preset=mainnet || true; \
 	fi
 
 test-all-minimal: fetch-tests-minimal
-	@echo "Running ALL spec tests (minimal)..."
-	python3 -m pytest tests/spec/ -v --preset=minimal \
+	@echo "Running ALL spec tests (minimal) [parallel: $(PYTEST_PARALLEL)]..."
+	python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=minimal \
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/minimal
 
 test-all-mainnet: fetch-tests-mainnet
-	@echo "Running ALL spec tests (mainnet)..."
-	python3 -m pytest tests/spec/ -v --preset=mainnet \
+	@echo "Running ALL spec tests (mainnet) [parallel: $(PYTEST_PARALLEL)]..."
+	python3 -m pytest tests/spec/ -v $(PYTEST_PARALLEL) --preset=mainnet \
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/mainnet
 
 # Docker build
