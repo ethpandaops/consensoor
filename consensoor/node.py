@@ -437,9 +437,25 @@ class BeaconNode:
             timestamp = self._genesis_time + slot * network_config.seconds_per_slot
 
             # Get prev_randao from state
+            # At epoch boundaries, we need special handling:
+            # - The current state is at the previous slot (in the old epoch)
+            # - When process_slots advances to the new epoch, process_randao_mixes_reset
+            #   copies the CURRENT epoch's mix to the NEW epoch's slot
+            # - So for slots in a new epoch, we should use the current state's epoch mix
             randao_mixes = self.state.randao_mixes
-            epoch = slot // SLOTS_PER_EPOCH()
-            prev_randao = bytes(randao_mixes[epoch % len(randao_mixes)])
+            target_epoch = slot // SLOTS_PER_EPOCH()
+            current_epoch = int(self.state.slot) // SLOTS_PER_EPOCH()
+
+            if target_epoch > current_epoch:
+                # Slot is in a new epoch - use current epoch's mix
+                # (which will be copied to the new epoch during epoch processing)
+                prev_randao = bytes(randao_mixes[current_epoch % len(randao_mixes)])
+                logger.debug(
+                    f"Epoch boundary: using current_epoch={current_epoch} randao for target_epoch={target_epoch}"
+                )
+            else:
+                # Same epoch - use the target epoch's mix directly
+                prev_randao = bytes(randao_mixes[target_epoch % len(randao_mixes)])
 
             payload_attributes = {
                 "timestamp": hex(timestamp),
