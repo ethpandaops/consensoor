@@ -195,6 +195,10 @@ class BeaconNode:
         await self._setup_beacon_api()
 
         self._running = True
+
+        # Prepare initial payload for slot 1 (or current slot + 1)
+        await self._prepare_initial_payload()
+
         self._slot_ticker_task = asyncio.create_task(self._slot_ticker())
 
         logger.info(f"Beacon node started at slot {self.head_slot}")
@@ -438,6 +442,109 @@ class BeaconNode:
         )
         await self.beacon_api.start()
 
+    async def _prepare_initial_payload(self) -> None:
+        """Prepare initial payload for first slot after genesis.
+
+        This ensures we have a payload_id ready when the first slot starts,
+        so we can produce a block if we're the proposer.
+        """
+        if not self.engine or not self.state:
+            logger.warning("Cannot prepare initial payload: no engine or state")
+            return
+
+        network_config = get_config()
+        current_time = int(time.time())
+        current_slot = (current_time - self._genesis_time) // network_config.seconds_per_slot
+
+        # Prepare for the next slot (current_slot + 1, or slot 1 if before genesis)
+        target_slot = max(1, current_slot + 1)
+
+        logger.info(f"Preparing initial payload for slot {target_slot}")
+
+        # Call forkchoice_updated with payload_attributes for target_slot
+        # We use slot - 1 as the "current slot" for _update_forkchoice_for_slot
+        await self._update_forkchoice_for_slot(target_slot - 1)
+
+    async def _request_payload_for_slot(self, slot: int) -> None:
+        """Request a fresh payload for a specific slot.
+
+        This is used when we need to build a block but don't have a valid payload_id,
+        or when the existing payload_id might be for a different slot.
+        """
+        if not self.engine or not self.state:
+            logger.warning("Cannot request payload: no engine or state")
+            return
+
+        try:
+            network_config = get_config()
+            timestamp = self._genesis_time + slot * network_config.seconds_per_slot
+
+            # Get the current head block hash
+            if hasattr(self.state, "latest_block_hash"):
+                head_block_hash = bytes(self.state.latest_block_hash)
+            else:
+                head_block_hash = bytes(
+                    self.state.latest_execution_payload_header.block_hash
+                )
+
+            forkchoice_state = ForkchoiceState(
+                head_block_hash=head_block_hash,
+                safe_block_hash=head_block_hash,
+                finalized_block_hash=b"\x00" * 32,
+            )
+
+            # Get prev_randao from state for this slot
+            # At epoch boundaries, we need special handling:
+            # - The current state is at some slot (possibly in the old epoch)
+            # - When process_slots advances to a new epoch, process_randao_mixes_reset
+            #   copies the CURRENT epoch's mix to the NEW epoch's slot
+            # - So for slots in a new epoch, we should use the current state's epoch mix
+            randao_mixes = self.state.randao_mixes
+            target_epoch = slot // SLOTS_PER_EPOCH()
+            current_epoch = int(self.state.slot) // SLOTS_PER_EPOCH()
+
+            if target_epoch > current_epoch:
+                # Target slot is in a new epoch - use current epoch's mix
+                # (which will be copied to the new epoch during epoch processing)
+                prev_randao = bytes(randao_mixes[current_epoch % len(randao_mixes)])
+                logger.debug(
+                    f"Epoch boundary: using current_epoch={current_epoch} randao for target_epoch={target_epoch}"
+                )
+            else:
+                # Same epoch - use the target epoch's mix directly
+                prev_randao = bytes(randao_mixes[target_epoch % len(randao_mixes)])
+
+            payload_attributes = {
+                "timestamp": hex(timestamp),
+                "prevRandao": "0x" + prev_randao.hex(),
+                "suggestedFeeRecipient": "0x" + "00" * 20,
+                "withdrawals": [],
+                "parentBeaconBlockRoot": "0x" + (self.head_root or b"\x00" * 32).hex(),
+            }
+
+            logger.info(
+                f"Requesting payload for slot {slot}: head_hash={head_block_hash.hex()[:16]}, "
+                f"timestamp={timestamp}, prev_randao={prev_randao.hex()[:16]}, "
+                f"state_slot={self.state.slot}, target_epoch={target_epoch}, current_epoch={current_epoch}"
+            )
+
+            response = await self.engine.forkchoice_updated(
+                forkchoice_state, payload_attributes, timestamp=timestamp
+            )
+
+            if response.payload_id:
+                logger.info(f"Got fresh payload_id for slot {slot}: {response.payload_id.hex()}")
+                self._current_payload_id = response.payload_id
+            else:
+                logger.warning(
+                    f"Failed to get payload_id for slot {slot}: status={response.payload_status.status}"
+                )
+                self._current_payload_id = None
+
+        except Exception as e:
+            logger.error(f"Failed to request payload for slot {slot}: {e}")
+            self._current_payload_id = None
+
     async def _slot_ticker(self) -> None:
         """Tick every slot and process duties."""
         network_config = get_config()
@@ -472,17 +579,17 @@ class BeaconNode:
         # Compute attester duties for current epoch if not cached
         await self._ensure_attester_duties(epoch)
 
-        # Update forkchoice to keep EL in sync
-        await self._update_forkchoice_for_slot(slot)
-
-        # Check if we should propose a block
+        # Check if we should propose a block FIRST (uses payload_id from previous slot's forkchoice)
         await self._maybe_propose_block(slot)
+
+        # Update forkchoice to keep EL in sync and prepare payload for NEXT slot
+        await self._update_forkchoice_for_slot(slot)
 
         # Produce attestations for this slot
         await self._produce_attestations(slot)
 
     async def _update_forkchoice_for_slot(self, slot: int) -> None:
-        """Update forkchoice with EL at the start of each slot."""
+        """Update forkchoice with EL and prepare payload for NEXT slot (slot + 1)."""
         if not self.engine or not self.state:
             return
 
@@ -495,11 +602,12 @@ class BeaconNode:
                     self.state.latest_execution_payload_header.block_hash
                 )
 
-            # Finalized block hash
-            if self.state.finalized_checkpoint.epoch > 0:
-                finalized_hash = bytes(self.state.finalized_checkpoint.root)
-            else:
-                finalized_hash = b"\x00" * 32
+            # Finalized block hash - need the EXECUTION block hash, not beacon root
+            # The finalized_checkpoint.root is a beacon block root, but EL needs execution block hash
+            # For now, use zeros until finalization (which needs looking up the finalized block)
+            # In production, we'd look up the finalized beacon block and get its execution payload hash
+            finalized_hash = b"\x00" * 32
+            finalized_epoch = int(self.state.finalized_checkpoint.epoch)
 
             forkchoice_state = ForkchoiceState(
                 head_block_hash=head_block_hash,
@@ -507,22 +615,29 @@ class BeaconNode:
                 finalized_block_hash=finalized_hash,
             )
 
-            # Prepare payload attributes for block building
+            # Prepare payload attributes for NEXT slot (slot + 1)
             network_config = get_config()
-            timestamp = self._genesis_time + slot * network_config.seconds_per_slot
+            next_slot = slot + 1
+            timestamp = self._genesis_time + next_slot * network_config.seconds_per_slot
+            import time as time_mod
+            current_time = int(time_mod.time())
+            logger.info(
+                f"Forkchoice prep for slot {next_slot}: head_hash={head_block_hash.hex()[:16]}, "
+                f"finalized_epoch={finalized_epoch}, timestamp={timestamp}, state_slot={self.state.slot}"
+            )
 
-            # Get prev_randao from state
+            # Get prev_randao from state for the next slot
             # At epoch boundaries, we need special handling:
             # - The current state is at the previous slot (in the old epoch)
             # - When process_slots advances to the new epoch, process_randao_mixes_reset
             #   copies the CURRENT epoch's mix to the NEW epoch's slot
             # - So for slots in a new epoch, we should use the current state's epoch mix
             randao_mixes = self.state.randao_mixes
-            target_epoch = slot // SLOTS_PER_EPOCH()
+            target_epoch = next_slot // SLOTS_PER_EPOCH()
             current_epoch = int(self.state.slot) // SLOTS_PER_EPOCH()
 
             if target_epoch > current_epoch:
-                # Slot is in a new epoch - use current epoch's mix
+                # Next slot is in a new epoch - use current epoch's mix
                 # (which will be copied to the new epoch during epoch processing)
                 prev_randao = bytes(randao_mixes[current_epoch % len(randao_mixes)])
                 logger.debug(
@@ -545,14 +660,19 @@ class BeaconNode:
             )
 
             if response.payload_id:
-                logger.debug(f"Payload building started: id={response.payload_id.hex()[:16]}")
-                # Store payload_id for potential block proposal
+                logger.info(f"Payload prepared for slot {next_slot}: id={response.payload_id.hex()}")
                 self._current_payload_id = response.payload_id
             else:
+                logger.warning(
+                    f"No payload_id returned for slot {next_slot}: status={response.payload_status.status}, "
+                    f"head_hash={head_block_hash.hex()[:16]}"
+                )
                 self._current_payload_id = None
 
         except Exception as e:
             logger.error(f"Failed to update forkchoice for slot {slot}: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def _maybe_propose_block(self, slot: int) -> None:
         """Check if we're the proposer and produce a block if so."""
@@ -575,7 +695,9 @@ class BeaconNode:
         if not proposer_key:
             return
 
-        logger.info(f"We are proposer for slot {slot}! Building block...")
+        logger.info(
+            f"We are proposer for slot {slot}! payload_id={self._current_payload_id.hex() if self._current_payload_id else 'None'}"
+        )
 
         try:
             await self._produce_and_broadcast_block(slot, proposer_key)
@@ -717,8 +839,8 @@ class BeaconNode:
 
     async def _produce_and_broadcast_block(self, slot: int, proposer_key) -> None:
         """Produce and broadcast a block for the given slot."""
-        if not self.engine or not self._current_payload_id:
-            logger.warning("Cannot produce block: no engine or payload_id")
+        if not self.engine:
+            logger.warning("Cannot produce block: no engine")
             return
 
         if not self.block_builder:
@@ -728,6 +850,15 @@ class BeaconNode:
         try:
             network_config = get_config()
             timestamp = self._genesis_time + slot * network_config.seconds_per_slot
+
+            # Always request a fresh payload for this slot to ensure correct timestamp
+            # This is safer than relying on a previously prepared payload which might be stale
+            logger.info(f"Requesting fresh payload for slot {slot}")
+            await self._request_payload_for_slot(slot)
+            if not self._current_payload_id:
+                logger.warning("Cannot produce block: failed to get payload_id")
+                return
+
             payload_response = await self.engine.get_payload(self._current_payload_id, timestamp=timestamp)
             execution_payload_dict = payload_response.execution_payload
             block_hash = execution_payload_dict.get("blockHash", "unknown")
@@ -768,30 +899,33 @@ class BeaconNode:
                     return
 
             new_block_hash = bytes(execution_payload.block_hash)
-            forkchoice_state = ForkchoiceState(
-                head_block_hash=new_block_hash,
-                safe_block_hash=new_block_hash,
-                finalized_block_hash=(
-                    bytes(self.state.finalized_checkpoint.root)
-                    if self.state and int(self.state.finalized_checkpoint.epoch) > 0
-                    else b"\x00" * 32
-                ),
-            )
 
-            fc_response = await self.engine.forkchoice_updated(forkchoice_state, timestamp=int(execution_payload.timestamp))
-            logger.info(f"Forkchoice updated: {fc_response.payload_status.status}")
-
+            # Apply the produced block to state FIRST so subsequent forkchoice calls
+            # use the updated state
             self.store.save_block(block_root, signed_block)
             self.head_slot = slot
             self.head_root = block_root
             self.store.set_head(block_root)
 
-            # Apply the produced block to state so forkchoice stays in sync
             await self._apply_block_to_state(block, block_root, signed_block)
+
             # Save state for epoch queries (Dora needs historical states by state_root)
             state_root = hash_tree_root(self.state)
             self.store.save_state(state_root, self.state)
             self.store.save_state(block_root, self.state)  # Also by block_root for flexibility
+
+            # Now update forkchoice with the new block
+            forkchoice_state = ForkchoiceState(
+                head_block_hash=new_block_hash,
+                safe_block_hash=new_block_hash,
+                finalized_block_hash=b"\x00" * 32,  # Use zeros for now
+            )
+
+            fc_response = await self.engine.forkchoice_updated(forkchoice_state, timestamp=int(execution_payload.timestamp))
+            logger.info(
+                f"Block forkchoice updated: status={fc_response.payload_status.status}, "
+                f"new_head={new_block_hash.hex()[:16]}"
+            )
 
             logger.info(
                 f"Block produced and applied: slot={slot}, "
@@ -1172,7 +1306,7 @@ class BeaconNode:
             return False
 
     async def _update_forkchoice(self) -> None:
-        """Update forkchoice with the execution layer."""
+        """Update forkchoice with the execution layer (no payload preparation)."""
         if not self.engine or not self.state:
             return
 
@@ -1188,18 +1322,18 @@ class BeaconNode:
                 )
                 timestamp = int(self.state.latest_execution_payload_header.timestamp)
 
+            # Use zeros for finalized hash (finalized_checkpoint.root is beacon root, not execution hash)
             forkchoice_state = ForkchoiceState(
                 head_block_hash=head_block_hash,
                 safe_block_hash=head_block_hash,
-                finalized_block_hash=bytes(
-                    self.state.finalized_checkpoint.root
-                )
-                if self.state.finalized_checkpoint.epoch > 0
-                else b"\x00" * 32,
+                finalized_block_hash=b"\x00" * 32,
             )
 
             response = await self.engine.forkchoice_updated(forkchoice_state, timestamp=timestamp)
-            logger.debug(f"Forkchoice updated: {response.payload_status.status}")
+            logger.debug(
+                f"Forkchoice updated (no payload prep): head={head_block_hash.hex()[:16]}, "
+                f"status={response.payload_status.status}"
+            )
 
         except Exception as e:
             logger.error(f"Failed to update forkchoice: {e}")

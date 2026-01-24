@@ -10,8 +10,7 @@ from .spec.constants import SLOTS_PER_EPOCH, MAX_VALIDATORS_PER_COMMITTEE, MAX_C
 from .spec.types import AttestationData
 from .spec.types.electra import Attestation as ElectraAttestation
 from .spec.types.phase0 import Phase0Attestation
-from .spec.types.base import Bitlist
-from .crypto import hash_tree_root
+from .crypto import hash_tree_root, aggregate_signatures
 
 AnyAttestation = Union[Phase0Attestation, ElectraAttestation]
 
@@ -76,7 +75,7 @@ class AttestationPool:
         """Get attestations suitable for inclusion in a block.
 
         Returns attestations from previous slots that can be included.
-        Attestations are aggregated by (slot, committee_index, data_root).
+        Attestations are aggregated by data_root (same AttestationData).
 
         Args:
             current_slot: The slot of the block being built
@@ -84,32 +83,41 @@ class AttestationPool:
             electra_fork_epoch: Epoch at which Electra fork occurs (for filtering)
 
         Returns:
-            List of attestations for block inclusion
+            List of aggregated attestations for block inclusion
         """
-        result = []
-
         slots_per_epoch = SLOTS_PER_EPOCH()
         min_slot = max(0, current_slot - slots_per_epoch)
         current_epoch = current_slot // slots_per_epoch
         is_electra_block = current_epoch >= electra_fork_epoch
         electra_start_slot = electra_fork_epoch * slots_per_epoch
 
-        # Collect individual attestations (skip aggregation for simplicity)
+        # Group attestations by data_root for aggregation
+        by_data_root: dict[bytes, list[PooledAttestation]] = defaultdict(list)
+
         for (slot, committee_index), pooled_list in self._attestations.items():
             if slot >= current_slot or slot < min_slot:
                 continue
 
-            # For Electra blocks, only include attestations from Electra epoch onwards
-            # (Phase0 and Electra attestations have incompatible formats)
+            # Fork compatibility filtering
             if is_electra_block and slot < electra_start_slot:
                 continue
-
-            # For pre-Electra blocks, only include attestations from before Electra
             if not is_electra_block and slot >= electra_start_slot:
                 continue
 
             for pooled in pooled_list:
-                result.append(pooled.attestation)
+                by_data_root[pooled.data_root].append(pooled)
+
+        # Aggregate attestations with the same data_root
+        result = []
+        for data_root, pooled_list in by_data_root.items():
+            try:
+                aggregated = self._aggregate_attestations(pooled_list, is_electra_block)
+                result.append(aggregated)
+            except Exception as e:
+                logger.warning(f"Failed to aggregate attestations for data_root {data_root.hex()[:16]}: {e}")
+                # Fall back to first attestation in the group
+                if pooled_list:
+                    result.append(pooled_list[0].attestation)
 
         # Sort by slot (newest first) and limit
         result.sort(key=lambda a: int(a.data.slot), reverse=True)
@@ -118,34 +126,169 @@ class AttestationPool:
             result = result[:max_attestations]
 
         logger.info(
-            f"Returning {len(result)} attestations for block at slot {current_slot} "
-            f"(electra_fork_epoch={electra_fork_epoch}, is_electra={is_electra_block}, "
-            f"electra_start_slot={electra_start_slot}, max={max_attestations})"
+            f"Returning {len(result)} aggregated attestations for block at slot {current_slot} "
+            f"(is_electra={is_electra_block}, max={max_attestations}, groups={len(by_data_root)})"
         )
         return result
 
-    def _merge_aggregation_bits(
-        self, bits1: Bitlist, bits2: Bitlist
-    ) -> Bitlist:
-        """Merge two aggregation bitlists (OR operation)."""
-        max_len = max(len(bits1), len(bits2))
-        AggBitsType = Attestation.fields()['aggregation_bits']
+    def _aggregate_attestations(
+        self, pooled_list: list[PooledAttestation], is_electra: bool
+    ) -> AnyAttestation:
+        """Aggregate multiple attestations with the same AttestationData.
 
-        merged = AggBitsType(*([False] * max_len))
-        for i in range(max_len):
-            val1 = bits1[i] if i < len(bits1) else False
-            val2 = bits2[i] if i < len(bits2) else False
-            merged[i] = val1 or val2
+        Only aggregates attestations with DISJOINT bit sets to avoid double-counting
+        validators' signatures (which would cause BLS verification to fail).
+
+        Args:
+            pooled_list: List of attestations with identical data
+            is_electra: Whether these are Electra-format attestations
+
+        Returns:
+            Aggregated attestation
+        """
+        if len(pooled_list) == 1:
+            return pooled_list[0].attestation
+
+        # Use the first attestation as template
+        first = pooled_list[0].attestation
+        data = first.data
+
+        # Sort by number of bits set (descending) to prefer attestations with more validators
+        sorted_pooled = sorted(
+            pooled_list,
+            key=lambda p: sum(1 for b in p.attestation.aggregation_bits if b),
+            reverse=True
+        )
+
+        # Track which bit positions we've already included
+        # Only include attestations with DISJOINT bit sets (no overlap)
+        included_bits: set[int] = set()
+        aggregatable: list[PooledAttestation] = []
+
+        for pooled in sorted_pooled:
+            att = pooled.attestation
+            att_bits = {i for i, bit in enumerate(att.aggregation_bits) if bit}
+
+            # Check for ANY overlap with already included bits
+            if att_bits & included_bits:
+                # Has overlapping bits - skip this attestation to avoid signature issues
+                continue
+
+            # No overlap - we can include this attestation
+            aggregatable.append(pooled)
+            included_bits |= att_bits
+
+        if len(aggregatable) == 0:
+            return first
+
+        if len(aggregatable) == 1:
+            return aggregatable[0].attestation
+
+        # Aggregate BLS signatures from disjoint attestations
+        signatures = [bytes(p.attestation.signature) for p in aggregatable]
+        try:
+            aggregated_sig = aggregate_signatures(signatures)
+        except Exception as e:
+            logger.warning(f"Failed to aggregate {len(signatures)} signatures: {e}, using first")
+            return aggregatable[0].attestation
+
+        logger.debug(
+            f"Aggregated {len(aggregatable)} attestations with {len(included_bits)} total bits"
+        )
+
+        if is_electra or hasattr(first, 'committee_bits'):
+            # Electra attestation - merge aggregation_bits and committee_bits
+            merged_agg_bits = self._merge_electra_aggregation_bits(aggregatable)
+            merged_committee_bits = self._merge_electra_committee_bits(aggregatable)
+
+            from .spec.types.electra import Attestation as ElectraAttestation
+            from .spec.types import BLSSignature
+
+            return ElectraAttestation(
+                aggregation_bits=merged_agg_bits,
+                data=data,
+                signature=BLSSignature(aggregated_sig),
+                committee_bits=merged_committee_bits,
+            )
+        else:
+            # Phase0 attestation - just merge aggregation_bits
+            merged_bits = self._merge_phase0_aggregation_bits(aggregatable)
+
+            from .spec.types.phase0 import Phase0Attestation
+            from .spec.types import BLSSignature
+
+            return Phase0Attestation(
+                aggregation_bits=merged_bits,
+                data=data,
+                signature=BLSSignature(aggregated_sig),
+            )
+
+    def _merge_phase0_aggregation_bits(self, pooled_list: list[PooledAttestation]):
+        """Merge aggregation bits for Phase0 attestations (OR operation)."""
+        if not pooled_list:
+            return None
+
+        # Get the length from first attestation
+        first_bits = pooled_list[0].attestation.aggregation_bits
+        bit_len = len(first_bits)
+
+        # Create merged bits
+        from .spec.types.base import Bitlist
+        AggBitsType = Bitlist[MAX_VALIDATORS_PER_COMMITTEE()]
+        merged = AggBitsType()
+
+        # Initialize with False values
+        for _ in range(bit_len):
+            merged.append(False)
+
+        # OR all bits together
+        for pooled in pooled_list:
+            bits = pooled.attestation.aggregation_bits
+            for i in range(min(len(bits), len(merged))):
+                if bits[i]:
+                    merged[i] = True
+
         return merged
 
-    def _merge_committee_bits(self, bits1, bits2):
-        """Merge two committee bitvectors (OR operation)."""
-        CommitteeBitsType = Attestation.fields()['committee_bits']
-        max_committees = MAX_COMMITTEES_PER_SLOT()
+    def _merge_electra_aggregation_bits(self, pooled_list: list[PooledAttestation]):
+        """Merge aggregation bits for Electra attestations (OR operation)."""
+        if not pooled_list:
+            return None
 
+        first_bits = pooled_list[0].attestation.aggregation_bits
+        bit_len = len(first_bits)
+
+        from .spec.types.base import Bitlist
+        AggBitsType = Bitlist[MAX_VALIDATORS_PER_COMMITTEE() * MAX_COMMITTEES_PER_SLOT()]
+        merged = AggBitsType()
+
+        for _ in range(bit_len):
+            merged.append(False)
+
+        for pooled in pooled_list:
+            bits = pooled.attestation.aggregation_bits
+            for i in range(min(len(bits), len(merged))):
+                if bits[i]:
+                    merged[i] = True
+
+        return merged
+
+    def _merge_electra_committee_bits(self, pooled_list: list[PooledAttestation]):
+        """Merge committee bits for Electra attestations (OR operation)."""
+        if not pooled_list:
+            return None
+
+        from .spec.types.base import Bitvector
+        CommitteeBitsType = Bitvector[MAX_COMMITTEES_PER_SLOT()]
         merged = CommitteeBitsType()
-        for i in range(max_committees):
-            merged[i] = bits1[i] or bits2[i]
+
+        for pooled in pooled_list:
+            if hasattr(pooled.attestation, 'committee_bits'):
+                bits = pooled.attestation.committee_bits
+                for i in range(len(bits)):
+                    if bits[i]:
+                        merged[i] = True
+
         return merged
 
     def prune(self, current_slot: int) -> int:

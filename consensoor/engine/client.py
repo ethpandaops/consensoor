@@ -98,7 +98,10 @@ class EngineAPIClient:
                     error = data["error"]
                     raise EngineAPIError(error.get("code", -1), error.get("message", ""))
 
-                return data.get("result")
+                result = data.get("result")
+                if method.startswith("engine_forkchoice"):
+                    logger.debug(f"Engine API response for {method}: {result}")
+                return result
         except aiohttp.ClientError as e:
             logger.error(f"Engine API connection error: {e}")
             raise

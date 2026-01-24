@@ -113,7 +113,10 @@ class BlockBuilder:
         execution_payload_dict: dict,
     ) -> Optional[AnySignedBeaconBlock]:
         """Build a complete signed beacon block."""
+        import time as time_mod
         from ..spec.state_transition import process_slots, process_block
+
+        build_start = time_mod.time()
 
         state = self.node.state
         if state is None:
@@ -130,7 +133,10 @@ class BlockBuilder:
 
         # Work on a copy of the state to compute state_root
         # Use SSZ round-trip instead of copy.deepcopy for deterministic behavior across architectures
+        t0 = time_mod.time()
         temp_state = state.__class__.decode_bytes(bytes(state.encode_bytes()))
+        t1 = time_mod.time()
+        logger.debug(f"State copy took {(t1-t0)*1000:.1f}ms")
         logger.info(
             f"Building block for slot={slot}: state_slot={state.slot}, "
             f"latest_header_slot={state.latest_block_header.slot}"
@@ -138,39 +144,68 @@ class BlockBuilder:
 
         # Process slots to advance state (fills in latest_block_header.state_root)
         # May return upgraded state type if crossing a fork boundary
+        t0 = time_mod.time()
         if slot > int(temp_state.slot):
             temp_state = process_slots(temp_state, slot)
+        t1 = time_mod.time()
+        logger.debug(f"process_slots took {(t1-t0)*1000:.1f}ms")
 
         # Compute parent_root from state.latest_block_header (with state_root filled in)
+        t0 = time_mod.time()
         parent_root = hash_tree_root(temp_state.latest_block_header)
+        t1 = time_mod.time()
+        logger.debug(f"parent_root hash_tree_root took {(t1-t0)*1000:.1f}ms")
 
         # Use temp_state (which may be upgraded) for RANDAO and body construction
         # This ensures correct fork version is used for domain computation
+        t0 = time_mod.time()
         randao_reveal = self._compute_randao_reveal(temp_state, slot, proposer_key)
+        t1 = time_mod.time()
+        logger.debug(f"RANDAO reveal took {(t1-t0)*1000:.1f}ms")
+
         execution_payload = self._build_execution_payload(execution_payload_dict, fork)
 
         # Get attestations from pool for inclusion (fork-specific limits)
+        # NOTE: Limiting attestations due to slow BLS verification with py_ecc (~100ms each)
+        # With 12s slots, we can handle ~8 attestations (800ms BLS time)
+        # Attestation aggregation helps by combining multiple validators into fewer attestations
         if fork in ("electra", "fulu"):
-            max_attestations = MAX_ATTESTATIONS_ELECTRA
+            max_attestations = min(8, MAX_ATTESTATIONS_ELECTRA)
         else:
-            max_attestations = MAX_ATTESTATIONS_PRE_ELECTRA
+            max_attestations = min(8, MAX_ATTESTATIONS_PRE_ELECTRA)
         net_config = get_config()
         electra_fork_epoch = getattr(net_config, 'electra_fork_epoch', 2**64 - 1)
         attestations = self.node.attestation_pool.get_attestations_for_block(
             slot, max_attestations, electra_fork_epoch
         )
         body = self._build_block_body(temp_state, randao_reveal, execution_payload, fork, attestations)
+        logger.debug(f"Block body attestations count after build: {len(body.attestations)}")
 
         # Build block with placeholder state_root
         block = self._create_block(slot, proposer_index, parent_root, b"\x00" * 32, body, fork)
+        logger.debug(f"Block attestations count after create: {len(block.body.attestations)}")
 
         # Process block on temp state to compute post-state root
         try:
+            logger.debug(f"Processing block with {len(block.body.attestations)} attestations")
+            t0 = time_mod.time()
             process_block(temp_state, block)
+            t1 = time_mod.time()
+            logger.debug(f"process_block took {(t1-t0)*1000:.1f}ms")
+
+            t0 = time_mod.time()
             state_root = hash_tree_root(temp_state)
+            t1 = time_mod.time()
+            logger.debug(f"state_root hash_tree_root took {(t1-t0)*1000:.1f}ms")
+            logger.debug(f"State root computed successfully")
         except Exception as e:
             logger.warning(f"Failed to compute state_root: {e}, using zero")
+            import traceback
+            traceback.print_exc()
             state_root = b"\x00" * 32
+
+        total_time = time_mod.time() - build_start
+        logger.info(f"Total block build time: {total_time*1000:.1f}ms")
 
         # Rebuild block with correct state_root
         block = self._create_block(slot, proposer_index, parent_root, state_root, body, fork)
@@ -328,6 +363,8 @@ class BlockBuilder:
 
         if attestations:
             logger.info(f"Including {len(attestations)} attestations in block body")
+            for i, att in enumerate(attestations[:3]):  # Log first 3 for debugging
+                logger.debug(f"  Attestation {i}: slot={att.data.slot}, committee={att.data.index}, bits={sum(1 for b in att.aggregation_bits if b)}")
 
         base_fields = {
             "randao_reveal": randao_reveal,

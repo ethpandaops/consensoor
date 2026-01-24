@@ -548,6 +548,29 @@ class BeaconAPI:
 
     def _block_body_to_json(self, body) -> dict:
         """Convert a beacon block body to JSON format."""
+        attestations_json = []
+        for att in body.attestations:
+            att_json = {
+                "aggregation_bits": "0x" + bytes(att.aggregation_bits).hex(),
+                "data": {
+                    "slot": str(att.data.slot),
+                    "index": str(att.data.index),
+                    "beacon_block_root": "0x" + bytes(att.data.beacon_block_root).hex(),
+                    "source": {
+                        "epoch": str(att.data.source.epoch),
+                        "root": "0x" + bytes(att.data.source.root).hex(),
+                    },
+                    "target": {
+                        "epoch": str(att.data.target.epoch),
+                        "root": "0x" + bytes(att.data.target.root).hex(),
+                    },
+                },
+                "signature": "0x" + bytes(att.signature).hex(),
+            }
+            if hasattr(att, "committee_bits"):
+                att_json["committee_bits"] = "0x" + bytes(att.committee_bits).hex()
+            attestations_json.append(att_json)
+
         result = {
             "randao_reveal": "0x" + bytes(body.randao_reveal).hex(),
             "eth1_data": {
@@ -558,7 +581,7 @@ class BeaconAPI:
             "graffiti": "0x" + bytes(body.graffiti).hex(),
             "proposer_slashings": [],
             "attester_slashings": [],
-            "attestations": [],
+            "attestations": attestations_json,
             "deposits": [],
             "voluntary_exits": [],
         }
