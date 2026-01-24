@@ -5,11 +5,15 @@ from dataclasses import dataclass, field
 from typing import Optional
 from collections import defaultdict
 
+from typing import Union
 from .spec.constants import SLOTS_PER_EPOCH, MAX_VALIDATORS_PER_COMMITTEE, MAX_COMMITTEES_PER_SLOT
 from .spec.types import AttestationData
-from .spec.types.electra import Attestation
+from .spec.types.electra import Attestation as ElectraAttestation
+from .spec.types.phase0 import Phase0Attestation
 from .spec.types.base import Bitlist
 from .crypto import hash_tree_root
+
+AnyAttestation = Union[Phase0Attestation, ElectraAttestation]
 
 logger = logging.getLogger(__name__)
 
@@ -18,7 +22,7 @@ logger = logging.getLogger(__name__)
 class PooledAttestation:
     """An attestation in the pool with metadata."""
 
-    attestation: Attestation
+    attestation: AnyAttestation
     data_root: bytes
     slot: int
     committee_index: int
@@ -36,7 +40,7 @@ class AttestationPool:
         self._attestations: dict[tuple[int, int], list[PooledAttestation]] = defaultdict(list)
         self._seen_data_roots: set[bytes] = set()
 
-    def add(self, attestation: Attestation) -> bool:
+    def add(self, attestation: AnyAttestation) -> bool:
         """Add an attestation to the pool.
 
         Args:
@@ -62,13 +66,13 @@ class AttestationPool:
         self._attestations[key].append(pooled)
         logger.debug(
             f"Added attestation to pool: slot={slot}, committee={committee_index}, "
-            f"bits={attestation.aggregation_bits.count()}"
+            f"bits={sum(1 for b in attestation.aggregation_bits if b)}"
         )
         return True
 
     def get_attestations_for_block(
-        self, current_slot: int, max_attestations: int = 128
-    ) -> list[Attestation]:
+        self, current_slot: int, max_attestations: int = 128, electra_fork_epoch: int = 2**64 - 1
+    ) -> list[AnyAttestation]:
         """Get attestations suitable for inclusion in a block.
 
         Returns attestations from previous slots that can be included.
@@ -77,6 +81,7 @@ class AttestationPool:
         Args:
             current_slot: The slot of the block being built
             max_attestations: Maximum number of attestations to return
+            electra_fork_epoch: Epoch at which Electra fork occurs (for filtering)
 
         Returns:
             List of attestations for block inclusion
@@ -85,42 +90,38 @@ class AttestationPool:
 
         slots_per_epoch = SLOTS_PER_EPOCH()
         min_slot = max(0, current_slot - slots_per_epoch)
+        current_epoch = current_slot // slots_per_epoch
+        is_electra_block = current_epoch >= electra_fork_epoch
+        electra_start_slot = electra_fork_epoch * slots_per_epoch
 
-        aggregated: dict[bytes, Attestation] = {}
-
+        # Collect individual attestations (skip aggregation for simplicity)
         for (slot, committee_index), pooled_list in self._attestations.items():
             if slot >= current_slot or slot < min_slot:
                 continue
 
+            # For Electra blocks, only include attestations from Electra epoch onwards
+            # (Phase0 and Electra attestations have incompatible formats)
+            if is_electra_block and slot < electra_start_slot:
+                continue
+
+            # For pre-Electra blocks, only include attestations from before Electra
+            if not is_electra_block and slot >= electra_start_slot:
+                continue
+
             for pooled in pooled_list:
-                key = pooled.data_root
+                result.append(pooled.attestation)
 
-                if key in aggregated:
-                    existing = aggregated[key]
-                    merged_agg_bits = self._merge_aggregation_bits(
-                        existing.aggregation_bits,
-                        pooled.attestation.aggregation_bits,
-                    )
-                    merged_committee_bits = self._merge_committee_bits(
-                        existing.committee_bits,
-                        pooled.attestation.committee_bits,
-                    )
-                    aggregated[key] = Attestation(
-                        aggregation_bits=merged_agg_bits,
-                        data=existing.data,
-                        signature=existing.signature,
-                        committee_bits=merged_committee_bits,
-                    )
-                else:
-                    aggregated[key] = pooled.attestation
-
-        result = list(aggregated.values())
+        # Sort by slot (newest first) and limit
         result.sort(key=lambda a: int(a.data.slot), reverse=True)
 
         if len(result) > max_attestations:
             result = result[:max_attestations]
 
-        logger.info(f"Returning {len(result)} attestations for block at slot {current_slot}")
+        logger.info(
+            f"Returning {len(result)} attestations for block at slot {current_slot} "
+            f"(electra_fork_epoch={electra_fork_epoch}, is_electra={is_electra_block}, "
+            f"electra_start_slot={electra_start_slot}, max={max_attestations})"
+        )
         return result
 
     def _merge_aggregation_bits(
@@ -128,9 +129,9 @@ class AttestationPool:
     ) -> Bitlist:
         """Merge two aggregation bitlists (OR operation)."""
         max_len = max(len(bits1), len(bits2))
-        max_size = MAX_VALIDATORS_PER_COMMITTEE() * MAX_COMMITTEES_PER_SLOT()
+        AggBitsType = Attestation.fields()['aggregation_bits']
 
-        merged = Bitlist[max_size](*([False] * max_len))
+        merged = AggBitsType(*([False] * max_len))
         for i in range(max_len):
             val1 = bits1[i] if i < len(bits1) else False
             val2 = bits2[i] if i < len(bits2) else False
@@ -139,10 +140,10 @@ class AttestationPool:
 
     def _merge_committee_bits(self, bits1, bits2):
         """Merge two committee bitvectors (OR operation)."""
-        from .spec.types.base import Bitvector
-
+        CommitteeBitsType = Attestation.fields()['committee_bits']
         max_committees = MAX_COMMITTEES_PER_SLOT()
-        merged = Bitvector[max_committees]()
+
+        merged = CommitteeBitsType()
         for i in range(max_committees):
             merged[i] = bits1[i] or bits2[i]
         return merged

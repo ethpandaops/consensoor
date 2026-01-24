@@ -59,9 +59,71 @@ logger = logging.getLogger(__name__)
 
 
 def decode_signed_beacon_block(ssz_bytes: bytes) -> AnySignedBeaconBlock:
-    """Decode a signed beacon block, trying different fork types."""
+    """Decode a signed beacon block, trying different fork types.
+
+    Tries forks from newest to oldest (excluding Gloas for now since it has a
+    completely different structure with SignedExecutionPayloadBid).
+    Electra/Fulu use the same block format.
+    """
+    from .spec.network_config import get_config
+    from .spec.constants import SLOTS_PER_EPOCH
+
+    config = get_config()
+
+    # Try to peek at slot to determine fork (slot is at fixed offset in SSZ)
+    # SignedBeaconBlock: message offset (4 bytes) + signature (96 bytes) at start
+    # BeaconBlock: slot (8 bytes) is first field
+    # So slot is at offset 4 (after the message offset)
+    try:
+        slot = int.from_bytes(ssz_bytes[4:12], "little")
+        epoch = slot // SLOTS_PER_EPOCH()
+
+        # Determine expected fork based on slot
+        if hasattr(config, 'gloas_fork_epoch') and epoch >= config.gloas_fork_epoch:
+            try:
+                block = SignedBeaconBlock.decode_bytes(ssz_bytes)
+                logger.debug(f"Block slot={slot} decoded as Gloas format")
+                return block
+            except Exception:
+                pass
+
+        if hasattr(config, 'electra_fork_epoch') and epoch >= config.electra_fork_epoch:
+            try:
+                block = SignedElectraBeaconBlock.decode_bytes(ssz_bytes)
+                logger.debug(f"Block slot={slot} decoded as Electra/Fulu format")
+                return block
+            except Exception:
+                pass
+
+        if hasattr(config, 'deneb_fork_epoch') and epoch >= config.deneb_fork_epoch:
+            try:
+                block = SignedDenebBeaconBlock.decode_bytes(ssz_bytes)
+                logger.debug(f"Block slot={slot} decoded as Deneb format")
+                return block
+            except Exception:
+                pass
+
+        if hasattr(config, 'capella_fork_epoch') and epoch >= config.capella_fork_epoch:
+            try:
+                block = SignedCapellaBeaconBlock.decode_bytes(ssz_bytes)
+                logger.debug(f"Block slot={slot} decoded as Capella format")
+                return block
+            except Exception:
+                pass
+
+        # Bellatrix or earlier
+        try:
+            block = SignedBellatrixBeaconBlock.decode_bytes(ssz_bytes)
+            logger.debug(f"Block slot={slot} decoded as Bellatrix format")
+            return block
+        except Exception:
+            pass
+
+    except Exception as e:
+        logger.debug(f"Failed to peek at slot: {e}, falling back to brute force")
+
+    # Fallback: try all types from newest to oldest (excluding Gloas)
     block_types = [
-        ("Gloas", SignedBeaconBlock),
         ("Electra", SignedElectraBeaconBlock),
         ("Deneb", SignedDenebBeaconBlock),
         ("Capella", SignedCapellaBeaconBlock),
@@ -71,7 +133,7 @@ def decode_signed_beacon_block(ssz_bytes: bytes) -> AnySignedBeaconBlock:
     for fork_name, block_type in block_types:
         try:
             block = block_type.decode_bytes(ssz_bytes)
-            logger.debug(f"Block decoded as {fork_name} format")
+            logger.debug(f"Block decoded as {fork_name} format (fallback)")
             return block
         except Exception as e:
             logger.debug(f"Failed to decode block as {fork_name}: {e}")
@@ -500,12 +562,16 @@ class BeaconNode:
         if not self.state:
             return
 
-        # Advance state to target slot before checking proposer duties
-        # This is necessary because fork upgrades can change the proposer calculation
-        if slot > int(self.state.slot):
-            self.state = process_slots(self.state, slot)
+        # Use a temp copy for proposer duty calculation to avoid mutating self.state
+        # This is necessary because state_transition needs to advance state from pre-slot
+        temp_state = self.state
+        if slot > int(temp_state.slot):
+            temp_state = process_slots(
+                temp_state.__class__.decode_bytes(bytes(temp_state.encode_bytes())),
+                slot
+            )
 
-        proposer_key = self.validator_client.is_our_proposer_slot(self.state, slot)
+        proposer_key = self.validator_client.is_our_proposer_slot(temp_state, slot)
         if not proposer_key:
             return
 
@@ -551,12 +617,20 @@ class BeaconNode:
         if not slot_duties:
             return
 
+        # Use temp state advanced to current slot for attestation production
+        temp_state = self.state
+        if slot > int(temp_state.slot):
+            temp_state = process_slots(
+                temp_state.__class__.decode_bytes(bytes(temp_state.encode_bytes())),
+                slot
+            )
+
         logger.info(f"Producing {len(slot_duties)} attestations for slot {slot}")
 
         for duty in slot_duties:
             try:
                 attestation = self.validator_client.produce_attestation(
-                    self.state, duty, self.head_root
+                    temp_state, duty, self.head_root
                 )
                 if attestation:
                     self.attestation_pool.add(attestation)
@@ -564,8 +638,82 @@ class BeaconNode:
                         f"Attestation produced: slot={slot}, committee={duty.committee_index}, "
                         f"validator={duty.validator_index}"
                     )
+
+                    # Broadcast via P2P as aggregate
+                    if self.beacon_gossip:
+                        try:
+                            await self._broadcast_attestation_as_aggregate(
+                                attestation, duty.validator_index, duty.pubkey
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to broadcast attestation: {e}")
             except Exception as e:
                 logger.error(f"Failed to produce attestation for duty {duty}: {e}")
+
+    def _is_electra_fork(self) -> bool:
+        """Check if current state is at Electra or later fork."""
+        if not self.state:
+            return False
+        return hasattr(self.state, "pending_deposits")
+
+    async def _broadcast_attestation_as_aggregate(
+        self, attestation, validator_index: int, pubkey: bytes
+    ) -> None:
+        """Wrap attestation in SignedAggregateAndProof and broadcast."""
+        from .spec.types.electra import ElectraAggregateAndProof, SignedElectraAggregateAndProof
+        from .spec.types.phase0 import AggregateAndProof, SignedAggregateAndProof
+        from .spec.types.base import BLSSignature
+        from .spec.constants import DOMAIN_SELECTION_PROOF, DOMAIN_AGGREGATE_AND_PROOF
+        from .spec.state_transition.helpers.domain import get_domain, compute_signing_root
+        from .spec.types import Slot
+
+        key = self.validator_client.get_key(pubkey)
+        if not key:
+            return
+
+        slot = int(attestation.data.slot)
+        epoch = slot // SLOTS_PER_EPOCH()
+
+        # Create selection proof (sign the slot)
+        domain = get_domain(self.state, DOMAIN_SELECTION_PROOF, epoch)
+        signing_root = compute_signing_root(Slot(slot), domain)
+        selection_proof = sign(key.privkey, signing_root)
+
+        is_electra = self._is_electra_fork()
+
+        if is_electra:
+            aggregate_and_proof = ElectraAggregateAndProof(
+                aggregator_index=validator_index,
+                aggregate=attestation,
+                selection_proof=BLSSignature(selection_proof),
+            )
+        else:
+            aggregate_and_proof = AggregateAndProof(
+                aggregator_index=validator_index,
+                aggregate=attestation,
+                selection_proof=BLSSignature(selection_proof),
+            )
+
+        # Sign the aggregate and proof
+        domain = get_domain(self.state, DOMAIN_AGGREGATE_AND_PROOF, epoch)
+        signing_root = compute_signing_root(aggregate_and_proof, domain)
+        signature = sign(key.privkey, signing_root)
+
+        if is_electra:
+            signed_aggregate = SignedElectraAggregateAndProof(
+                message=aggregate_and_proof,
+                signature=BLSSignature(signature),
+            )
+        else:
+            signed_aggregate = SignedAggregateAndProof(
+                message=aggregate_and_proof,
+                signature=BLSSignature(signature),
+            )
+
+        # Broadcast
+        ssz_bytes = signed_aggregate.encode_bytes()
+        await self.beacon_gossip.publish_aggregate(ssz_bytes)
+        logger.debug(f"Broadcast attestation as aggregate for slot {slot}, electra={is_electra}")
 
     async def _produce_and_broadcast_block(self, slot: int, proposer_key) -> None:
         """Produce and broadcast a block for the given slot."""
@@ -835,9 +983,32 @@ class BeaconNode:
     async def _on_p2p_aggregate(self, data: bytes, from_peer: str) -> None:
         """Handle an aggregate attestation received via libp2p gossipsub."""
         try:
-            attestation = Attestation.decode_bytes(data)
-            logger.debug(
-                f"P2P: Received aggregate slot={attestation.data.slot}, "
+            from .spec.types.electra import SignedElectraAggregateAndProof
+            from .spec.types.phase0 import SignedAggregateAndProof
+
+            # Try Electra format first, then Phase0
+            signed_aggregate = None
+            attestation = None
+
+            try:
+                signed_aggregate = SignedElectraAggregateAndProof.decode_bytes(data)
+                attestation = signed_aggregate.message.aggregate
+            except Exception:
+                try:
+                    signed_aggregate = SignedAggregateAndProof.decode_bytes(data)
+                    attestation = signed_aggregate.message.aggregate
+                except Exception as e:
+                    logger.error(f"Failed to decode aggregate as any known format: {e}")
+                    return
+
+            slot = int(attestation.data.slot)
+
+            # Add to attestation pool
+            self.attestation_pool.add(attestation)
+
+            logger.info(
+                f"P2P: Received aggregate slot={slot}, "
+                f"aggregator={signed_aggregate.message.aggregator_index}, "
                 f"from={from_peer[:16]}"
             )
         except Exception as e:

@@ -12,7 +12,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from ..types import Fork
-from ..types.base import Version, Epoch, Gwei, ValidatorIndex, uint64, Bytes32, Hash32, Root
+from ..types.base import Version, Epoch, Gwei, ValidatorIndex, uint64, Bytes32, Hash32, Root, Bitvector
 from ..types.bellatrix import BellatrixBeaconState, ExecutionPayloadHeaderBellatrix
 from ..types.capella import (
     CapellaBeaconState,
@@ -378,7 +378,7 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
         proposer_lookahead=pre.proposer_lookahead,
         builders=[],
         next_withdrawal_builder_index=uint64(0),
-        execution_payload_availability=[False] * slots_per_hist,
+        execution_payload_availability=Bitvector[slots_per_hist](),
         builder_pending_payments=[empty_pending_payment] * slots_2x_epoch,
         builder_pending_withdrawals=[],
         latest_block_hash=Hash32(pre_header.block_hash),

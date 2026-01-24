@@ -19,6 +19,10 @@ from ..spec.types.phase0 import Phase0Attestation
 from ..spec.types.electra import Attestation as ElectraAttestation
 from ..spec.types.base import Checkpoint, Bitlist, Bitvector
 from ..spec.constants import MAX_VALIDATORS_PER_COMMITTEE, MAX_COMMITTEES_PER_SLOT
+
+Phase0AggregationBits = Bitlist[MAX_VALIDATORS_PER_COMMITTEE()]
+ElectraAggregationBits = Bitlist[MAX_VALIDATORS_PER_COMMITTEE() * MAX_COMMITTEES_PER_SLOT()]
+ElectraCommitteeBits = Bitvector[MAX_COMMITTEES_PER_SLOT()]
 from ..crypto import sign as bls_sign
 from .types import ValidatorKey, ProposerDuty, AttesterDuty
 from .shuffling import get_beacon_proposer_index
@@ -160,9 +164,14 @@ class ValidatorClient:
 
         return duties
 
+    def _is_electra_fork(self, state) -> bool:
+        """Check if the state is at or after Electra fork."""
+        # Electra states have pending_deposits field
+        return hasattr(state, "pending_deposits")
+
     def produce_attestation(
         self, state, duty: AttesterDuty, head_root: bytes
-    ) -> Optional[ElectraAttestation]:
+    ):
         """Produce an attestation for the given duty.
 
         Args:
@@ -178,7 +187,16 @@ class ValidatorClient:
             committee_index = duty.committee_index
             epoch = compute_epoch_at_slot(slot)
 
-            target_root = get_block_root(state, epoch)
+            # Get target root - the block root at the start of the target epoch
+            # If we're at the first slot of the epoch, we can't get that slot's root yet
+            # In that case, use the head_root (most recent known block)
+            epoch_start_slot = epoch * SLOTS_PER_EPOCH()
+            if epoch_start_slot < int(state.slot):
+                target_root = get_block_root(state, epoch)
+            else:
+                # At or before epoch start - use head_root as target
+                target_root = head_root
+
             source = state.current_justified_checkpoint
 
             target = Checkpoint(
@@ -186,47 +204,66 @@ class ValidatorClient:
                 root=target_root,
             )
 
-            attestation_data = AttestationData(
-                slot=slot,
-                index=0,  # Electra attestations use committee_bits, not index in data
-                beacon_block_root=head_root,
-                source=source,
-                target=target,
-            )
-
-            max_validators = MAX_VALIDATORS_PER_COMMITTEE()
-            max_committees = MAX_COMMITTEES_PER_SLOT()
-
-            # Electra-style: aggregation_bits spans all committees
-            # Position = committee_index * committee_length + validator_committee_index
-            total_bits = max_validators * max_committees
-            aggregation_bits = Bitlist[total_bits](*([False] * total_bits))
-            bit_position = committee_index * duty.committee_length + duty.validator_committee_index
-            aggregation_bits[bit_position] = True
-
-            # Set the committee bit
-            committee_bits = Bitvector[max_committees]()
-            committee_bits[committee_index] = True
-
             key = self.keys.get(duty.pubkey)
             if key is None:
                 logger.error(f"No key found for pubkey {duty.pubkey.hex()[:16]}...")
                 return None
 
             domain = get_domain(state, DOMAIN_BEACON_ATTESTER, epoch)
-            signing_root = compute_signing_root(attestation_data, domain)
-            signature = bls_sign(key.privkey, signing_root)
 
-            attestation = ElectraAttestation(
-                aggregation_bits=aggregation_bits,
-                data=attestation_data,
-                signature=signature,
-                committee_bits=committee_bits,
-            )
+            if self._is_electra_fork(state):
+                # Electra+ attestations use committee_bits
+                attestation_data = AttestationData(
+                    slot=slot,
+                    index=0,  # Electra attestations use committee_bits, not index in data
+                    beacon_block_root=head_root,
+                    source=source,
+                    target=target,
+                )
+
+                aggregation_bits = ElectraAggregationBits()
+                for i in range(duty.committee_length):
+                    aggregation_bits.append(i == duty.validator_committee_index)
+
+                committee_bits = ElectraCommitteeBits()
+                committee_bits[committee_index] = True
+
+                signing_root = compute_signing_root(attestation_data, domain)
+                signature = bls_sign(key.privkey, signing_root)
+
+                attestation = ElectraAttestation(
+                    aggregation_bits=aggregation_bits,
+                    data=attestation_data,
+                    signature=signature,
+                    committee_bits=committee_bits,
+                )
+            else:
+                # Pre-Electra attestations (Phase0 through Deneb)
+                attestation_data = AttestationData(
+                    slot=slot,
+                    index=committee_index,  # Pre-Electra uses index in data
+                    beacon_block_root=head_root,
+                    source=source,
+                    target=target,
+                )
+
+                aggregation_bits = Phase0AggregationBits()
+                for i in range(duty.committee_length):
+                    aggregation_bits.append(i == duty.validator_committee_index)
+
+                signing_root = compute_signing_root(attestation_data, domain)
+                signature = bls_sign(key.privkey, signing_root)
+
+                attestation = Phase0Attestation(
+                    aggregation_bits=aggregation_bits,
+                    data=attestation_data,
+                    signature=signature,
+                )
 
             logger.info(
                 f"Produced attestation: slot={slot}, committee={committee_index}, "
-                f"target_epoch={epoch}, source_epoch={int(source.epoch)}"
+                f"target_epoch={epoch}, source_epoch={int(source.epoch)}, "
+                f"electra={self._is_electra_fork(state)}"
             )
 
             return attestation

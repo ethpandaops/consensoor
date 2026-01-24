@@ -42,6 +42,8 @@ from ..spec.constants import (
     DOMAIN_RANDAO,
     DOMAIN_BEACON_PROPOSER,
     SYNC_COMMITTEE_SIZE,
+    MAX_ATTESTATIONS_PRE_ELECTRA,
+    MAX_ATTESTATIONS_ELECTRA,
 )
 from ..spec.network_config import get_config
 from ..crypto import sign, compute_signing_root, hash_tree_root
@@ -147,8 +149,16 @@ class BlockBuilder:
         randao_reveal = self._compute_randao_reveal(temp_state, slot, proposer_key)
         execution_payload = self._build_execution_payload(execution_payload_dict, fork)
 
-        # Get attestations from pool for inclusion
-        attestations = self.node.attestation_pool.get_attestations_for_block(slot)
+        # Get attestations from pool for inclusion (fork-specific limits)
+        if fork in ("electra", "fulu"):
+            max_attestations = MAX_ATTESTATIONS_ELECTRA
+        else:
+            max_attestations = MAX_ATTESTATIONS_PRE_ELECTRA
+        net_config = get_config()
+        electra_fork_epoch = getattr(net_config, 'electra_fork_epoch', 2**64 - 1)
+        attestations = self.node.attestation_pool.get_attestations_for_block(
+            slot, max_attestations, electra_fork_epoch
+        )
         body = self._build_block_body(temp_state, randao_reveal, execution_payload, fork, attestations)
 
         # Build block with placeholder state_root

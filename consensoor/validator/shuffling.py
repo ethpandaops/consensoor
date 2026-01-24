@@ -64,21 +64,41 @@ def get_seed(state, epoch: int, domain_type: bytes) -> bytes:
 
 
 def compute_proposer_index(state, indices: list[int], seed: bytes) -> int:
-    """Return from indices a random index sampled by effective balance."""
+    """Return from indices a random index sampled by effective balance.
+
+    Note: Electra (EIP-7251) modifies this function to use 2-byte random values
+    and MAX_EFFECTIVE_BALANCE_ELECTRA for improved precision with higher balances.
+    """
     assert len(indices) > 0
-    MAX_RANDOM_BYTE = 2**8 - 1
-    MAX_EFFECTIVE_BALANCE = 32 * 10**9
+
+    is_electra = hasattr(state, "pending_deposits")
 
     i = 0
     total = len(indices)
-    while True:
-        candidate_index = indices[compute_shuffled_index(i % total, total, seed)]
-        random_byte_input = seed + _uint_to_bytes(i // 32, 8)
-        random_byte = sha256(random_byte_input)[i % 32]
-        effective_balance = int(state.validators[candidate_index].effective_balance)
-        if effective_balance * MAX_RANDOM_BYTE >= MAX_EFFECTIVE_BALANCE * random_byte:
-            return candidate_index
-        i += 1
+
+    if is_electra:
+        MAX_RANDOM_VALUE = 2**16 - 1
+        MAX_EFFECTIVE_BALANCE_ELECTRA = 2048 * 10**9
+        while True:
+            candidate_index = indices[compute_shuffled_index(i % total, total, seed)]
+            random_bytes = sha256(seed + _uint_to_bytes(i // 16, 8))
+            offset = (i % 16) * 2
+            random_value = int.from_bytes(random_bytes[offset:offset + 2], "little")
+            effective_balance = int(state.validators[candidate_index].effective_balance)
+            if effective_balance * MAX_RANDOM_VALUE >= MAX_EFFECTIVE_BALANCE_ELECTRA * random_value:
+                return candidate_index
+            i += 1
+    else:
+        MAX_RANDOM_BYTE = 2**8 - 1
+        MAX_EFFECTIVE_BALANCE = 32 * 10**9
+        while True:
+            candidate_index = indices[compute_shuffled_index(i % total, total, seed)]
+            random_byte_input = seed + _uint_to_bytes(i // 32, 8)
+            random_byte = sha256(random_byte_input)[i % 32]
+            effective_balance = int(state.validators[candidate_index].effective_balance)
+            if effective_balance * MAX_RANDOM_BYTE >= MAX_EFFECTIVE_BALANCE * random_byte:
+                return candidate_index
+            i += 1
 
 
 def get_beacon_proposer_index(state, slot: int) -> int:
