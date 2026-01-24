@@ -135,15 +135,21 @@ class BlockBuilder:
         )
 
         # Process slots to advance state (fills in latest_block_header.state_root)
+        # May return upgraded state type if crossing a fork boundary
         if slot > int(temp_state.slot):
-            process_slots(temp_state, slot)
+            temp_state = process_slots(temp_state, slot)
 
         # Compute parent_root from state.latest_block_header (with state_root filled in)
         parent_root = hash_tree_root(temp_state.latest_block_header)
 
-        randao_reveal = self._compute_randao_reveal(state, slot, proposer_key)
+        # Use temp_state (which may be upgraded) for RANDAO and body construction
+        # This ensures correct fork version is used for domain computation
+        randao_reveal = self._compute_randao_reveal(temp_state, slot, proposer_key)
         execution_payload = self._build_execution_payload(execution_payload_dict, fork)
-        body = self._build_block_body(state, randao_reveal, execution_payload, fork)
+
+        # Get attestations from pool for inclusion
+        attestations = self.node.attestation_pool.get_attestations_for_block(slot)
+        body = self._build_block_body(temp_state, randao_reveal, execution_payload, fork, attestations)
 
         # Build block with placeholder state_root
         block = self._create_block(slot, proposer_index, parent_root, b"\x00" * 32, body, fork)
@@ -302,7 +308,7 @@ class BlockBuilder:
 
         return ExecutionPayload(**base_fields)
 
-    def _build_block_body(self, state, randao_reveal: BLSSignature, execution_payload, fork: str):
+    def _build_block_body(self, state, randao_reveal: BLSSignature, execution_payload, fork: str, attestations=None):
         """Build the beacon block body for the appropriate fork."""
         sync_committee_size = SYNC_COMMITTEE_SIZE()
         empty_sync_aggregate = SyncAggregate(
@@ -310,13 +316,16 @@ class BlockBuilder:
             sync_committee_signature=BLSSignature(b"\xc0" + b"\x00" * 95),
         )
 
+        if attestations:
+            logger.info(f"Including {len(attestations)} attestations in block body")
+
         base_fields = {
             "randao_reveal": randao_reveal,
             "eth1_data": state.eth1_data,
             "graffiti": Bytes32(self.node.config.graffiti_bytes),
             "proposer_slashings": [],
             "attester_slashings": [],
-            "attestations": [],
+            "attestations": attestations or [],
             "deposits": [],
             "voluntary_exits": [],
             "sync_aggregate": empty_sync_aggregate,

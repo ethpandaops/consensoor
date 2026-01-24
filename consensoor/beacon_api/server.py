@@ -45,6 +45,7 @@ class BeaconAPI:
         self.app.router.add_get("/eth/v1/beacon/headers", self.get_headers)
         self.app.router.add_get("/eth/v1/beacon/headers/{block_id}", self.get_header)
         self.app.router.add_get("/eth/v2/beacon/blocks/{block_id}", self.get_block)
+        self.app.router.add_get("/eth/v2/debug/beacon/states/{state_id}", self.get_debug_state)
         self.app.router.add_get("/eth/v1/config/spec", self.get_spec)
         self.app.router.add_get("/eth/v1/events", self.get_events)
 
@@ -614,6 +615,103 @@ class BeaconAPI:
         """GET /eth/v1/config/spec"""
         spec = build_spec_response()
         return web.json_response({"data": spec})
+
+    def _get_state_version(self, state) -> str:
+        """Determine the fork version string for a state."""
+        if hasattr(state, "proposer_lookahead"):
+            return "fulu"
+        if hasattr(state, "pending_deposits"):
+            return "electra"
+        if hasattr(state, "latest_execution_payload_header") and hasattr(
+            state.latest_execution_payload_header, "blob_gas_used"
+        ):
+            return "deneb"
+        if hasattr(state, "latest_execution_payload_header") and hasattr(
+            state.latest_execution_payload_header, "withdrawals_root"
+        ):
+            return "capella"
+        if hasattr(state, "latest_execution_payload_header"):
+            return "bellatrix"
+        if hasattr(state, "current_sync_committee"):
+            return "altair"
+        return "phase0"
+
+    def _resolve_state_id(self, state_id: str):
+        """Resolve a state_id to the actual state object.
+
+        Supports: "head", "finalized", "justified", "genesis", slot number, state root, or block root.
+        Returns None if not found.
+        """
+        if state_id == "head":
+            return self.node.state
+        if state_id == "genesis":
+            return self.node.state if self.node.state and int(self.node.state.slot) == 0 else None
+        if state_id in ("finalized", "justified"):
+            return self.node.state
+        if state_id.startswith("0x"):
+            try:
+                root = bytes.fromhex(state_id[2:])
+                if len(root) == 32:
+                    if self.node.state:
+                        from ..crypto import hash_tree_root
+                        current_state_root = hash_tree_root(self.node.state)
+                        if current_state_root == root:
+                            return self.node.state
+                        header = self.node.state.latest_block_header
+                        if bytes(header.state_root) == root:
+                            return self.node.state
+                    stored_state = self.node.store.get_state(root)
+                    if stored_state:
+                        return stored_state
+                    block = self.node.store.get_block(root)
+                    if block and hasattr(block, "message"):
+                        block_state_root = bytes(block.message.state_root)
+                        stored_state = self.node.store.get_state(block_state_root)
+                        if stored_state:
+                            return stored_state
+                        if self.node.state:
+                            from ..crypto import hash_tree_root
+                            current_state_root = hash_tree_root(self.node.state)
+                            if current_state_root == block_state_root:
+                                return self.node.state
+            except ValueError:
+                pass
+            return None
+        try:
+            slot = int(state_id)
+            if self.node.state and int(self.node.state.slot) == slot:
+                return self.node.state
+            return None
+        except ValueError:
+            return None
+
+    async def get_debug_state(self, request: web.Request) -> web.Response:
+        """GET /eth/v2/debug/beacon/states/{state_id}
+
+        Returns the full beacon state for debugging/indexing purposes.
+        Supports SSZ (application/octet-stream) or JSON responses.
+        """
+        state_id = request.match_info["state_id"]
+        state = self._resolve_state_id(state_id)
+
+        if state is None:
+            return web.json_response({"message": "State not found"}, status=404)
+
+        accept = request.headers.get("Accept", "application/json")
+        version = self._get_state_version(state)
+
+        if "application/octet-stream" in accept:
+            ssz_bytes = state.encode_bytes()
+            return web.Response(
+                body=ssz_bytes,
+                content_type="application/octet-stream",
+                headers={"Eth-Consensus-Version": version},
+            )
+
+        return web.json_response(
+            {"message": "JSON format not supported for full state, use SSZ"},
+            status=406,
+        )
 
     async def get_events(self, request: web.Request) -> web.StreamResponse:
         """GET /eth/v1/events - SSE endpoint for beacon events."""

@@ -167,6 +167,38 @@ class NetworkConfig:
             return self.altair_fork_version
         return self.genesis_fork_version
 
+    def get_fork_schedule(self) -> list[tuple[int, bytes, str]]:
+        """Get all forks in chronological order.
+
+        Returns a list of (epoch, version, name) tuples sorted by epoch.
+        Only includes forks that are scheduled (epoch < FAR_FUTURE_EPOCH).
+        """
+        FAR_FUTURE_EPOCH = 2**64 - 1
+        forks = [
+            (0, self.genesis_fork_version, "phase0"),
+            (self.altair_fork_epoch, self.altair_fork_version, "altair"),
+            (self.bellatrix_fork_epoch, self.bellatrix_fork_version, "bellatrix"),
+            (self.capella_fork_epoch, self.capella_fork_version, "capella"),
+            (self.deneb_fork_epoch, self.deneb_fork_version, "deneb"),
+            (self.electra_fork_epoch, self.electra_fork_version, "electra"),
+            (self.fulu_fork_epoch, self.fulu_fork_version, "fulu"),
+            (self.gloas_fork_epoch, self.gloas_fork_version, "gloas"),
+        ]
+        scheduled = [(e, v, n) for e, v, n in forks if e < FAR_FUTURE_EPOCH]
+        return sorted(scheduled, key=lambda x: x[0])
+
+    def get_fork_at_epoch(self, epoch: int) -> tuple[int, bytes, str] | None:
+        """Get the fork that activates exactly at the given epoch.
+
+        Returns (epoch, version, name) if a fork activates at this epoch,
+        or None if no fork activates at this epoch.
+        """
+        schedule = self.get_fork_schedule()
+        for fork_epoch, fork_version, fork_name in schedule:
+            if fork_epoch == epoch:
+                return (fork_epoch, fork_version, fork_name)
+        return None
+
 
 _config: NetworkConfig | None = None
 

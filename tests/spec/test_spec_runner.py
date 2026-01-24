@@ -899,7 +899,7 @@ class TestSanitySlots:
         target_slot = int(state.slot) + slots_data
 
         try:
-            process_slots(state, target_slot)
+            state = process_slots(state, target_slot)
         except (AssertionError, Exception) as e:
             if not post_file.exists():
                 return

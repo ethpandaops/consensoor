@@ -6,6 +6,7 @@ Reference (Fulu): https://github.com/ethereum/consensus-specs/blob/master/specs/
 Implements the complete state transition function for Ethereum consensus layer.
 """
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
 from ..constants import SLOTS_PER_EPOCH, SLOTS_PER_HISTORICAL_ROOT
@@ -15,6 +16,8 @@ from ...crypto import hash_tree_root
 
 if TYPE_CHECKING:
     from ..types import BeaconState, BeaconBlock, SignedBeaconBlock
+
+logger = logging.getLogger(__name__)
 
 
 def state_transition(
@@ -46,8 +49,8 @@ def state_transition(
 
     block = signed_block.message
 
-    # Process slots (including missed slots)
-    process_slots(state, int(block.slot))
+    # Process slots (including missed slots) - may return upgraded state type
+    state = process_slots(state, int(block.slot))
 
     # Verify block signature (if validating)
     if validate_result:
@@ -95,16 +98,20 @@ def verify_block_signature(
     ), "Invalid block signature"
 
 
-def process_slots(state: "BeaconState", slot: int) -> None:
+def process_slots(state: "BeaconState", slot: int) -> "BeaconState":
     """Process slots up to (but not including) the target slot.
 
     For each slot, this:
     1. Processes the slot (state caches)
     2. At epoch boundaries, processes epoch transition
+    3. At fork boundaries, upgrades state to new fork type
 
     Args:
-        state: Beacon state (modified in place)
+        state: Beacon state
         slot: Target slot
+
+    Returns:
+        The state after processing (may be a different type after fork upgrade)
     """
     assert slot > int(state.slot), (
         f"Target slot {slot} <= state slot {state.slot}"
@@ -113,12 +120,34 @@ def process_slots(state: "BeaconState", slot: int) -> None:
     while int(state.slot) < slot:
         process_slot(state)
 
-        # At epoch boundary, process epoch
+        # At epoch boundary, process epoch and check for fork upgrade
         if (int(state.slot) + 1) % SLOTS_PER_EPOCH() == 0:
             process_epoch(state)
+            next_epoch = (int(state.slot) + 1) // SLOTS_PER_EPOCH()
+            state = upgrade_fork_if_needed(state, next_epoch)
 
         # Advance slot
         state.slot = int(state.slot) + 1
+
+    return state
+
+
+def upgrade_fork_if_needed(state: "BeaconState", epoch: int) -> "BeaconState":
+    """Upgrade state if a fork transition occurs at this epoch.
+
+    Per the consensus spec, when crossing a fork boundary, the state must be
+    upgraded to the new fork's state type with appropriate new fields initialized.
+    This is necessary for correct domain computation and new fork features.
+
+    Args:
+        state: Beacon state
+        epoch: The epoch we're transitioning into
+
+    Returns:
+        Upgraded state if a fork occurs, otherwise the original state
+    """
+    from .fork_upgrade import maybe_upgrade_state
+    return maybe_upgrade_state(state, epoch)
 
 
 def process_slot(state: "BeaconState") -> None:

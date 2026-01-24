@@ -22,6 +22,7 @@ class Config:
     data_dir: str = "./data"
     log_level: str = "INFO"
     checkpoint_sync_url: str = ""
+    supernode: bool = False
 
     @property
     def jwt_secret(self) -> bytes:

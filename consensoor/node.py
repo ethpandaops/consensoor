@@ -45,6 +45,7 @@ from .spec.network_config import (
     get_config,
 )
 from .spec.constants import SLOTS_PER_EPOCH
+from .spec.state_transition import process_slots
 from .network import Gossip, GossipConfig, MessageType
 from .engine import EngineAPIClient, ForkchoiceState, PayloadStatusEnum
 from .store import Store
@@ -52,6 +53,7 @@ from .beacon_api import BeaconAPI
 from .crypto import hash_tree_root, sign, compute_signing_root
 from .validator import ValidatorClient, load_keystores_teku_style
 from .builder import BlockBuilder
+from .attestation_pool import AttestationPool
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +103,8 @@ class BeaconNode:
         self.state_sync: Optional[StateSyncManager] = None
         self.block_builder: Optional[BlockBuilder] = None
         self.beacon_gossip: Optional[BeaconGossip] = None
+        self.attestation_pool = AttestationPool()
+        self._attester_duties: dict[int, list] = {}  # epoch -> duties
 
         self._running = False
         self._genesis_time: int = 0
@@ -317,6 +321,7 @@ class BeaconNode:
                 next_fork_version=next_fork_version,
                 next_fork_epoch=next_fork_epoch,
                 fork_digest_override=fork_digest_override,
+                supernode=self.config.supernode,
             )
 
             self.beacon_gossip.subscribe_blocks(self._on_p2p_block)
@@ -399,12 +404,20 @@ class BeaconNode:
 
         if slot % slots_per_epoch == 0:
             logger.info(f"New epoch: {epoch}")
+            # Prune old attestations from pool
+            self.attestation_pool.prune(slot)
+
+        # Compute attester duties for current epoch if not cached
+        await self._ensure_attester_duties(epoch)
 
         # Update forkchoice to keep EL in sync
         await self._update_forkchoice_for_slot(slot)
 
         # Check if we should propose a block
         await self._maybe_propose_block(slot)
+
+        # Produce attestations for this slot
+        await self._produce_attestations(slot)
 
     async def _update_forkchoice_for_slot(self, slot: int) -> None:
         """Update forkchoice with EL at the start of each slot."""
@@ -487,6 +500,11 @@ class BeaconNode:
         if not self.state:
             return
 
+        # Advance state to target slot before checking proposer duties
+        # This is necessary because fork upgrades can change the proposer calculation
+        if slot > int(self.state.slot):
+            self.state = process_slots(self.state, slot)
+
         proposer_key = self.validator_client.is_our_proposer_slot(self.state, slot)
         if not proposer_key:
             return
@@ -497,6 +515,57 @@ class BeaconNode:
             await self._produce_and_broadcast_block(slot, proposer_key)
         except Exception as e:
             logger.error(f"Failed to produce block for slot {slot}: {e}")
+
+    async def _ensure_attester_duties(self, epoch: int) -> None:
+        """Ensure we have attester duties computed for the given epoch."""
+        if not self.validator_client or not self.validator_client.keys:
+            return
+        if not self.state:
+            return
+        if epoch in self._attester_duties:
+            return
+
+        duties = self.validator_client.get_attester_duties(self.state, epoch)
+        self._attester_duties[epoch] = duties
+        if duties:
+            logger.info(f"Computed {len(duties)} attester duties for epoch {epoch}")
+
+        # Clean up old epochs
+        old_epochs = [e for e in self._attester_duties if e < epoch - 1]
+        for e in old_epochs:
+            del self._attester_duties[e]
+
+    async def _produce_attestations(self, slot: int) -> None:
+        """Produce attestations for validators with duties at this slot."""
+        if not self.validator_client or not self.validator_client.keys:
+            return
+        if not self.state or not self.head_root:
+            return
+
+        slots_per_epoch = SLOTS_PER_EPOCH()
+        epoch = slot // slots_per_epoch
+
+        duties = self._attester_duties.get(epoch, [])
+        slot_duties = [d for d in duties if d.slot == slot]
+
+        if not slot_duties:
+            return
+
+        logger.info(f"Producing {len(slot_duties)} attestations for slot {slot}")
+
+        for duty in slot_duties:
+            try:
+                attestation = self.validator_client.produce_attestation(
+                    self.state, duty, self.head_root
+                )
+                if attestation:
+                    self.attestation_pool.add(attestation)
+                    logger.debug(
+                        f"Attestation produced: slot={slot}, committee={duty.committee_index}, "
+                        f"validator={duty.validator_index}"
+                    )
+            except Exception as e:
+                logger.error(f"Failed to produce attestation for duty {duty}: {e}")
 
     async def _produce_and_broadcast_block(self, slot: int, proposer_key) -> None:
         """Produce and broadcast a block for the given slot."""
@@ -571,6 +640,10 @@ class BeaconNode:
 
             # Apply the produced block to state so forkchoice stays in sync
             await self._apply_block_to_state(block, block_root, signed_block)
+            # Save state for epoch queries (Dora needs historical states by state_root)
+            state_root = hash_tree_root(self.state)
+            self.store.save_state(state_root, self.state)
+            self.store.save_state(block_root, self.state)  # Also by block_root for flexibility
 
             logger.info(
                 f"Block produced and applied: slot={slot}, "
@@ -739,6 +812,10 @@ class BeaconNode:
                     self.head_slot = int(block.slot)
                     self.head_root = block_root
                     self.store.set_head(block_root)
+                    # Save state for epoch queries (Dora needs historical states by state_root)
+                    state_root = hash_tree_root(self.state)
+                    self.store.save_state(state_root, self.state)
+                    self.store.save_state(block_root, self.state)  # Also by block_root for flexibility
                     logger.info(
                         f"P2P: Adopted block as new head: slot={block.slot}, "
                         f"root={block_root.hex()[:16]}"
@@ -801,7 +878,7 @@ class BeaconNode:
         # Fallback: process slots to advance state, then process block
         target_slot = int(block.slot)
         if target_slot > int(self.state.slot):
-            process_slots(self.state, target_slot)
+            self.state = process_slots(self.state, target_slot)
         process_block(self.state, block)
         logger.info(
             f"Block processed: slot={block.slot}, "

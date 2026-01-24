@@ -3,7 +3,23 @@
 import logging
 from typing import Optional
 
-from ..spec.constants import SLOTS_PER_EPOCH
+from ..spec.constants import SLOTS_PER_EPOCH, DOMAIN_BEACON_ATTESTER
+from ..spec.state_transition.helpers.beacon_committee import (
+    get_beacon_committee,
+    get_committee_count_per_slot,
+)
+from ..spec.state_transition.helpers.accessors import (
+    get_block_root,
+    get_block_root_at_slot,
+)
+from ..spec.state_transition.helpers.misc import compute_epoch_at_slot
+from ..spec.state_transition.helpers.domain import get_domain, compute_signing_root
+from ..spec.types import AttestationData
+from ..spec.types.phase0 import Phase0Attestation
+from ..spec.types.electra import Attestation as ElectraAttestation
+from ..spec.types.base import Checkpoint, Bitlist, Bitvector
+from ..spec.constants import MAX_VALIDATORS_PER_COMMITTEE, MAX_COMMITTEES_PER_SLOT
+from ..crypto import sign as bls_sign
 from .types import ValidatorKey, ProposerDuty, AttesterDuty
 from .shuffling import get_beacon_proposer_index
 
@@ -44,30 +60,27 @@ class ValidatorClient:
     def _get_proposer_index(self, state, slot: int) -> Optional[int]:
         """Get proposer index for a slot.
 
-        Uses proposer_lookahead if available and the state is in the same epoch.
-        Falls back to compute_proposer_index (via randao) otherwise.
+        Uses proposer_lookahead if available and the slot is within the lookahead range.
+        The lookahead contains proposers for (MIN_SEED_LOOKAHEAD + 1) epochs starting
+        from the state's current epoch.
 
-        Per the Fulu spec, proposer_lookahead is indexed by slot % SLOTS_PER_EPOCH
-        and is only valid for the current epoch stored in state.
+        Falls back to compute_proposer_index (via randao) otherwise.
         """
         slots_per_epoch = SLOTS_PER_EPOCH()
-        slot_epoch = slot // slots_per_epoch
         state_epoch = int(state.slot) // slots_per_epoch
 
         if hasattr(state, "proposer_lookahead"):
-            # proposer_lookahead is only valid for the state's current epoch
-            # If the requested slot is in a different epoch, fall back to computing
-            if slot_epoch != state_epoch:
-                logger.debug(
-                    f"Slot {slot} (epoch {slot_epoch}) differs from state epoch {state_epoch}, "
-                    f"falling back to randao-based computation"
-                )
-                return get_beacon_proposer_index(state, slot)
-
             lookahead = state.proposer_lookahead
-            slot_in_epoch = slot % slots_per_epoch
-            if slot_in_epoch < len(lookahead):
-                return int(lookahead[slot_in_epoch])
+            current_epoch_start_slot = state_epoch * slots_per_epoch
+            slot_offset = slot - current_epoch_start_slot
+
+            if 0 <= slot_offset < len(lookahead):
+                return int(lookahead[slot_offset])
+
+            logger.debug(
+                f"Slot {slot} is outside proposer_lookahead range "
+                f"(state epoch {state_epoch}, offset {slot_offset}, lookahead len {len(lookahead)})"
+            )
 
         return get_beacon_proposer_index(state, slot)
 
@@ -106,14 +119,123 @@ class ValidatorClient:
                 return key
         return None
 
-    async def get_attester_duties(self, state, epoch: int) -> list[AttesterDuty]:
-        """Get attester duties for an epoch."""
+    def get_attester_duties(self, state, epoch: int) -> list[AttesterDuty]:
+        """Get attester duties for our validators in an epoch.
+
+        Args:
+            state: Beacon state
+            epoch: Target epoch
+
+        Returns:
+            List of attester duties for our validators
+        """
         duties = []
+        slots_per_epoch = SLOTS_PER_EPOCH()
+        start_slot = epoch * slots_per_epoch
+        end_slot = start_slot + slots_per_epoch
+
+        committees_per_slot = get_committee_count_per_slot(state, epoch)
+
+        for slot in range(start_slot, end_slot):
+            for committee_index in range(committees_per_slot):
+                committee = get_beacon_committee(state, slot, committee_index)
+
+                for validator_position, validator_index in enumerate(committee):
+                    for pubkey, key in self.keys.items():
+                        if key.validator_index == validator_index:
+                            duty = AttesterDuty(
+                                validator_index=validator_index,
+                                slot=slot,
+                                committee_index=committee_index,
+                                committee_length=len(committee),
+                                committees_at_slot=committees_per_slot,
+                                validator_committee_index=validator_position,
+                                pubkey=pubkey,
+                            )
+                            duties.append(duty)
+                            logger.debug(
+                                f"Attester duty: slot={slot}, committee={committee_index}, "
+                                f"position={validator_position}, validator={validator_index}"
+                            )
+
         return duties
 
-    async def produce_attestation(self, state, slot: int, committee_index: int) -> object:
-        """Produce an attestation for the given slot and committee."""
-        pass
+    def produce_attestation(
+        self, state, duty: AttesterDuty, head_root: bytes
+    ) -> Optional[ElectraAttestation]:
+        """Produce an attestation for the given duty.
+
+        Args:
+            state: Beacon state
+            duty: The attester duty
+            head_root: Current head block root
+
+        Returns:
+            Signed attestation or None if production fails
+        """
+        try:
+            slot = duty.slot
+            committee_index = duty.committee_index
+            epoch = compute_epoch_at_slot(slot)
+
+            target_root = get_block_root(state, epoch)
+            source = state.current_justified_checkpoint
+
+            target = Checkpoint(
+                epoch=epoch,
+                root=target_root,
+            )
+
+            attestation_data = AttestationData(
+                slot=slot,
+                index=0,  # Electra attestations use committee_bits, not index in data
+                beacon_block_root=head_root,
+                source=source,
+                target=target,
+            )
+
+            max_validators = MAX_VALIDATORS_PER_COMMITTEE()
+            max_committees = MAX_COMMITTEES_PER_SLOT()
+
+            # Electra-style: aggregation_bits spans all committees
+            # Position = committee_index * committee_length + validator_committee_index
+            total_bits = max_validators * max_committees
+            aggregation_bits = Bitlist[total_bits](*([False] * total_bits))
+            bit_position = committee_index * duty.committee_length + duty.validator_committee_index
+            aggregation_bits[bit_position] = True
+
+            # Set the committee bit
+            committee_bits = Bitvector[max_committees]()
+            committee_bits[committee_index] = True
+
+            key = self.keys.get(duty.pubkey)
+            if key is None:
+                logger.error(f"No key found for pubkey {duty.pubkey.hex()[:16]}...")
+                return None
+
+            domain = get_domain(state, DOMAIN_BEACON_ATTESTER, epoch)
+            signing_root = compute_signing_root(attestation_data, domain)
+            signature = bls_sign(key.privkey, signing_root)
+
+            attestation = ElectraAttestation(
+                aggregation_bits=aggregation_bits,
+                data=attestation_data,
+                signature=signature,
+                committee_bits=committee_bits,
+            )
+
+            logger.info(
+                f"Produced attestation: slot={slot}, committee={committee_index}, "
+                f"target_epoch={epoch}, source_epoch={int(source.epoch)}"
+            )
+
+            return attestation
+
+        except Exception as e:
+            logger.error(f"Failed to produce attestation: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     async def produce_sync_committee_message(self, state, slot: int) -> object:
         """Produce a sync committee message."""

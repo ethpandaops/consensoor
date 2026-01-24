@@ -10,6 +10,14 @@ from .transition import (
     process_slot,
     process_epoch,
     process_block,
+    upgrade_fork_if_needed,
+)
+from .fork_upgrade import (
+    upgrade_to_capella,
+    upgrade_to_deneb,
+    upgrade_to_electra,
+    upgrade_to_fulu,
+    maybe_upgrade_state,
 )
 
 # Gloas (ePBS) - execution payload envelope processing (separate from block)
@@ -21,6 +29,13 @@ __all__ = [
     "process_slot",
     "process_epoch",
     "process_block",
+    "upgrade_fork_if_needed",
+    # Fork upgrades
+    "upgrade_to_capella",
+    "upgrade_to_deneb",
+    "upgrade_to_electra",
+    "upgrade_to_fulu",
+    "maybe_upgrade_state",
     # Gloas (ePBS)
     "process_execution_payload_envelope",
 ]

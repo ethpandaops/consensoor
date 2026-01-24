@@ -129,6 +129,13 @@ def cli():
     help="Bootnode ENRs or multiaddrs (can be specified multiple times)",
     envvar="CONSENSOOR_BOOTNODES",
 )
+@click.option(
+    "--supernode",
+    is_flag=True,
+    default=False,
+    help="Run as supernode (custody all 128 data column groups for PeerDAS/Fulu)",
+    envvar="CONSENSOOR_SUPERNODE",
+)
 def run(
     engine_api_url: str,
     jwt_secret: Optional[str],
@@ -146,6 +153,7 @@ def run(
     graffiti: str,
     checkpoint_sync_url: Optional[str],
     bootnodes: tuple[str, ...],
+    supernode: bool,
 ):
     """Run the consensus layer node."""
     setup_logging(log_level)
@@ -175,10 +183,12 @@ def run(
         data_dir=data_dir,
         log_level=log_level,
         checkpoint_sync_url=checkpoint_sync_url or "",
+        supernode=supernode,
     )
 
     logger.info("Starting consensoor")
     logger.info(f"  Preset: {preset}")
+    logger.info(f"  Supernode: {supernode}")
     logger.info(f"  Engine API: {engine_api_url}")
     logger.info(f"  P2P: {p2p_host}:{p2p_port}")
     logger.info(f"  Beacon API: port {beacon_api_port}")

@@ -71,6 +71,7 @@ class BeaconGossip:
         attnets: Optional[bytes] = None,
         syncnets: Optional[bytes] = None,
         fork_digest_override: Optional[bytes] = None,
+        supernode: bool = False,
     ):
         # Use override if provided, otherwise compute from fork_version and genesis_validators_root
         computed_digest = compute_fork_digest(fork_version, genesis_validators_root)
@@ -93,8 +94,10 @@ class BeaconGossip:
             next_fork_epoch=next_fork_epoch,
             attnets=attnets or b"\xff\xff\xff\xff\xff\xff\xff\xff",
             syncnets=syncnets or b"\x0f",
+            supernode=supernode,
         )
         self._host = P2PHost(config)
+        logger.info(f"P2P custody_group_count: {config.custody_group_count} (supernode={supernode})")
 
     async def start(self) -> None:
         """Start the gossip network."""

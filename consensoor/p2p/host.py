@@ -45,12 +45,23 @@ class P2PConfig:
     next_fork_epoch: int = 2**64 - 1
     attnets: bytes = field(default_factory=lambda: b"\xff\xff\xff\xff\xff\xff\xff\xff")
     syncnets: bytes = field(default_factory=lambda: b"\x0f")
-    custody_group_count: int = 4  # For Fulu/PeerDAS - number of custody groups
+    supernode: bool = False
     gossip_degree: int = 8
     gossip_degree_low: int = 6
     gossip_degree_high: int = 12
     heartbeat_interval: float = 1.0
     advertised_ip: str = ""
+
+    @property
+    def custody_group_count(self) -> int:
+        """Calculate custody group count based on supernode flag.
+
+        Per Fulu/PeerDAS spec:
+        - Supernodes custody all 128 groups (NUMBER_OF_CUSTODY_GROUPS)
+        - Regular nodes custody CUSTODY_REQUIREMENT groups (4)
+        """
+        from ..spec.constants import NUMBER_OF_CUSTODY_GROUPS, CUSTODY_REQUIREMENT
+        return NUMBER_OF_CUSTODY_GROUPS if self.supernode else CUSTODY_REQUIREMENT
 
 
 class P2PHost:
@@ -277,16 +288,29 @@ class P2PHost:
         """Register Ethereum consensus protocol handlers."""
         from libp2p.custom_types import TProtocol
 
-        status_protocol = TProtocol("/eth2/beacon_chain/req/status/1/ssz_snappy")
-        self._host.set_stream_handler(status_protocol, self._handle_status_request)
+        # Status v1 (pre-Fulu)
+        status_v1_protocol = TProtocol("/eth2/beacon_chain/req/status/1/ssz_snappy")
+        self._host.set_stream_handler(status_v1_protocol, self._handle_status_v1_request)
 
-        metadata_protocol = TProtocol("/eth2/beacon_chain/req/metadata/2/ssz_snappy")
-        self._host.set_stream_handler(metadata_protocol, self._handle_metadata_request)
+        # Status v2 (Fulu+) - includes custody_group_count and earliest_available_slot
+        status_v2_protocol = TProtocol("/eth2/beacon_chain/req/status/2/ssz_snappy")
+        self._host.set_stream_handler(status_v2_protocol, self._handle_status_v2_request)
+
+        # Metadata v2 (Altair+)
+        metadata_v2_protocol = TProtocol("/eth2/beacon_chain/req/metadata/2/ssz_snappy")
+        self._host.set_stream_handler(metadata_v2_protocol, self._handle_metadata_v2_request)
+
+        # Metadata v3 (Fulu+) - includes custody_group_count
+        metadata_v3_protocol = TProtocol("/eth2/beacon_chain/req/metadata/3/ssz_snappy")
+        self._host.set_stream_handler(metadata_v3_protocol, self._handle_metadata_v3_request)
 
         ping_protocol = TProtocol("/eth2/beacon_chain/req/ping/1/ssz_snappy")
         self._host.set_stream_handler(ping_protocol, self._handle_ping_request)
 
-        logger.info("Registered Ethereum P2P protocol handlers")
+        logger.info(
+            f"Registered Ethereum P2P protocol handlers "
+            f"(custody_group_count={self.config.custody_group_count})"
+        )
 
     def _snappy_frame_compress(self, data: bytes) -> bytes:
         """Compress data using snappy framing format (required by Eth2 req/resp)."""
@@ -306,13 +330,13 @@ class P2PHost:
                 return value, i + 1
         raise ValueError("Truncated varint")
 
-    async def _handle_status_request(self, stream) -> None:
-        """Handle incoming status request."""
+    async def _handle_status_v1_request(self, stream) -> None:
+        """Handle incoming status/1 request (pre-Fulu)."""
         import varint
 
         try:
             peer_id = stream.muxed_conn.peer_id.to_base58()
-            logger.info(f"Received status request from {peer_id[:16]}...")
+            logger.info(f"Received status/1 request from {peer_id[:16]}...")
 
             await stream.read(1024)
 
@@ -321,6 +345,9 @@ class P2PHost:
             head_root = b"\x00" * 32
             head_slot = 0
 
+            # Status v1: 84 bytes
+            # fork_digest (4) + finalized_root (32) + finalized_epoch (8) +
+            # head_root (32) + head_slot (8)
             status_ssz = (
                 self.config.fork_digest +
                 finalized_root +
@@ -332,28 +359,78 @@ class P2PHost:
             compressed = self._snappy_frame_compress(status_ssz)
 
             response_code = b"\x00"
-            # Eth2 RPC uses varint-encoded UNCOMPRESSED length
             length_prefix = varint.encode(len(status_ssz))
             response = response_code + length_prefix + compressed
 
             await stream.write(response)
             await stream.close()
-            logger.debug(f"Sent status response to {peer_id[:16]}...")
+            logger.debug(f"Sent status/1 response to {peer_id[:16]}...")
 
         except Exception as e:
-            logger.warning(f"Error handling status request: {e}")
+            logger.warning(f"Error handling status/1 request: {e}")
             try:
                 await stream.close()
             except Exception:
                 pass
 
-    async def _handle_metadata_request(self, stream) -> None:
-        """Handle incoming metadata request (version 2: Altair+ format)."""
+    async def _handle_status_v2_request(self, stream) -> None:
+        """Handle incoming status/2 request (Fulu+).
+
+        Status v2 adds custody_group_count and earliest_available_slot fields.
+        """
         import varint
 
         try:
             peer_id = stream.muxed_conn.peer_id.to_base58()
-            logger.debug(f"Received metadata request from {peer_id[:16]}...")
+            logger.info(f"Received status/2 request from {peer_id[:16]}...")
+
+            await stream.read(1024)
+
+            finalized_root = b"\x00" * 32
+            finalized_epoch = 0
+            head_root = b"\x00" * 32
+            head_slot = 0
+            custody_group_count = self.config.custody_group_count
+            earliest_available_slot = 0
+
+            # Status v2: 100 bytes
+            # fork_digest (4) + finalized_root (32) + finalized_epoch (8) +
+            # head_root (32) + head_slot (8) + custody_group_count (8) +
+            # earliest_available_slot (8)
+            status_ssz = (
+                self.config.fork_digest +
+                finalized_root +
+                finalized_epoch.to_bytes(8, "little") +
+                head_root +
+                head_slot.to_bytes(8, "little") +
+                custody_group_count.to_bytes(8, "little") +
+                earliest_available_slot.to_bytes(8, "little")
+            )
+
+            compressed = self._snappy_frame_compress(status_ssz)
+
+            response_code = b"\x00"
+            length_prefix = varint.encode(len(status_ssz))
+            response = response_code + length_prefix + compressed
+
+            await stream.write(response)
+            await stream.close()
+            logger.debug(f"Sent status/2 response to {peer_id[:16]} (cgc={custody_group_count})...")
+
+        except Exception as e:
+            logger.warning(f"Error handling status/2 request: {e}")
+            try:
+                await stream.close()
+            except Exception:
+                pass
+
+    async def _handle_metadata_v2_request(self, stream) -> None:
+        """Handle incoming metadata/2 request (Altair+ format)."""
+        import varint
+
+        try:
+            peer_id = stream.muxed_conn.peer_id.to_base58()
+            logger.debug(f"Received metadata/2 request from {peer_id[:16]}...")
 
             await stream.read(1024)
 
@@ -362,7 +439,6 @@ class P2PHost:
             syncnets = self.config.syncnets
 
             # MetaData v2 (Altair+): seq_number (8) + attnets (8) + syncnets (1) = 17 bytes
-            # Note: Fulu/PeerDAS would use metadata/3 with custody_group_count
             metadata_ssz = (
                 seq_number.to_bytes(8, "little") +
                 attnets +
@@ -379,7 +455,46 @@ class P2PHost:
             await stream.close()
 
         except Exception as e:
-            logger.warning(f"Error handling metadata request: {e}")
+            logger.warning(f"Error handling metadata/2 request: {e}")
+            try:
+                await stream.close()
+            except Exception:
+                pass
+
+    async def _handle_metadata_v3_request(self, stream) -> None:
+        """Handle incoming metadata/3 request (Fulu+ format with custody_group_count)."""
+        import varint
+
+        try:
+            peer_id = stream.muxed_conn.peer_id.to_base58()
+            logger.debug(f"Received metadata/3 request from {peer_id[:16]}...")
+
+            await stream.read(1024)
+
+            seq_number = 1
+            attnets = self.config.attnets
+            syncnets = self.config.syncnets
+            custody_group_count = self.config.custody_group_count
+
+            # MetaData v3 (Fulu+): seq_number (8) + attnets (8) + syncnets (1) + custody_group_count (8) = 25 bytes
+            metadata_ssz = (
+                seq_number.to_bytes(8, "little") +
+                attnets +
+                syncnets +
+                custody_group_count.to_bytes(8, "little")
+            )
+
+            compressed = self._snappy_frame_compress(metadata_ssz)
+            response_code = b"\x00"
+            length_prefix = varint.encode(len(metadata_ssz))
+            response = response_code + length_prefix + compressed
+
+            await stream.write(response)
+            await stream.close()
+            logger.debug(f"Sent metadata/3 response to {peer_id[:16]} (cgc={custody_group_count})...")
+
+        except Exception as e:
+            logger.warning(f"Error handling metadata/3 request: {e}")
             try:
                 await stream.close()
             except Exception:
@@ -596,34 +711,60 @@ class P2PHost:
             self._peer_count = len(self._connected_peers)
 
             # Try to open a status stream to keep connection alive and verify it works
+            # Use status/2 for Fulu (includes custody_group_count and earliest_available_slot)
             try:
                 from libp2p.custom_types import TProtocol
                 import varint
                 import snappy
 
-                status_protocol = TProtocol("/eth2/beacon_chain/req/status/1/ssz_snappy")
-                logger.info(f"Opening status stream to {peer_info.peer_id.to_base58()[:16]}...")
-                stream = await self._host.new_stream(peer_info.peer_id, [status_protocol])
-                logger.info(f"Status stream opened successfully to {peer_info.peer_id.to_base58()[:16]}")
+                # Try status/2 first (Fulu+), fallback to status/1 if not supported
+                status_v2_protocol = TProtocol("/eth2/beacon_chain/req/status/2/ssz_snappy")
+                status_v1_protocol = TProtocol("/eth2/beacon_chain/req/status/1/ssz_snappy")
+                logger.info(f"Opening status/2 stream to {peer_info.peer_id.to_base58()[:16]}...")
+
+                try:
+                    stream = await self._host.new_stream(peer_info.peer_id, [status_v2_protocol])
+                    use_v2 = True
+                    logger.info(f"Status/2 stream opened successfully to {peer_info.peer_id.to_base58()[:16]}")
+                except Exception as e:
+                    logger.debug(f"Status/2 not supported, falling back to status/1: {e}")
+                    stream = await self._host.new_stream(peer_info.peer_id, [status_v1_protocol])
+                    use_v2 = False
+                    logger.info(f"Status/1 stream opened successfully to {peer_info.peer_id.to_base58()[:16]}")
 
                 # Build our status message
                 finalized_root = b"\x00" * 32
                 finalized_epoch = 0
                 head_root = b"\x00" * 32
                 head_slot = 0
-                status_ssz = (
-                    self.config.fork_digest +
-                    finalized_root +
-                    finalized_epoch.to_bytes(8, "little") +
-                    head_root +
-                    head_slot.to_bytes(8, "little")
-                )
+
+                if use_v2:
+                    custody_group_count = self.config.custody_group_count
+                    earliest_available_slot = 0
+                    status_ssz = (
+                        self.config.fork_digest +
+                        finalized_root +
+                        finalized_epoch.to_bytes(8, "little") +
+                        head_root +
+                        head_slot.to_bytes(8, "little") +
+                        custody_group_count.to_bytes(8, "little") +
+                        earliest_available_slot.to_bytes(8, "little")
+                    )
+                else:
+                    status_ssz = (
+                        self.config.fork_digest +
+                        finalized_root +
+                        finalized_epoch.to_bytes(8, "little") +
+                        head_root +
+                        head_slot.to_bytes(8, "little")
+                    )
 
                 # Eth2 RPC format: varint-encoded UNCOMPRESSED length + snappy framed data
                 compressed = self._snappy_frame_compress(status_ssz)
                 length_prefix = varint.encode(len(status_ssz))
                 message = length_prefix + compressed
-                logger.info(f"Sending status: {len(status_ssz)} bytes SSZ, {len(compressed)} bytes compressed")
+                version = "v2" if use_v2 else "v1"
+                logger.info(f"Sending status/{version}: {len(status_ssz)} bytes SSZ, {len(compressed)} bytes compressed")
 
                 await stream.write(message)
                 logger.info(f"Sent status request to {peer_info.peer_id.to_base58()[:16]}")
