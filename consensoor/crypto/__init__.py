@@ -1,11 +1,29 @@
-"""Cryptographic utilities."""
+"""Cryptographic utilities.
+
+Uses blspy (fast C/assembly) when available, falls back to py_ecc (pure Python).
+"""
 
 import hashlib
+import logging
 from typing import Sequence
 
-from py_ecc.bls import G2ProofOfPossession as bls
-from py_ecc.bls.g2_primitives import pubkey_to_G1, G1_to_pubkey
-from remerkleable.core import View
+logger = logging.getLogger(__name__)
+
+# Try to use blspy (fast) first, fall back to py_ecc (slow)
+_USE_BLSPY = False
+try:
+    from blspy import (
+        PrivateKey as BlsPrivateKey,
+        G1Element,
+        G2Element,
+        AugSchemeMPL,
+        PopSchemeMPL,
+    )
+    _USE_BLSPY = True
+    logger.info("Using blspy for BLS cryptography (fast)")
+except ImportError:
+    from py_ecc.bls import G2ProofOfPossession as _py_ecc_bls
+    logger.warning("blspy not available, using py_ecc (slow) - install blspy for better performance")
 
 
 def sha256(data: bytes) -> bytes:
@@ -22,13 +40,11 @@ def hash_tree_root(obj) -> bytes:
     Returns:
         32-byte hash tree root
     """
-    # If it's already bytes (e.g., a Root/block root), return directly
     if isinstance(obj, bytes):
         if len(obj) == 32:
             return obj
         raise ValueError(f"Expected 32-byte root, got {len(obj)} bytes")
 
-    # SSZ object - call its hash_tree_root method
     if hasattr(obj, 'hash_tree_root'):
         root = obj.hash_tree_root()
         if isinstance(root, bytes):
@@ -50,7 +66,6 @@ def compute_signing_root(obj, domain: bytes) -> bytes:
     """
     from consensoor.spec.types import SigningData, Root
 
-    # Get the object root - either hash it or use directly if already bytes
     if isinstance(obj, bytes):
         if len(obj) == 32:
             object_root = obj
@@ -71,26 +86,48 @@ def compute_signing_root(obj, domain: bytes) -> bytes:
 
 def sign(privkey: int, message: bytes) -> bytes:
     """Sign a message with a BLS private key."""
-    return bls.Sign(privkey, message)
+    if _USE_BLSPY:
+        # Convert int to 32-byte big-endian, then to blspy PrivateKey
+        privkey_bytes = privkey.to_bytes(32, 'big')
+        sk = BlsPrivateKey.from_bytes(privkey_bytes)
+        sig = PopSchemeMPL.sign(sk, message)
+        return bytes(sig)
+    else:
+        return _py_ecc_bls.Sign(privkey, message)
 
 
 def verify(pubkey: bytes, message: bytes, signature: bytes) -> bool:
     """Verify a BLS signature."""
     try:
-        return bls.Verify(pubkey, message, signature)
+        if _USE_BLSPY:
+            pk = G1Element.from_bytes(pubkey)
+            sig = G2Element.from_bytes(signature)
+            return PopSchemeMPL.verify(pk, message, sig)
+        else:
+            return _py_ecc_bls.Verify(pubkey, message, signature)
     except Exception:
         return False
 
 
 def aggregate_signatures(signatures: Sequence[bytes]) -> bytes:
     """Aggregate multiple BLS signatures."""
-    return bls.Aggregate(list(signatures))
+    if _USE_BLSPY:
+        sigs = [G2Element.from_bytes(s) for s in signatures]
+        agg = AugSchemeMPL.aggregate(sigs)
+        return bytes(agg)
+    else:
+        return _py_ecc_bls.Aggregate(list(signatures))
 
 
 def verify_aggregate(pubkeys: Sequence[bytes], messages: Sequence[bytes], signature: bytes) -> bool:
     """Verify an aggregate BLS signature."""
     try:
-        return bls.AggregateVerify(list(pubkeys), list(messages), signature)
+        if _USE_BLSPY:
+            pks = [G1Element.from_bytes(pk) for pk in pubkeys]
+            sig = G2Element.from_bytes(signature)
+            return AugSchemeMPL.aggregate_verify(pks, list(messages), sig)
+        else:
+            return _py_ecc_bls.AggregateVerify(list(pubkeys), list(messages), signature)
     except Exception:
         return False
 
@@ -103,24 +140,42 @@ def fast_aggregate_verify(pubkeys: Sequence[bytes], message: bytes, signature: b
     """
     try:
         if len(pubkeys) == 0:
-            # G2 point at infinity: 0xc0 followed by 95 zero bytes
             g2_point_at_infinity = b'\xc0' + b'\x00' * 95
             return signature == g2_point_at_infinity
-        return bls.FastAggregateVerify(list(pubkeys), message, signature)
+
+        if _USE_BLSPY:
+            pks = [G1Element.from_bytes(pk) for pk in pubkeys]
+            sig = G2Element.from_bytes(signature)
+            return PopSchemeMPL.fast_aggregate_verify(pks, message, sig)
+        else:
+            return _py_ecc_bls.FastAggregateVerify(list(pubkeys), message, signature)
     except Exception:
         return False
 
 
 def pubkey_from_privkey(privkey: int) -> bytes:
     """Derive public key from private key."""
-    return bls.SkToPk(privkey)
+    if _USE_BLSPY:
+        privkey_bytes = privkey.to_bytes(32, 'big')
+        sk = BlsPrivateKey.from_bytes(privkey_bytes)
+        return bytes(sk.get_g1())
+    else:
+        return _py_ecc_bls.SkToPk(privkey)
 
 
 def aggregate_pubkeys(pubkeys: Sequence[bytes]) -> bytes:
     """Aggregate multiple public keys."""
     if not pubkeys:
         raise ValueError("Cannot aggregate empty list of pubkeys")
-    return bls._AggregatePKs(list(pubkeys))
+
+    if _USE_BLSPY:
+        pks = [G1Element.from_bytes(pk) for pk in pubkeys]
+        agg = pks[0]
+        for pk in pks[1:]:
+            agg = agg + pk
+        return bytes(agg)
+    else:
+        return _py_ecc_bls._AggregatePKs(list(pubkeys))
 
 
 # Aliases for consensus spec compatibility

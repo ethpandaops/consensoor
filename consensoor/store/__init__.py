@@ -1,17 +1,26 @@
-"""State and block storage with SQLite persistence."""
+"""State and block storage with LevelDB persistence."""
 
 import logging
-import sqlite3
+import struct
 from typing import Optional, Any
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Key prefixes for LevelDB
+_PREFIX_STATE = b"s:"
+_PREFIX_STATE_SLOT = b"ss:"
+_PREFIX_BLOCK = b"b:"
+_PREFIX_BLOCK_SLOT = b"bs:"
+_PREFIX_BLOCK_PARENT = b"bp:"
+_PREFIX_PAYLOAD = b"p:"
+_PREFIX_META = b"m:"
+
 
 class Store:
-    """SQLite-backed store for beacon state and blocks.
+    """LevelDB-backed store for beacon state and blocks.
 
-    Stores SSZ-encoded states and blocks in SQLite for persistence.
+    Stores SSZ-encoded states and blocks in LevelDB for persistence.
     Keeps recent items in memory cache for fast access.
     """
 
@@ -24,7 +33,7 @@ class Store:
         self._block_cache: dict[bytes, object] = {}
         self._payload_cache: dict[bytes, object] = {}
         self._bid_cache: dict[int, object] = {}
-        self._cache_limit = 128  # Keep last N items in memory
+        self._cache_limit = 128
 
         # Metadata (always in memory, persisted to DB)
         self.head_root: Optional[bytes] = None
@@ -33,86 +42,62 @@ class Store:
         self.justified_root: bytes = b"\x00" * 32
         self.justified_epoch: int = 0
 
-        # Initialize SQLite
-        self._db_path = self.data_dir / "beacon.db"
-        self._conn: Optional[sqlite3.Connection] = None
+        # Initialize LevelDB
+        self._db_path = self.data_dir / "beacon.ldb"
+        self._db = None
         self._init_db()
         self._load_metadata()
 
     def _init_db(self) -> None:
-        """Initialize SQLite database and tables."""
-        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
-        self._conn.execute("PRAGMA journal_mode=WAL")  # Better concurrent access
-        self._conn.execute("PRAGMA synchronous=NORMAL")  # Faster writes, still safe
-
-        # Create tables
-        self._conn.executescript("""
-            CREATE TABLE IF NOT EXISTS states (
-                root BLOB PRIMARY KEY,
-                slot INTEGER,
-                fork TEXT,
-                data BLOB
-            );
-            CREATE TABLE IF NOT EXISTS blocks (
-                root BLOB PRIMARY KEY,
-                slot INTEGER,
-                parent_root BLOB,
-                fork TEXT,
-                data BLOB
-            );
-            CREATE TABLE IF NOT EXISTS payloads (
-                root BLOB PRIMARY KEY,
-                data BLOB
-            );
-            CREATE TABLE IF NOT EXISTS metadata (
-                key TEXT PRIMARY KEY,
-                value BLOB
-            );
-            CREATE INDEX IF NOT EXISTS idx_states_slot ON states(slot);
-            CREATE INDEX IF NOT EXISTS idx_blocks_slot ON blocks(slot);
-            CREATE INDEX IF NOT EXISTS idx_blocks_parent ON blocks(parent_root);
-        """)
-        self._conn.commit()
-        logger.info(f"SQLite store initialized at {self._db_path}")
+        """Initialize LevelDB database."""
+        import plyvel
+        self._db = plyvel.DB(
+            str(self._db_path),
+            create_if_missing=True,
+            write_buffer_size=64 * 1024 * 1024,
+            max_open_files=512,
+            bloom_filter_bits=10,
+        )
+        logger.info(f"LevelDB store initialized at {self._db_path}")
 
     def _load_metadata(self) -> None:
         """Load metadata from database."""
-        cursor = self._conn.cursor()
-        cursor.execute("SELECT key, value FROM metadata")
-        for key, value in cursor.fetchall():
-            if key == "head_root" and value:
-                self.head_root = value
-            elif key == "finalized_root" and value:
-                self.finalized_root = value
-            elif key == "finalized_epoch" and value:
-                self.finalized_epoch = int.from_bytes(value, "little")
-            elif key == "justified_root" and value:
-                self.justified_root = value
-            elif key == "justified_epoch" and value:
-                self.justified_epoch = int.from_bytes(value, "little")
+        head = self._db.get(_PREFIX_META + b"head_root")
+        if head:
+            self.head_root = head
+
+        finalized = self._db.get(_PREFIX_META + b"finalized_root")
+        if finalized:
+            self.finalized_root = finalized
+
+        finalized_epoch = self._db.get(_PREFIX_META + b"finalized_epoch")
+        if finalized_epoch:
+            self.finalized_epoch = int.from_bytes(finalized_epoch, "little")
+
+        justified = self._db.get(_PREFIX_META + b"justified_root")
+        if justified:
+            self.justified_root = justified
+
+        justified_epoch = self._db.get(_PREFIX_META + b"justified_epoch")
+        if justified_epoch:
+            self.justified_epoch = int.from_bytes(justified_epoch, "little")
 
         if self.head_root:
             logger.info(f"Loaded head_root from DB: {self.head_root.hex()[:16]}")
 
     def _save_metadata(self, key: str, value: bytes) -> None:
         """Save a metadata value to database."""
-        self._conn.execute(
-            "INSERT OR REPLACE INTO metadata (key, value) VALUES (?, ?)",
-            (key, value)
-        )
-        self._conn.commit()
+        self._db.put(_PREFIX_META + key.encode(), value)
 
     def _detect_fork(self, obj: Any) -> str:
         """Detect the fork type of a state or block."""
         type_name = type(obj).__name__
 
-        # For Fulu state types
         if "Fulu" in type_name:
             return "fulu"
         if "Gloas" in type_name:
             return "gloas"
 
-        # For blocks, check slot against fork epochs since Electra/Fulu share block types
         if "Electra" in type_name:
             msg = obj.message if hasattr(obj, "message") else obj
             if hasattr(msg, "slot"):
@@ -140,7 +125,7 @@ class Store:
 
     def _get_state_types(self):
         """Get all beacon state types for deserialization."""
-        from ..spec.types import BeaconState  # Fulu/latest
+        from ..spec.types import BeaconState
         from ..spec.types.electra import ElectraBeaconState
         from ..spec.types.deneb import DenebBeaconState
         from ..spec.types.capella import CapellaBeaconState
@@ -178,59 +163,45 @@ class Store:
             "phase0": Phase0SignedBeaconBlock,
         }
 
+    def _encode_value(self, fork: str, data: bytes) -> bytes:
+        """Encode fork and data into a single value."""
+        fork_bytes = fork.encode().ljust(16, b'\x00')
+        return fork_bytes + data
+
+    def _decode_value(self, value: bytes) -> tuple[str, bytes]:
+        """Decode fork and data from a value."""
+        fork = value[:16].rstrip(b'\x00').decode()
+        data = value[16:]
+        return fork, data
+
     def save_state(self, root: bytes, state: object) -> None:
         """Save a beacon state by root."""
-        # Cache in memory
         self._state_cache[root] = state
         self._trim_cache(self._state_cache)
 
-        # Persist to SQLite
         try:
             fork = self._detect_fork(state)
             slot = int(state.slot) if hasattr(state, "slot") else 0
             data = state.encode_bytes()
 
-            self._conn.execute(
-                "INSERT OR REPLACE INTO states (root, slot, fork, data) VALUES (?, ?, ?, ?)",
-                (root, slot, fork, data)
-            )
-            self._conn.commit()
+            batch = self._db.write_batch()
+            batch.put(_PREFIX_STATE + root, self._encode_value(fork, data))
+            batch.put(_PREFIX_STATE_SLOT + struct.pack(">Q", slot), root)
+            batch.write()
+
             logger.debug(f"Saved state: slot={slot}, fork={fork}, root={root.hex()[:16]}")
         except Exception as e:
-            logger.warning(f"Failed to persist state to SQLite: {e}")
+            logger.warning(f"Failed to persist state to LevelDB: {e}")
 
     def get_state(self, root: bytes) -> Optional[object]:
         """Get a beacon state by root."""
-        # Check cache first
         if root in self._state_cache:
             return self._state_cache[root]
 
-        # Load from SQLite
         try:
-            cursor = self._conn.cursor()
-            cursor.execute("SELECT fork, data FROM states WHERE root = ?", (root,))
-            row = cursor.fetchone()
-            if row:
-                fork, data = row
-                state_types = self._get_state_types()
-                state_type = state_types.get(fork)
-                if state_type:
-                    state = state_type.decode_bytes(data)
-                    self._state_cache[root] = state  # Cache it
-                    return state
-        except Exception as e:
-            logger.warning(f"Failed to load state from SQLite: {e}")
-
-        return None
-
-    def get_state_by_slot(self, slot: int) -> Optional[object]:
-        """Get a beacon state by slot (returns first match)."""
-        try:
-            cursor = self._conn.cursor()
-            cursor.execute("SELECT root, fork, data FROM states WHERE slot = ? LIMIT 1", (slot,))
-            row = cursor.fetchone()
-            if row:
-                root, fork, data = row
+            value = self._db.get(_PREFIX_STATE + root)
+            if value:
+                fork, data = self._decode_value(value)
                 state_types = self._get_state_types()
                 state_type = state_types.get(fork)
                 if state_type:
@@ -238,16 +209,25 @@ class Store:
                     self._state_cache[root] = state
                     return state
         except Exception as e:
-            logger.warning(f"Failed to load state by slot from SQLite: {e}")
+            logger.warning(f"Failed to load state from LevelDB: {e}")
+
+        return None
+
+    def get_state_by_slot(self, slot: int) -> Optional[object]:
+        """Get a beacon state by slot (returns first match)."""
+        try:
+            root = self._db.get(_PREFIX_STATE_SLOT + struct.pack(">Q", slot))
+            if root:
+                return self.get_state(root)
+        except Exception as e:
+            logger.warning(f"Failed to load state by slot from LevelDB: {e}")
         return None
 
     def save_block(self, root: bytes, block: object) -> None:
         """Save a signed beacon block by root."""
-        # Cache in memory
         self._block_cache[root] = block
         self._trim_cache(self._block_cache)
 
-        # Persist to SQLite
         try:
             fork = self._detect_fork(block)
             msg = block.message if hasattr(block, "message") else block
@@ -255,28 +235,25 @@ class Store:
             parent_root = bytes(msg.parent_root) if hasattr(msg, "parent_root") else b"\x00" * 32
             data = block.encode_bytes()
 
-            self._conn.execute(
-                "INSERT OR REPLACE INTO blocks (root, slot, parent_root, fork, data) VALUES (?, ?, ?, ?, ?)",
-                (root, slot, parent_root, fork, data)
-            )
-            self._conn.commit()
+            batch = self._db.write_batch()
+            batch.put(_PREFIX_BLOCK + root, self._encode_value(fork, data))
+            batch.put(_PREFIX_BLOCK_SLOT + struct.pack(">Q", slot), root)
+            batch.put(_PREFIX_BLOCK_PARENT + parent_root + root, b"")
+            batch.write()
+
             logger.debug(f"Saved block: slot={slot}, fork={fork}, root={root.hex()[:16]}")
         except Exception as e:
-            logger.warning(f"Failed to persist block to SQLite: {e}")
+            logger.warning(f"Failed to persist block to LevelDB: {e}")
 
     def get_block(self, root: bytes) -> Optional[object]:
         """Get a signed beacon block by root."""
-        # Check cache first
         if root in self._block_cache:
             return self._block_cache[root]
 
-        # Load from SQLite
         try:
-            cursor = self._conn.cursor()
-            cursor.execute("SELECT fork, data FROM blocks WHERE root = ?", (root,))
-            row = cursor.fetchone()
-            if row:
-                fork, data = row
+            value = self._db.get(_PREFIX_BLOCK + root)
+            if value:
+                fork, data = self._decode_value(value)
                 block_types = self._get_block_types()
                 block_type = block_types.get(fork)
                 if block_type:
@@ -284,43 +261,32 @@ class Store:
                     self._block_cache[root] = block
                     return block
         except Exception as e:
-            logger.warning(f"Failed to load block from SQLite: {e}")
+            logger.warning(f"Failed to load block from LevelDB: {e}")
 
         return None
 
     def get_block_by_slot(self, slot: int) -> Optional[object]:
         """Get a signed beacon block by slot (returns first match)."""
         try:
-            cursor = self._conn.cursor()
-            cursor.execute("SELECT root, fork, data FROM blocks WHERE slot = ? LIMIT 1", (slot,))
-            row = cursor.fetchone()
-            if row:
-                root, fork, data = row
-                block_types = self._get_block_types()
-                block_type = block_types.get(fork)
-                if block_type:
-                    block = block_type.decode_bytes(data)
-                    self._block_cache[root] = block
-                    return block
+            root = self._db.get(_PREFIX_BLOCK_SLOT + struct.pack(">Q", slot))
+            if root:
+                return self.get_block(root)
         except Exception as e:
-            logger.warning(f"Failed to load block by slot from SQLite: {e}")
+            logger.warning(f"Failed to load block by slot from LevelDB: {e}")
         return None
 
     def get_blocks_by_parent(self, parent_root: bytes) -> list:
         """Get all blocks with a given parent root."""
         blocks = []
         try:
-            cursor = self._conn.cursor()
-            cursor.execute("SELECT root, fork, data FROM blocks WHERE parent_root = ?", (parent_root,))
-            block_types = self._get_block_types()
-            for root, fork, data in cursor.fetchall():
-                block_type = block_types.get(fork)
-                if block_type:
-                    block = block_type.decode_bytes(data)
-                    self._block_cache[root] = block
+            prefix = _PREFIX_BLOCK_PARENT + parent_root
+            for key, _ in self._db.iterator(prefix=prefix):
+                root = key[len(prefix):]
+                block = self.get_block(root)
+                if block:
                     blocks.append(block)
         except Exception as e:
-            logger.warning(f"Failed to load blocks by parent from SQLite: {e}")
+            logger.warning(f"Failed to load blocks by parent from LevelDB: {e}")
         return blocks
 
     def save_payload(self, root: bytes, payload: object) -> None:
@@ -328,16 +294,12 @@ class Store:
         self._payload_cache[root] = payload
         self._trim_cache(self._payload_cache)
 
-        # Persist to SQLite
         try:
             data = payload.encode_bytes() if hasattr(payload, "encode_bytes") else b""
-            self._conn.execute(
-                "INSERT OR REPLACE INTO payloads (root, data) VALUES (?, ?)",
-                (root, data)
-            )
-            self._conn.commit()
+            if data:
+                self._db.put(_PREFIX_PAYLOAD + root, data)
         except Exception as e:
-            logger.debug(f"Failed to persist payload to SQLite: {e}")
+            logger.debug(f"Failed to persist payload to LevelDB: {e}")
 
     def get_payload(self, root: bytes) -> Optional[object]:
         """Get an execution payload envelope by root."""
@@ -374,7 +336,6 @@ class Store:
         """Trim cache to limit size."""
         limit = limit or self._cache_limit
         while len(cache) > limit:
-            # Remove oldest item (first key)
             oldest_key = next(iter(cache))
             del cache[oldest_key]
 
@@ -382,23 +343,33 @@ class Store:
         """Prune old states and blocks. Returns number of items pruned."""
         pruned = 0
         try:
-            # Get the latest slot
-            cursor = self._conn.cursor()
-            cursor.execute("SELECT MAX(slot) FROM states")
-            result = cursor.fetchone()
-            if result and result[0]:
-                max_slot = result[0]
+            max_slot = 0
+            for key, _ in self._db.iterator(prefix=_PREFIX_STATE_SLOT, reverse=True):
+                max_slot = struct.unpack(">Q", key[len(_PREFIX_STATE_SLOT):])[0]
+                break
+
+            if max_slot > 0:
                 cutoff_slot = max_slot - keep_slots
+                batch = self._db.write_batch()
 
-                # Prune old states (keep finalized states)
-                cursor.execute("DELETE FROM states WHERE slot < ? AND slot > 0", (cutoff_slot,))
-                pruned += cursor.rowcount
+                for key, value in self._db.iterator(prefix=_PREFIX_STATE_SLOT):
+                    slot = struct.unpack(">Q", key[len(_PREFIX_STATE_SLOT):])[0]
+                    if 0 < slot < cutoff_slot:
+                        root = value
+                        batch.delete(key)
+                        batch.delete(_PREFIX_STATE + root)
+                        pruned += 1
 
-                # Prune old blocks
-                cursor.execute("DELETE FROM blocks WHERE slot < ?", (cutoff_slot,))
-                pruned += cursor.rowcount
+                for key, value in self._db.iterator(prefix=_PREFIX_BLOCK_SLOT):
+                    slot = struct.unpack(">Q", key[len(_PREFIX_BLOCK_SLOT):])[0]
+                    if slot < cutoff_slot:
+                        root = value
+                        batch.delete(key)
+                        batch.delete(_PREFIX_BLOCK + root)
+                        pruned += 1
 
-                self._conn.commit()
+                batch.write()
+
                 if pruned > 0:
                     logger.info(f"Pruned {pruned} old states/blocks (cutoff slot: {cutoff_slot})")
         except Exception as e:
@@ -411,29 +382,47 @@ class Store:
         stats = {
             "state_cache_size": len(self._state_cache),
             "block_cache_size": len(self._block_cache),
+            "states_count": 0,
+            "blocks_count": 0,
+            "state_slot_range": (0, 0),
+            "block_slot_range": (0, 0),
         }
         try:
-            cursor = self._conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM states")
-            stats["states_count"] = cursor.fetchone()[0]
-            cursor.execute("SELECT COUNT(*) FROM blocks")
-            stats["blocks_count"] = cursor.fetchone()[0]
-            cursor.execute("SELECT MIN(slot), MAX(slot) FROM states")
-            row = cursor.fetchone()
-            stats["state_slot_range"] = (row[0], row[1]) if row[0] else (0, 0)
-            cursor.execute("SELECT MIN(slot), MAX(slot) FROM blocks")
-            row = cursor.fetchone()
-            stats["block_slot_range"] = (row[0], row[1]) if row[0] else (0, 0)
+            for _ in self._db.iterator(prefix=_PREFIX_STATE):
+                stats["states_count"] += 1
+
+            for _ in self._db.iterator(prefix=_PREFIX_BLOCK):
+                stats["blocks_count"] += 1
+
+            min_state_slot, max_state_slot = None, None
+            for key, _ in self._db.iterator(prefix=_PREFIX_STATE_SLOT):
+                slot = struct.unpack(">Q", key[len(_PREFIX_STATE_SLOT):])[0]
+                if min_state_slot is None or slot < min_state_slot:
+                    min_state_slot = slot
+                if max_state_slot is None or slot > max_state_slot:
+                    max_state_slot = slot
+            if min_state_slot is not None:
+                stats["state_slot_range"] = (min_state_slot, max_state_slot)
+
+            min_block_slot, max_block_slot = None, None
+            for key, _ in self._db.iterator(prefix=_PREFIX_BLOCK_SLOT):
+                slot = struct.unpack(">Q", key[len(_PREFIX_BLOCK_SLOT):])[0]
+                if min_block_slot is None or slot < min_block_slot:
+                    min_block_slot = slot
+                if max_block_slot is None or slot > max_block_slot:
+                    max_block_slot = slot
+            if min_block_slot is not None:
+                stats["block_slot_range"] = (min_block_slot, max_block_slot)
         except Exception as e:
             logger.warning(f"Failed to get DB stats: {e}")
         return stats
 
     def close(self) -> None:
         """Close the database connection."""
-        if self._conn:
-            self._conn.close()
-            self._conn = None
-            logger.info("SQLite store closed")
+        if self._db:
+            self._db.close()
+            self._db = None
+            logger.info("LevelDB store closed")
 
 
 __all__ = ["Store"]

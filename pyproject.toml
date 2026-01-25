@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11,<3.13"  # Python 3.13 breaks remerkleable SSZ hash_tree_root
 dependencies = [
     "remerkleable>=0.1.28",
+    "blspy>=2.0.0",
     "py_ecc>=7.0.0",
     "aiohttp>=3.9.0",
     "pyjwt>=2.8.0",
@@ -15,6 +16,7 @@ dependencies = [
     "libp2p>=0.2.0",
     "python-snappy>=0.7.0",
     "rlp>=4.0.0",
+    "plyvel>=1.5.0",
 ]
 
 [project.optional-dependencies]

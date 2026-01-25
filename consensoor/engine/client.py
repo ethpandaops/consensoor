@@ -115,21 +115,30 @@ class EngineAPIClient:
 
         config = get_config()
         genesis_time = self._genesis_time or 0
+        FAR_FUTURE_EPOCH = 2**64 - 1
 
         def epoch_start_time(epoch: int) -> int:
-            if epoch == 2**64 - 1:
+            if epoch >= FAR_FUTURE_EPOCH:
                 return 2**63
             return genesis_time + epoch * SLOTS_PER_EPOCH() * config.seconds_per_slot
 
-        if hasattr(config, 'gloas_fork_epoch') and timestamp >= epoch_start_time(config.gloas_fork_epoch):
+        def is_fork_active(attr_name: str) -> bool:
+            if not hasattr(config, attr_name):
+                return False
+            epoch = getattr(config, attr_name)
+            if epoch >= FAR_FUTURE_EPOCH:
+                return False
+            return timestamp >= epoch_start_time(epoch)
+
+        if is_fork_active('gloas_fork_epoch'):
             return "gloas"
-        if hasattr(config, 'fulu_fork_epoch') and timestamp >= epoch_start_time(config.fulu_fork_epoch):
+        if is_fork_active('fulu_fork_epoch'):
             return "fulu"
-        if hasattr(config, 'electra_fork_epoch') and timestamp >= epoch_start_time(config.electra_fork_epoch):
+        if is_fork_active('electra_fork_epoch'):
             return "electra"
-        if hasattr(config, 'deneb_fork_epoch') and timestamp >= epoch_start_time(config.deneb_fork_epoch):
+        if is_fork_active('deneb_fork_epoch'):
             return "deneb"
-        if hasattr(config, 'capella_fork_epoch') and timestamp >= epoch_start_time(config.capella_fork_epoch):
+        if is_fork_active('capella_fork_epoch'):
             return "capella"
         return "bellatrix"
 

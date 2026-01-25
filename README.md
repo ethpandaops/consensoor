@@ -22,6 +22,16 @@ Built for the Gloas fork (ePBS - Enshrined Proposer-Builder Separation).
 - Python 3.11+
 - An execution layer client (geth, reth, etc.)
 
+## Key Dependencies
+
+| Package | Purpose |
+|---------|---------|
+| `blspy` | Fast BLS12-381 cryptography (C/assembly, 100x faster than py_ecc) |
+| `plyvel` | LevelDB bindings for state/block storage |
+| `remerkleable` | SSZ serialization and Merkleization |
+| `libp2p` | P2P networking with gossipsub |
+| `aiohttp` | Async HTTP for Engine API and Beacon API |
+
 ## Installation
 
 ```bash
@@ -81,7 +91,7 @@ consensoor/
 │   ├── types/          # SSZ containers (BeaconState, BeaconBlock, etc.)
 │   ├── constants.py    # Preset values organized by fork
 │   └── network_config.py   # Runtime config from YAML or upstream
-├── crypto/             # BLS signatures, hashing
+├── crypto/             # BLS signatures (blspy), hashing
 ├── p2p/                # libp2p networking
 │   ├── host.py         # P2P host with ENR generation
 │   ├── gossip.py       # Beacon gossip topics
@@ -90,7 +100,7 @@ consensoor/
 ├── engine/             # Engine API client
 │   ├── types.py        # Payload types and responses
 │   └── client.py       # JSON-RPC client
-├── store/              # State and block storage
+├── store/              # State and block storage (LevelDB)
 ├── validator/          # Validator duties
 │   ├── types.py        # ValidatorKey, ProposerDuty, etc.
 │   ├── shuffling.py    # Proposer selection algorithms
@@ -219,6 +229,7 @@ This is a prototype for local testing. Not intended for production use.
 - No full fork choice implementation
 - Simplified state transition
 - No slashing protection
+- Falls back to py_ecc (slow) if blspy unavailable
 - No proper sync protocol (relies on checkpoint sync)
 - Limited validator/builder logic
 
