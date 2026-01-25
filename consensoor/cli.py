@@ -82,6 +82,13 @@ def cli():
     envvar="CONSENSOOR_BEACON_API_PORT",
 )
 @click.option(
+    "--metrics-port",
+    default=8008,
+    type=int,
+    help="Port for Prometheus metrics endpoint",
+    envvar="CONSENSOOR_METRICS_PORT",
+)
+@click.option(
     "--peers",
     multiple=True,
     help="Peer addresses (can be specified multiple times)",
@@ -145,6 +152,7 @@ def run(
     p2p_port: int,
     p2p_host: str,
     beacon_api_port: int,
+    metrics_port: int,
     peers: tuple[str, ...],
     data_dir: str,
     log_level: str,
@@ -179,6 +187,7 @@ def run(
         listen_port=p2p_port,
         listen_host=p2p_host,
         beacon_api_port=beacon_api_port,
+        metrics_port=metrics_port,
         peers=all_peers,
         data_dir=data_dir,
         log_level=log_level,
@@ -193,6 +202,7 @@ def run(
     logger.info(f"  Engine API: {engine_api_url}")
     logger.info(f"  P2P: {p2p_host}:{p2p_port}")
     logger.info(f"  Beacon API: port {beacon_api_port}")
+    logger.info(f"  Metrics: port {metrics_port}")
     if peers:
         logger.info(f"  Peers: {list(peers)}")
     if bootnodes:

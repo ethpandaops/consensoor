@@ -54,6 +54,7 @@ from .crypto import hash_tree_root, sign, compute_signing_root
 from .validator import ValidatorClient, load_keystores_teku_style
 from .builder import BlockBuilder
 from .attestation_pool import AttestationPool
+from . import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +179,15 @@ class BeaconNode:
         logger.info("Starting consensoor beacon node")
         logger.info(f"Using preset: {self.config.preset}")
 
+        # Start metrics server
+        metrics.start_metrics_server(self.config.metrics_port)
+        from .version import get_cl_version
+        metrics.set_node_info(
+            version=get_cl_version(),
+            network=self.config.network_config_path or "kurtosis",
+            preset=self.config.preset,
+        )
+
         if self.config.network_config_path:
             load_network_config(self.config.network_config_path)
             logger.info(f"Loaded network config from {self.config.network_config_path}")
@@ -287,6 +297,15 @@ class BeaconNode:
         self.store.save_state(self.head_root, self.state)
         self.store.set_head(self.head_root)
         logger.info(f"Genesis block root: {self.head_root.hex()}")
+
+        # Update metrics
+        from .spec import constants
+        epoch = self.head_slot // constants.SLOTS_PER_EPOCH()
+        metrics.update_head(self.head_slot, epoch)
+        metrics.update_checkpoints(
+            finalized=int(self.state.finalized_checkpoint.epoch),
+            justified=int(self.state.current_justified_checkpoint.epoch),
+        )
 
     async def _load_validator_keys(self) -> None:
         """Load validator keys if configured."""
@@ -532,7 +551,8 @@ class BeaconNode:
 
         network_config = get_config()
         current_time = int(time.time())
-        current_slot = (current_time - self._genesis_time) // network_config.seconds_per_slot
+        slot_duration_sec = network_config.slot_duration_ms // 1000
+        current_slot = (current_time - self._genesis_time) // slot_duration_sec
 
         # Prepare for the next slot (current_slot + 1, or slot 1 if before genesis)
         target_slot = max(1, current_slot + 1)
@@ -555,7 +575,7 @@ class BeaconNode:
 
         try:
             network_config = get_config()
-            timestamp = self._genesis_time + slot * network_config.seconds_per_slot
+            timestamp = self._genesis_time + slot * (network_config.slot_duration_ms // 1000)
 
             # Get the current head block hash
             if hasattr(self.state, "latest_block_hash"):
@@ -624,23 +644,71 @@ class BeaconNode:
             self._current_payload_id = None
 
     async def _slot_ticker(self) -> None:
-        """Tick every slot and process duties."""
+        """Tick every slot and process duties with proper intra-slot timing.
+
+        Per Ethereum spec, the slot is divided into phases with timing from config:
+        - 0: Block proposal window
+        - ATTESTATION_DUE_BPS: Attestation production (default 33.33% = 1/3)
+        - AGGREGATE_DUE_BPS: Aggregation window (default 66.67% = 2/3)
+
+        Gloas (ePBS) uses different timing:
+        - ATTESTATION_DUE_BPS_GLOAS: 25% of slot
+        - AGGREGATE_DUE_BPS_GLOAS: 50% of slot
+        """
         network_config = get_config()
-        seconds_per_slot = network_config.seconds_per_slot
+        slot_duration = network_config.slot_duration_ms / 1000.0
+
+        last_slot_processed = -1
+        last_attestation_slot = -1
 
         while self._running:
-            now = int(time.time())
-            current_slot = (now - self._genesis_time) // seconds_per_slot
+            try:
+                now = time.time()
+                current_slot = int((now - self._genesis_time) // slot_duration)
+                slot_start_time = self._genesis_time + current_slot * slot_duration
+                time_into_slot = now - slot_start_time
 
-            if current_slot > self.head_slot:
-                await self._on_slot(current_slot)
+                # Calculate current epoch for fork-aware timing
+                slots_per_epoch = SLOTS_PER_EPOCH()
+                current_epoch = current_slot // slots_per_epoch
 
-            next_slot_time = self._genesis_time + (current_slot + 1) * seconds_per_slot
-            sleep_time = max(0.1, next_slot_time - time.time())
-            await asyncio.sleep(sleep_time)
+                # Get attestation timing based on active fork (Gloas has different timing)
+                attestation_offset = network_config.get_attestation_due_offset(current_epoch)
 
-    async def _on_slot(self, slot: int) -> None:
-        """Handle a new slot."""
+                # Phase 1: Slot start - propose blocks and update forkchoice
+                if current_slot > last_slot_processed:
+                    last_slot_processed = current_slot
+                    await self._on_slot_start(current_slot)
+
+                # Phase 2: Attestation due time - produce attestations
+                if current_slot > last_attestation_slot and time_into_slot >= attestation_offset:
+                    last_attestation_slot = current_slot
+                    await self._produce_attestations(current_slot)
+
+                # Calculate sleep time - wake up for next event
+                if current_slot == last_attestation_slot:
+                    # Already attested this slot, sleep until next slot
+                    next_slot_time = self._genesis_time + (current_slot + 1) * slot_duration
+                    sleep_time = max(0.05, next_slot_time - time.time())
+                else:
+                    # Need to attest this slot, sleep until attestation due time
+                    attestation_time = slot_start_time + attestation_offset
+                    sleep_time = max(0.05, attestation_time - time.time())
+
+                await asyncio.sleep(sleep_time)
+            except asyncio.CancelledError:
+                logger.info("Slot ticker cancelled")
+                raise
+            except Exception as e:
+                logger.error(f"Slot ticker error: {e}", exc_info=True)
+                await asyncio.sleep(1)  # Prevent tight loop on errors
+
+    async def _on_slot_start(self, slot: int) -> None:
+        """Handle the start of a new slot (0/3 mark).
+
+        This is called at slot start for block proposals and forkchoice updates.
+        Attestations are produced separately at the 1/3 mark by the slot ticker.
+        """
         slots_per_epoch = SLOTS_PER_EPOCH()
         epoch = slot // slots_per_epoch
         logger.info(f"Slot {slot} (epoch {epoch})")
@@ -665,8 +733,7 @@ class BeaconNode:
         # Update forkchoice to keep EL in sync and prepare payload for NEXT slot
         await self._update_forkchoice_for_slot(slot)
 
-        # Produce attestations for this slot
-        await self._produce_attestations(slot)
+        # NOTE: Attestations are produced at the 1/3 mark by _slot_ticker, not here
 
     async def _update_forkchoice_for_slot(self, slot: int) -> None:
         """Update forkchoice with EL and prepare payload for NEXT slot (slot + 1)."""
@@ -698,7 +765,7 @@ class BeaconNode:
             # Prepare payload attributes for NEXT slot (slot + 1)
             network_config = get_config()
             next_slot = slot + 1
-            timestamp = self._genesis_time + next_slot * network_config.seconds_per_slot
+            timestamp = self._genesis_time + next_slot * (network_config.slot_duration_ms // 1000)
             import time as time_mod
             current_time = int(time_mod.time())
             logger.info(
@@ -804,14 +871,24 @@ class BeaconNode:
             del self._attester_duties[e]
 
     async def _produce_attestations(self, slot: int) -> None:
-        """Produce attestations for validators with duties at this slot."""
+        """Produce attestations for validators with duties at this slot.
+
+        Called at 1/3 into the slot per Ethereum spec to allow time for
+        block proposals to arrive before attesting.
+        """
         if not self.validator_client or not self.validator_client.keys:
             return
         if not self.state or not self.head_root:
             return
 
+        # Log timing for debugging attestation rate issues
+        network_config = get_config()
+        slot_duration = network_config.slot_duration_ms / 1000.0
         slots_per_epoch = SLOTS_PER_EPOCH()
         epoch = slot // slots_per_epoch
+        slot_start = self._genesis_time + slot * slot_duration
+        time_into_slot = time.time() - slot_start
+        expected_offset = network_config.get_attestation_due_offset(epoch)
 
         duties = self._attester_duties.get(epoch, [])
         slot_duties = [d for d in duties if d.slot == slot]
@@ -827,7 +904,10 @@ class BeaconNode:
                 slot
             )
 
-        logger.info(f"Producing {len(slot_duties)} attestations for slot {slot}")
+        logger.info(
+            f"Producing {len(slot_duties)} attestations for slot {slot} "
+            f"(at {time_into_slot:.2f}s into slot, target={expected_offset:.2f}s)"
+        )
 
         for duty in slot_duties:
             try:
@@ -929,7 +1009,7 @@ class BeaconNode:
 
         try:
             network_config = get_config()
-            timestamp = self._genesis_time + slot * network_config.seconds_per_slot
+            timestamp = self._genesis_time + slot * (network_config.slot_duration_ms // 1000)
 
             # Always request a fresh payload for this slot to ensure correct timestamp
             # This is safer than relying on a previously prepared payload which might be stale
@@ -1005,6 +1085,12 @@ class BeaconNode:
             self.head_root = block_root
             self.store.set_head(block_root)
 
+            # Update metrics
+            from .spec import constants
+            epoch = slot // constants.SLOTS_PER_EPOCH()
+            metrics.update_head(slot, epoch)
+            metrics.record_block_proposed(success=True)
+
             await self._apply_block_to_state(block, block_root, signed_block)
 
             # Save state for epoch queries (Dora needs historical states by state_root)
@@ -1055,6 +1141,8 @@ class BeaconNode:
                 f"Received block: slot={block.slot}, root={block_root.hex()[:16]}"
             )
 
+            metrics.record_block_received()
+
             if self.store.get_block(block_root):
                 return
 
@@ -1064,6 +1152,12 @@ class BeaconNode:
                 self.head_slot = int(block.slot)
                 self.head_root = block_root
                 self.store.set_head(block_root)
+
+                # Update metrics
+                from .spec import constants
+                slot = int(block.slot)
+                epoch = slot // constants.SLOTS_PER_EPOCH()
+                metrics.update_head(slot, epoch)
 
                 # Apply full state transition
                 await self._apply_block_to_state(block, block_root, signed_block)
@@ -1142,6 +1236,8 @@ class BeaconNode:
                 f"from={from_peer[:16]}"
             )
 
+            metrics.record_block_received()
+
             if self.store.get_block(block_root):
                 logger.debug(f"Block already known: {block_root.hex()[:16]}")
                 return
@@ -1192,6 +1288,13 @@ class BeaconNode:
                     self.head_slot = int(block.slot)
                     self.head_root = block_root
                     self.store.set_head(block_root)
+
+                    # Update metrics
+                    from .spec import constants
+                    slot = int(block.slot)
+                    epoch = slot // constants.SLOTS_PER_EPOCH()
+                    metrics.update_head(slot, epoch)
+
                     # Save state for epoch queries (Dora needs historical states by state_root)
                     state_root = hash_tree_root(self.state)
                     self.store.save_state(state_root, self.state)
@@ -1275,6 +1378,11 @@ class BeaconNode:
                 f"Full state transition applied: slot={block.slot}, "
                 f"block_hash={bytes(block.body.execution_payload.block_hash).hex()[:16] if hasattr(block.body, 'execution_payload') else 'N/A'}, "
                 f"latest_header_slot={self.state.latest_block_header.slot}"
+            )
+            # Update checkpoint metrics
+            metrics.update_checkpoints(
+                finalized=int(self.state.finalized_checkpoint.epoch),
+                justified=int(self.state.current_justified_checkpoint.epoch),
             )
             return
 
@@ -1441,7 +1549,7 @@ class BeaconNode:
         """Get the current slot based on time."""
         network_config = get_config()
         now = int(time.time())
-        return (now - self._genesis_time) // network_config.seconds_per_slot
+        return (now - self._genesis_time) // (network_config.slot_duration_ms // 1000)
 
     @property
     def current_epoch(self) -> int:

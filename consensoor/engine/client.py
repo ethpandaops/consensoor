@@ -14,6 +14,7 @@ from .types import (
     GetPayloadResponse,
     EngineAPIError,
 )
+from .. import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +43,7 @@ def _epoch_to_timestamp(epoch: int, config) -> int:
     if epoch == 2**64 - 1:
         return 2**63
     genesis_time = getattr(config, 'min_genesis_time', 0)
-    return genesis_time + epoch * SLOTS_PER_EPOCH() * config.seconds_per_slot
+    return genesis_time + epoch * SLOTS_PER_EPOCH() * (config.slot_duration_ms // 1000)
 
 
 class EngineAPIClient:
@@ -90,6 +91,9 @@ class EngineAPIClient:
 
         logger.debug(f"Engine API call: {method}")
 
+        start_time = time.time()
+        error_type = None
+
         try:
             async with session.post(
                 self.url, json=payload, headers=headers
@@ -98,6 +102,7 @@ class EngineAPIClient:
 
                 if "error" in data:
                     error = data["error"]
+                    error_type = str(error.get("code", "unknown"))
                     raise EngineAPIError(error.get("code", -1), error.get("message", ""))
 
                 result = data.get("result")
@@ -105,8 +110,12 @@ class EngineAPIClient:
                     logger.debug(f"Engine API response for {method}: {result}")
                 return result
         except aiohttp.ClientError as e:
+            error_type = "connection_error"
             logger.error(f"Engine API connection error: {e}")
             raise
+        finally:
+            latency = time.time() - start_time
+            metrics.record_engine_api_call(method, latency, error_type)
 
     def _get_fork_for_timestamp(self, timestamp: int) -> str:
         """Determine which fork is active for a given timestamp."""
@@ -120,7 +129,7 @@ class EngineAPIClient:
         def epoch_start_time(epoch: int) -> int:
             if epoch >= FAR_FUTURE_EPOCH:
                 return 2**63
-            return genesis_time + epoch * SLOTS_PER_EPOCH() * config.seconds_per_slot
+            return genesis_time + epoch * SLOTS_PER_EPOCH() * (config.slot_duration_ms // 1000)
 
         def is_fork_active(attr_name: str) -> bool:
             if not hasattr(config, attr_name):

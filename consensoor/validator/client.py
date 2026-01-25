@@ -26,6 +26,7 @@ ElectraCommitteeBits = Bitvector[MAX_COMMITTEES_PER_SLOT()]
 from ..crypto import sign as bls_sign, hash_tree_root
 from .types import ValidatorKey, ProposerDuty, AttesterDuty
 from .shuffling import get_beacon_proposer_index
+from .. import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -275,6 +276,7 @@ class ValidatorClient:
                 f"electra={self._is_electra_fork(state)}"
             )
 
+            metrics.record_attestation_produced()
             return attestation
 
         except Exception as e:

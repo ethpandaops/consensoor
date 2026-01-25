@@ -15,6 +15,8 @@ if TYPE_CHECKING:
     from libp2p.pubsub.pubsub import Pubsub
     from libp2p.pubsub.gossipsub import GossipSub
 
+from .. import metrics
+
 logger = logging.getLogger(__name__)
 
 MessageHandler = Callable[[bytes, str], Awaitable[None]]
@@ -46,10 +48,10 @@ class P2PConfig:
     attnets: bytes = field(default_factory=lambda: b"\xff\xff\xff\xff\xff\xff\xff\xff")
     syncnets: bytes = field(default_factory=lambda: b"\x0f")
     supernode: bool = False
-    gossip_degree: int = 8
-    gossip_degree_low: int = 6
-    gossip_degree_high: int = 12
-    heartbeat_interval: float = 1.0
+    gossip_degree: int = 3
+    gossip_degree_low: int = 1
+    gossip_degree_high: int = 6
+    heartbeat_interval: float = 0.7
     advertised_ip: str = ""
 
     @property
@@ -214,14 +216,17 @@ class P2PHost:
                         # Start subscription message reader as a background task
                         async with trio.open_nursery() as nursery:
                             last_reconnect_attempt = 0
+                            last_mesh_log = 0
                             reconnect_interval = 10  # seconds
+                            mesh_log_interval = 30  # seconds
                             while not self._stop_event.is_set():
                                 await self._process_publish_queue_trio()
                                 await self._process_subscribe_queue_trio(nursery)
 
-                                # Periodically retry connecting to static peers
                                 import time
                                 now = time.time()
+
+                                # Periodically retry connecting to static peers
                                 if now - last_reconnect_attempt > reconnect_interval:
                                     last_reconnect_attempt = now
                                     if len(self._connected_peers) < len(self.config.static_peers):
@@ -230,6 +235,11 @@ class P2PHost:
                                                 await self._connect_to_peer_trio(peer)
                                             except Exception as e:
                                                 logger.debug(f"Reconnect to {peer[:30]}... failed: {e}")
+
+                                # Periodically log mesh state and ensure peers are in mesh
+                                if now - last_mesh_log > mesh_log_interval:
+                                    last_mesh_log = now
+                                    await self._log_and_maintain_mesh()
 
                                 await trio.sleep(0.1)
 
@@ -268,6 +278,7 @@ class P2PHost:
                     "direction": "inbound" if hasattr(conn, 'is_initiator') and not conn.is_initiator else "outbound"
                 }
                 host._peer_count = len(host._connected_peers)
+                metrics.update_peers(host._peer_count)
 
             async def disconnected(self, network, conn):
                 full_peer_id = conn.muxed_conn.peer_id.to_base58()
@@ -275,6 +286,7 @@ class P2PHost:
                 logger.info(f"Notifier: peer disconnected: {peer_id}")
                 host._connected_peers.pop(full_peer_id, None)
                 host._peer_count = len(host._connected_peers)
+                metrics.update_peers(host._peer_count)
 
             async def listen(self, network, multiaddr):
                 logger.info(f"Listening on: {multiaddr}")
@@ -709,6 +721,19 @@ class P2PHost:
                 "direction": "outbound"
             }
             self._peer_count = len(self._connected_peers)
+            metrics.update_peers(self._peer_count)
+
+            # Explicitly add peer to gossipsub mesh for all subscribed topics
+            if self._gossipsub:
+                for topic in self._subscriptions.keys():
+                    try:
+                        # Add peer to mesh - this ensures messages will be forwarded
+                        if hasattr(self._gossipsub, 'mesh') and topic in self._gossipsub.mesh:
+                            if peer_info.peer_id not in self._gossipsub.mesh[topic]:
+                                self._gossipsub.mesh[topic].add(peer_info.peer_id)
+                                logger.info(f"Added peer {full_peer_id[:16]} to mesh for topic {topic[:50]}...")
+                    except Exception as e:
+                        logger.debug(f"Could not add peer to mesh for {topic}: {e}")
 
             # Try to open a status stream to keep connection alive and verify it works
             # Use status/2 for Fulu (includes custody_group_count and earliest_available_slot)
@@ -809,6 +834,41 @@ class P2PHost:
         except Exception as e:
             logger.warning(f"Failed to connect to peer {peer_addr[:50]}: {e}")
 
+    async def _log_and_maintain_mesh(self) -> None:
+        """Log current mesh state and ensure all peers are in the mesh."""
+        if not self._gossipsub:
+            return
+
+        try:
+            mesh = getattr(self._gossipsub, 'mesh', {})
+            fanout = getattr(self._gossipsub, 'fanout', {})
+            peers_in_mesh = {}
+
+            for topic, peer_set in mesh.items():
+                short_topic = topic.split("/")[-2] if "/" in topic else topic[:30]
+                peer_ids = [str(p)[:16] for p in peer_set] if peer_set else []
+                peers_in_mesh[short_topic] = len(peer_ids)
+                if peer_ids:
+                    logger.info(f"Mesh[{short_topic}]: {len(peer_ids)} peers - {peer_ids}")
+                else:
+                    logger.warning(f"Mesh[{short_topic}]: EMPTY - no peers to forward messages!")
+
+            # Try to add connected peers to mesh if mesh is empty
+            for topic in self._subscriptions.keys():
+                if topic in mesh and len(mesh[topic]) == 0:
+                    for peer_id_str, peer_info in self._connected_peers.items():
+                        try:
+                            from libp2p.peer.id import ID
+                            peer_id = ID.from_base58(peer_id_str)
+                            mesh[topic].add(peer_id)
+                            logger.info(f"Added {peer_id_str[:16]} to empty mesh for {topic[:50]}")
+                        except Exception as e:
+                            logger.debug(f"Could not add peer to mesh: {e}")
+
+            logger.info(f"Connected peers: {len(self._connected_peers)}, Subscriptions: {len(self._subscriptions)}")
+        except Exception as e:
+            logger.debug(f"Error logging mesh state: {e}")
+
     async def _process_publish_queue_trio(self) -> None:
         """Process outgoing messages from the publish queue (Trio context)."""
         try:
@@ -816,8 +876,14 @@ class P2PHost:
                 try:
                     topic, data = self._publish_queue.get_nowait()
                     if self._pubsub:
+                        # Log mesh state before publishing
+                        mesh = getattr(self._gossipsub, 'mesh', {})
+                        mesh_peers = len(mesh.get(topic, set())) if mesh else 0
+                        short_topic = topic.split("/")[-2] if "/" in topic else topic[:30]
+
                         await self._pubsub.publish(topic, data)
-                        logger.debug(f"Published message to {topic}: {len(data)} bytes")
+                        metrics.record_gossip_sent(topic)
+                        logger.info(f"GOSSIP SEND to {short_topic}: {len(data)} bytes (mesh_peers={mesh_peers})")
                 except queue.Empty:
                     break
         except Exception as e:
@@ -843,14 +909,19 @@ class P2PHost:
     async def _read_subscription_trio(self, topic: str, subscription) -> None:
         """Read messages from a gossipsub subscription and queue them (Trio context)."""
         logger.info(f"Started reading messages from topic: {topic}")
+        msg_count = 0
         try:
             while self._running:
                 try:
                     msg = await subscription.get()
+                    msg_count += 1
                     # Put the message in the queue for asyncio processing
                     from_peer = msg.from_id.hex() if hasattr(msg, 'from_id') else "unknown"
                     self._message_queue.put((topic, msg.data, from_peer))
-                    logger.debug(f"Received gossip message on {topic}: {len(msg.data)} bytes from {from_peer[:16]}")
+                    metrics.record_gossip_received(topic)
+                    # Log received messages at INFO level to track gossip activity
+                    short_topic = topic.split("/")[-2] if "/" in topic else topic
+                    logger.info(f"GOSSIP RECV #{msg_count} on {short_topic}: {len(msg.data)} bytes from {from_peer[:16]}")
                 except Exception as e:
                     if self._running:
                         logger.warning(f"Error reading from subscription {topic}: {e}")

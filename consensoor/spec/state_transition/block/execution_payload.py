@@ -86,7 +86,7 @@ def process_execution_payload(
     expected_timestamp = compute_time_at_slot(
         int(state.genesis_time),
         int(state.slot),
-        network_config.seconds_per_slot,
+        network_config.slot_duration_ms,
     )
     assert int(payload.timestamp) == expected_timestamp, (
         f"Payload timestamp {payload.timestamp} doesn't match expected {expected_timestamp}"

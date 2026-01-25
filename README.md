@@ -64,6 +64,7 @@ consensoor run \
 | `--p2p-port` | TCP/UDP port for P2P | `9000` |
 | `--p2p-host` | Host to bind P2P | `0.0.0.0` |
 | `--beacon-api-port` | Beacon API HTTP port | `5052` |
+| `--metrics-port` | Prometheus metrics HTTP port | `8008` |
 | `--bootnodes` | Bootnode ENRs (repeatable) | - |
 | `--checkpoint-sync-url` | Upstream beacon URL for state sync | - |
 | `--validator-keys` | Validator keystores (format: keystores:secrets) | - |
@@ -210,6 +211,36 @@ Implements subset of standard Beacon API:
 - `GET /eth/v1/beacon/headers/head`
 - `GET /eth/v1/beacon/states/{state_id}/root`
 - `GET /eth/v1/config/spec`
+
+## Prometheus Metrics
+
+Consensoor exposes Prometheus-compatible metrics on port 8008 (configurable via `--metrics-port`).
+
+**Node metrics:**
+- `consensoor_head_slot` - Current head slot
+- `consensoor_head_epoch` - Current head epoch
+- `consensoor_finalized_epoch` - Current finalized epoch
+- `consensoor_justified_epoch` - Current justified epoch
+- `consensoor_syncing` - Whether the node is syncing (1) or synced (0)
+
+**P2P metrics:**
+- `consensoor_peers_connected` - Number of connected peers
+- `consensoor_gossip_messages_received_total` - Messages received by topic
+- `consensoor_gossip_messages_sent_total` - Messages sent by topic
+
+**Validator metrics:**
+- `consensoor_attestations_produced_total` - Attestations created
+- `consensoor_blocks_proposed_total` - Blocks proposed
+- `consensoor_blocks_received_total` - Blocks received from network
+
+**Engine API metrics:**
+- `consensoor_engine_api_requests_total` - Requests by method
+- `consensoor_engine_api_errors_total` - Errors by method and type
+- `consensoor_engine_api_latency_seconds` - Request latency histogram
+
+**Performance metrics:**
+- `consensoor_block_processing_seconds` - Block processing time histogram
+- `consensoor_state_transition_seconds` - State transition time histogram
 
 ## Gloas ePBS Flow
 

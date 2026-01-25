@@ -20,6 +20,7 @@ class Config:
     listen_host: str = "0.0.0.0"
     listen_port: int = 9000
     beacon_api_port: int = 5052
+    metrics_port: int = 8008
     data_dir: str = "./data"
     log_level: str = "INFO"
     checkpoint_sync_url: str = ""

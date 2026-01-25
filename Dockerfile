@@ -44,11 +44,12 @@ COPY --from=builder /app/dist/*.whl /tmp/
 # Pin py_ecc>=7.0.0 and remerkleable>=0.1.28 to avoid deprecation warnings from old eth-utils
 # blspy provides fast BLS cryptography (C/assembly instead of pure Python py_ecc)
 RUN pip install --no-cache-dir --no-deps /tmp/*.whl && \
-    pip install --no-cache-dir "remerkleable>=0.1.28" "blspy>=2.0.0" "py_ecc>=7.0.0" "plyvel>=1.5.0" pycryptodome aiohttp click python-snappy coincurve rlp trio varint pyjwt pyyaml && \
+    pip install --no-cache-dir "remerkleable>=0.1.28" "blspy>=2.0.0" "py_ecc>=7.0.0" "plyvel>=1.5.0" "prometheus_client>=0.20.0" pycryptodome aiohttp click python-snappy coincurve rlp trio varint pyjwt pyyaml && \
     rm /tmp/*.whl
 
 EXPOSE 9000/udp
 EXPOSE 5052/tcp
+EXPOSE 8008/tcp
 
 ENTRYPOINT ["consensoor"]
 CMD ["run", "--help"]

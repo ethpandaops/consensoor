@@ -93,18 +93,18 @@ def compute_fork_digest(
     return compute_fork_data_root(current_version, genesis_validators_root)[:4]
 
 
-def compute_time_at_slot(genesis_time: int, slot: int, seconds_per_slot: int) -> int:
+def compute_time_at_slot(genesis_time: int, slot: int, slot_duration_ms: int) -> int:
     """Return the Unix timestamp at the start of the given slot.
 
     Args:
         genesis_time: Genesis Unix timestamp
         slot: Slot number
-        seconds_per_slot: Seconds per slot from network config
+        slot_duration_ms: Slot duration in milliseconds from network config
 
     Returns:
         Unix timestamp at start of slot
     """
-    return genesis_time + slot * seconds_per_slot
+    return genesis_time + slot * (slot_duration_ms // 1000)
 
 
 def convert_builder_index_to_validator_index(builder_index: int) -> int:

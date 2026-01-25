@@ -86,7 +86,7 @@ def process_execution_payload_envelope(
 
     network_config = get_config()
     expected_timestamp = compute_time_at_slot(
-        int(state.genesis_time), int(state.slot), network_config.seconds_per_slot
+        int(state.genesis_time), int(state.slot), network_config.slot_duration_ms
     )
     assert int(payload.timestamp) == expected_timestamp
 

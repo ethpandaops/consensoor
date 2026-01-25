@@ -26,8 +26,27 @@ class NetworkConfig:
     preset_base: str = "mainnet"
     blob_schedule: list = field(default_factory=list)
 
-    seconds_per_slot: int = 12
+    slot_duration_ms: int = 12000
     seconds_per_eth1_block: int = 14
+
+    # Intra-slot timing (basis points = hundredths of a percent)
+    proposer_reorg_cutoff_bps: int = 1667  # ~17% of slot
+    attestation_due_bps: int = 3333  # ~33% of slot (1/3 mark)
+    aggregate_due_bps: int = 6667  # ~67% of slot (2/3 mark)
+    sync_message_due_bps: int = 3333
+    contribution_due_bps: int = 6667
+
+    # Gloas (ePBS) timing - different values for ePBS slots
+    attestation_due_bps_gloas: int = 2500  # 25% of slot
+    aggregate_due_bps_gloas: int = 5000  # 50% of slot
+    sync_message_due_bps_gloas: int = 2500
+    contribution_due_bps_gloas: int = 5000
+    payload_attestation_due_bps: int = 7500  # 75% of slot
+
+    # EIP-7805 timing
+    view_freeze_cutoff_bps: int = 7500
+    inclusion_list_submission_due_bps: int = 6667
+    proposer_inclusion_list_cutoff_bps: int = 9167
     min_validator_withdrawability_delay: int = 256
     shard_committee_period: int = 256
     eth1_follow_distance: int = 2048
@@ -105,7 +124,7 @@ class NetworkConfig:
         config = cls()
         config.config_name = "minimal"
         config.preset_base = "minimal"
-        config.seconds_per_slot = 6
+        config.slot_duration_ms = 6000
         config.min_genesis_active_validator_count = 64
         config.genesis_delay = 300
         config.min_validator_withdrawability_delay = 256
@@ -120,6 +139,12 @@ class NetworkConfig:
         config.electra_fork_version = bytes.fromhex("05000001")
         config.fulu_fork_version = bytes.fromhex("06000001")
         config.gloas_fork_version = bytes.fromhex("07000001")
+        # Timing values (same as mainnet by default, loaded from config)
+        config.attestation_due_bps = 3333
+        config.aggregate_due_bps = 6667
+        config.attestation_due_bps_gloas = 2500
+        config.aggregate_due_bps_gloas = 5000
+        config.payload_attestation_due_bps = 7500
         return config
 
     @classmethod
@@ -198,6 +223,44 @@ class NetworkConfig:
             if fork_epoch == epoch:
                 return (fork_epoch, fork_version, fork_name)
         return None
+
+    def is_gloas_active(self, epoch: int) -> bool:
+        """Check if Gloas (ePBS) fork is active at the given epoch."""
+        return epoch >= self.gloas_fork_epoch
+
+    def get_attestation_due_offset(self, epoch: int) -> float:
+        """Get attestation due time offset in seconds for the given epoch.
+
+        Returns the time offset from slot start when attestations should be produced.
+        Uses Gloas timing if ePBS is active.
+        """
+        slot_duration = self.slot_duration_ms / 1000.0
+        if self.is_gloas_active(epoch):
+            bps = self.attestation_due_bps_gloas
+        else:
+            bps = self.attestation_due_bps
+        return slot_duration * (bps / 10000.0)
+
+    def get_aggregate_due_offset(self, epoch: int) -> float:
+        """Get aggregate due time offset in seconds for the given epoch.
+
+        Returns the time offset from slot start when aggregates should be published.
+        Uses Gloas timing if ePBS is active.
+        """
+        slot_duration = self.slot_duration_ms / 1000.0
+        if self.is_gloas_active(epoch):
+            bps = self.aggregate_due_bps_gloas
+        else:
+            bps = self.aggregate_due_bps
+        return slot_duration * (bps / 10000.0)
+
+    def get_payload_attestation_due_offset(self) -> float:
+        """Get payload attestation (PTC) due time offset in seconds.
+
+        Only applicable in Gloas (ePBS) for Payload Timeliness Committee attestations.
+        """
+        slot_duration = self.slot_duration_ms / 1000.0
+        return slot_duration * (self.payload_attestation_due_bps / 10000.0)
 
 
 _config: NetworkConfig | None = None

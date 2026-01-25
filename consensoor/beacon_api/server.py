@@ -467,7 +467,7 @@ class BeaconAPI:
         block_id = request.match_info["block_id"]
         root, signed_block = self._resolve_block_id(block_id)
 
-        if root is None:
+        if root is None or signed_block is None:
             if block_id == "head" and self.node.state and self.node.head_root:
                 header = self.node.state.latest_block_header
                 return web.json_response({
