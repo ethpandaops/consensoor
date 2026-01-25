@@ -189,6 +189,7 @@ def run(
     logger.info("Starting consensoor")
     logger.info(f"  Preset: {preset}")
     logger.info(f"  Supernode: {supernode}")
+    logger.info(f"  Data dir: {data_dir}")
     logger.info(f"  Engine API: {engine_api_url}")
     logger.info(f"  P2P: {p2p_host}:{p2p_port}")
     logger.info(f"  Beacon API: port {beacon_api_port}")

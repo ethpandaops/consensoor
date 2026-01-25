@@ -22,7 +22,6 @@ wheels/
 .venv
 env/
 venv/
-.git/
 .gitignore
 .idea/
 .vscode/
