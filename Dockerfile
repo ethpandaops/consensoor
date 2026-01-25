@@ -24,8 +24,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-RUN useradd -m -u 1000 consensoor
-
 # Install py-libp2p from local directory (with debug logging)
 # Copy from ../py-libp2p-upstream before building:
 #   cp -r ../py-libp2p-upstream ./py-libp2p-local
@@ -45,8 +43,6 @@ COPY --from=builder /app/dist/*.whl /tmp/
 RUN pip install --no-cache-dir --no-deps /tmp/*.whl && \
     pip install --no-cache-dir "remerkleable>=0.1.28" "py_ecc>=7.0.0" pycryptodome aiohttp click python-snappy coincurve rlp trio varint pyjwt pyyaml && \
     rm /tmp/*.whl
-
-USER consensoor
 
 EXPOSE 9000/udp
 EXPOSE 5052/tcp
