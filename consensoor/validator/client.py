@@ -3,7 +3,7 @@
 import logging
 from typing import Optional
 
-from ..spec.constants import SLOTS_PER_EPOCH, DOMAIN_BEACON_ATTESTER
+from ..spec.constants import SLOTS_PER_EPOCH, DOMAIN_BEACON_ATTESTER, DOMAIN_SYNC_COMMITTEE
 from ..spec.state_transition.helpers.beacon_committee import (
     get_beacon_committee,
     get_committee_count_per_slot,
@@ -17,6 +17,7 @@ from ..spec.state_transition.helpers.domain import get_domain, compute_signing_r
 from ..spec.types import AttestationData
 from ..spec.types.phase0 import Phase0Attestation
 from ..spec.types.electra import Attestation as ElectraAttestation
+from ..spec.types.altair import SyncCommitteeMessage
 from ..spec.types.base import Checkpoint, Bitlist, Bitvector
 from ..spec.constants import MAX_VALIDATORS_PER_COMMITTEE, MAX_COMMITTEES_PER_SLOT
 
@@ -285,6 +286,62 @@ class ValidatorClient:
             traceback.print_exc()
             return None
 
-    async def produce_sync_committee_message(self, state, slot: int) -> object:
-        """Produce a sync committee message."""
-        pass
+    async def produce_sync_committee_message(
+        self, state, slot: int, validator_key: ValidatorKey
+    ) -> Optional[SyncCommitteeMessage]:
+        """Produce a sync committee message for a validator.
+
+        Sync committee members sign the block root from the previous slot
+        at the start of each slot.
+
+        Args:
+            state: Beacon state
+            slot: Current slot
+            validator_key: The validator's key
+
+        Returns:
+            SyncCommitteeMessage or None if production fails
+        """
+        try:
+            if validator_key.validator_index is None:
+                logger.warning("Cannot produce sync committee message: no validator index")
+                return None
+
+            previous_slot = max(0, slot - 1)
+            state_slot = int(state.slot)
+            from ..spec.constants import SLOTS_PER_HISTORICAL_ROOT
+
+            if previous_slot < state_slot:
+                beacon_block_root = get_block_root_at_slot(state, previous_slot)
+            else:
+                block_root_entry = bytes(state.block_roots[previous_slot % SLOTS_PER_HISTORICAL_ROOT()])
+                if block_root_entry == b'\x00' * 32:
+                    beacon_block_root = hash_tree_root(state.latest_block_header)
+                else:
+                    beacon_block_root = block_root_entry
+
+            epoch = slot // SLOTS_PER_EPOCH()
+            domain = get_domain(state, DOMAIN_SYNC_COMMITTEE, epoch)
+            signing_root = compute_signing_root(beacon_block_root, domain)
+            signature = bls_sign(validator_key.privkey, signing_root)
+
+            message = SyncCommitteeMessage(
+                slot=slot,
+                beacon_block_root=beacon_block_root,
+                validator_index=validator_key.validator_index,
+                signature=signature,
+            )
+
+            logger.debug(
+                f"Produced sync committee message: slot={slot}, "
+                f"validator={validator_key.validator_index}, "
+                f"block_root={bytes(beacon_block_root).hex()[:16]}"
+            )
+
+            return message
+
+        except Exception as e:
+            logger.error(f"Failed to produce sync committee message: {e}")
+            import traceback
+            traceback.print_exc()
+            return None

@@ -383,10 +383,14 @@ class BlockBuilder:
 
     def _build_block_body(self, state, randao_reveal: BLSSignature, execution_payload, fork: str, attestations=None):
         """Build the beacon block body for the appropriate fork."""
-        sync_committee_size = SYNC_COMMITTEE_SIZE()
-        empty_sync_aggregate = SyncAggregate(
-            sync_committee_bits=Bitvector[sync_committee_size](),
-            sync_committee_signature=BLSSignature(b"\xc0" + b"\x00" * 95),
+        current_slot = int(state.slot)
+        # SyncAggregate contains messages from the previous slot (which signed the slot before that)
+        sync_aggregate_slot = max(0, current_slot - 1)
+        sync_aggregate = self.node.sync_committee_pool.get_sync_aggregate(sync_aggregate_slot)
+        participant_count = sum(1 for b in sync_aggregate.sync_committee_bits if b)
+        logger.info(
+            f"Sync aggregate for slot {current_slot} (using messages from slot {sync_aggregate_slot}): "
+            f"{participant_count}/{SYNC_COMMITTEE_SIZE()} participants"
         )
 
         if attestations:
@@ -403,7 +407,7 @@ class BlockBuilder:
             "attestations": attestations or [],
             "deposits": [],
             "voluntary_exits": [],
-            "sync_aggregate": empty_sync_aggregate,
+            "sync_aggregate": sync_aggregate,
             "execution_payload": execution_payload,
         }
 

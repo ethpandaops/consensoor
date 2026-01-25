@@ -242,8 +242,15 @@ class BeaconAPI:
                 status = "active_ongoing"
 
             # Filter by status if specified
-            if status_param and status not in status_param:
-                continue
+            # Supports both exact status (e.g. "active_ongoing") and prefix (e.g. "active")
+            if status_param:
+                match = False
+                for sp in status_param:
+                    if status == sp or status.startswith(sp + "_"):
+                        match = True
+                        break
+                if not match:
+                    continue
 
             validators_data.append({
                 "index": str(i),

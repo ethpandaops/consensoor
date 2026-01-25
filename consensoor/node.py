@@ -54,6 +54,7 @@ from .crypto import hash_tree_root, sign, compute_signing_root
 from .validator import ValidatorClient, load_keystores_teku_style
 from .builder import BlockBuilder
 from .attestation_pool import AttestationPool
+from .sync_committee_pool import SyncCommitteePool
 from . import metrics
 
 logger = logging.getLogger(__name__)
@@ -167,7 +168,9 @@ class BeaconNode:
         self.block_builder: Optional[BlockBuilder] = None
         self.beacon_gossip: Optional[BeaconGossip] = None
         self.attestation_pool = AttestationPool()
+        self.sync_committee_pool = SyncCommitteePool()
         self._attester_duties: dict[int, list] = {}  # epoch -> duties
+        self._sync_committee_duties: dict[int, list] = {}  # validator_index -> committee positions
 
         self._running = False
         self._genesis_time: int = 0
@@ -424,6 +427,7 @@ class BeaconNode:
 
             self.beacon_gossip.subscribe_blocks(self._on_p2p_block)
             self.beacon_gossip.subscribe_aggregates(self._on_p2p_aggregate)
+            self.beacon_gossip.subscribe_sync_committee_contributions(self._on_p2p_sync_committee_contribution)
 
             await self.beacon_gossip.start()
             await self.beacon_gossip.activate_subscriptions()
@@ -721,11 +725,18 @@ class BeaconNode:
             logger.info(f"New epoch: {epoch}")
             # Prune old attestations from pool
             self.attestation_pool.prune(slot)
+            # Prune old sync committee messages
+            self.sync_committee_pool.prune(slot)
             # Update fork_digest for publishing if we've crossed a fork boundary
             await self._update_fork_digest_for_epoch(epoch)
+            # Recompute sync committee duties at epoch boundary
+            await self._compute_sync_committee_duties()
 
         # Compute attester duties for current epoch if not cached
         await self._ensure_attester_duties(epoch)
+
+        # Produce sync committee messages at slot start (Altair+)
+        await self._produce_sync_committee_messages(slot)
 
         # Check if we should propose a block FIRST (uses payload_id from previous slot's forkchoice)
         await self._maybe_propose_block(slot)
@@ -937,6 +948,187 @@ class BeaconNode:
         if not self.state:
             return False
         return hasattr(self.state, "pending_deposits")
+
+    async def _compute_sync_committee_duties(self) -> None:
+        """Compute which of our validators are in the current sync committee.
+
+        Called at epoch boundaries to refresh sync committee membership.
+        """
+        if not self.state or not self.validator_client:
+            return
+
+        if not hasattr(self.state, "current_sync_committee"):
+            return
+
+        self._sync_committee_duties.clear()
+
+        committee_pubkeys = list(self.state.current_sync_committee.pubkeys)
+
+        for position, pubkey in enumerate(committee_pubkeys):
+            pubkey_bytes = bytes(pubkey)
+            if self.validator_client.has_key(pubkey_bytes):
+                validator_index = self.validator_client.get_validator_index(pubkey_bytes)
+                if validator_index is not None:
+                    if validator_index not in self._sync_committee_duties:
+                        self._sync_committee_duties[validator_index] = []
+                    self._sync_committee_duties[validator_index].append(position)
+
+        if self._sync_committee_duties:
+            logger.info(
+                f"Sync committee duties: {len(self._sync_committee_duties)} validators, "
+                f"positions: {sum(len(p) for p in self._sync_committee_duties.values())}"
+            )
+
+    async def _produce_sync_committee_messages(self, slot: int) -> None:
+        """Produce sync committee messages for validators in the current sync committee.
+
+        Called at the start of each slot. Sync committee members sign the
+        previous slot's block root.
+
+        Args:
+            slot: Current slot
+        """
+        if not self.state or not self.validator_client:
+            return
+
+        if not hasattr(self.state, "current_sync_committee"):
+            return
+
+        if not self._sync_committee_duties:
+            await self._compute_sync_committee_duties()
+
+        if not self._sync_committee_duties:
+            return
+
+        state_for_signing = self.state
+        if int(self.state.slot) < slot:
+            state_for_signing = process_slots(
+                self.state.__class__.decode_bytes(bytes(self.state.encode_bytes())),
+                slot
+            )
+
+        for validator_index, positions in self._sync_committee_duties.items():
+            for pubkey, key in self.validator_client.keys.items():
+                if key.validator_index == validator_index:
+                    message = await self.validator_client.produce_sync_committee_message(
+                        state_for_signing, slot, key
+                    )
+                    if message:
+                        for position in positions:
+                            self.sync_committee_pool.add(message, position)
+                    break
+
+        logger.debug(
+            f"Produced sync committee messages: slot={slot}, "
+            f"pool_size={self.sync_committee_pool.size}"
+        )
+
+        await self._broadcast_sync_committee_contributions(slot, state_for_signing)
+
+    async def _broadcast_sync_committee_contributions(self, slot: int, state) -> None:
+        """Broadcast sync committee contributions for each subcommittee."""
+        if not self.beacon_gossip or not self.validator_client:
+            return
+
+        from .spec.constants import SYNC_COMMITTEE_SIZE, SYNC_COMMITTEE_SUBNET_COUNT, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_CONTRIBUTION_AND_PROOF
+        from .spec.types.altair import (
+            SyncCommitteeContribution, ContributionAndProof, SignedContributionAndProof,
+            SyncAggregatorSelectionData,
+        )
+        from .spec.types.base import Bitvector, BLSSignature, uint64
+        from .spec.state_transition.helpers.domain import get_domain, compute_signing_root
+        from .crypto import sign as bls_sign
+
+        sync_committee_size = SYNC_COMMITTEE_SIZE()
+        subcommittee_size = sync_committee_size // SYNC_COMMITTEE_SUBNET_COUNT
+        messages = self.sync_committee_pool._messages.get(slot, {})
+
+        if not messages:
+            return
+
+        for subcommittee_index in range(SYNC_COMMITTEE_SUBNET_COUNT):
+            base_position = subcommittee_index * subcommittee_size
+
+            subcommittee_messages = []
+            aggregator_key = None
+
+            for position, pooled in messages.items():
+                if base_position <= position < base_position + subcommittee_size:
+                    subcommittee_messages.append((position - base_position, pooled))
+                    if aggregator_key is None:
+                        for pubkey, key in self.validator_client.keys.items():
+                            if key.validator_index == pooled.message.validator_index:
+                                aggregator_key = key
+                                break
+
+            if not subcommittee_messages or not aggregator_key:
+                continue
+
+            agg_bits = Bitvector[subcommittee_size]()
+            signatures = []
+            beacon_block_root = None
+
+            for bit_pos, pooled in subcommittee_messages:
+                agg_bits[bit_pos] = True
+                signatures.append(bytes(pooled.message.signature))
+                if beacon_block_root is None:
+                    beacon_block_root = pooled.message.beacon_block_root
+
+            if not signatures:
+                continue
+
+            try:
+                from .crypto import aggregate_signatures
+                if len(signatures) == 1:
+                    aggregated_sig = signatures[0]
+                else:
+                    aggregated_sig = aggregate_signatures(signatures)
+            except Exception as e:
+                logger.warning(f"Failed to aggregate subcommittee {subcommittee_index}: {e}")
+                continue
+
+            contribution = SyncCommitteeContribution(
+                slot=slot,
+                beacon_block_root=beacon_block_root,
+                subcommittee_index=uint64(subcommittee_index),
+                aggregation_bits=agg_bits,
+                signature=BLSSignature(aggregated_sig),
+            )
+
+            epoch = slot // SLOTS_PER_EPOCH()
+            selection_data = SyncAggregatorSelectionData(
+                slot=slot,
+                subcommittee_index=uint64(subcommittee_index),
+            )
+            selection_domain = get_domain(state, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, epoch)
+            selection_root = compute_signing_root(selection_data, selection_domain)
+            selection_proof = bls_sign(aggregator_key.privkey, selection_root)
+
+            contribution_and_proof = ContributionAndProof(
+                aggregator_index=aggregator_key.validator_index,
+                contribution=contribution,
+                selection_proof=BLSSignature(selection_proof),
+            )
+
+            contrib_domain = get_domain(state, DOMAIN_CONTRIBUTION_AND_PROOF, epoch)
+            contrib_root = compute_signing_root(contribution_and_proof, contrib_domain)
+            contrib_signature = bls_sign(aggregator_key.privkey, contrib_root)
+
+            signed_contribution = SignedContributionAndProof(
+                message=contribution_and_proof,
+                signature=BLSSignature(contrib_signature),
+            )
+
+            try:
+                await self.beacon_gossip.publish_sync_committee_contribution(
+                    bytes(signed_contribution.encode_bytes())
+                )
+                logger.debug(
+                    f"Broadcast sync committee contribution: slot={slot}, "
+                    f"subcommittee={subcommittee_index}, bits={len(signatures)}"
+                )
+            except Exception as e:
+                logger.warning(f"Failed to broadcast contribution: {e}")
 
     async def _broadcast_attestation_as_aggregate(
         self, attestation, validator_index: int, pubkey: bytes
@@ -1348,6 +1540,27 @@ class BeaconNode:
             )
         except Exception as e:
             logger.error(f"Error processing P2P aggregate: {e}")
+
+    async def _on_p2p_sync_committee_contribution(self, data: bytes, from_peer: str) -> None:
+        """Handle a sync committee contribution received via libp2p gossipsub."""
+        try:
+            from .spec.types.altair import SignedContributionAndProof
+
+            signed_contribution = SignedContributionAndProof.decode_bytes(data)
+            contribution = signed_contribution.message.contribution
+            slot = int(contribution.slot)
+            subcommittee_index = int(contribution.subcommittee_index)
+
+            self.sync_committee_pool.add_contribution(contribution)
+
+            participant_count = sum(1 for b in contribution.aggregation_bits if b)
+            logger.info(
+                f"P2P: Received sync committee contribution slot={slot}, "
+                f"subcommittee={subcommittee_index}, participants={participant_count}, "
+                f"from={from_peer[:16]}"
+            )
+        except Exception as e:
+            logger.error(f"Error processing P2P sync committee contribution: {e}")
 
     async def _apply_block_to_state(self, block, block_root: bytes, signed_block=None) -> None:
         """Apply a received block to the local state using full state transition.

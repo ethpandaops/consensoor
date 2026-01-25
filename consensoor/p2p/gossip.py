@@ -21,6 +21,7 @@ from .encoding import (
     PROPOSER_SLASHING_TOPIC,
     ATTESTER_SLASHING_TOPIC,
     BLS_TO_EXECUTION_CHANGE_TOPIC,
+    SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_TOPIC,
 )
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,10 @@ class BeaconGossip:
         """Subscribe to attester slashing messages."""
         self._handlers[ATTESTER_SLASHING_TOPIC] = handler
 
+    def subscribe_sync_committee_contributions(self, handler: MessageHandler) -> None:
+        """Subscribe to sync committee contribution and proof messages."""
+        self._handlers[SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_TOPIC] = handler
+
     async def activate_subscriptions(self) -> None:
         """Activate all registered subscriptions on the P2P host.
 
@@ -180,6 +185,13 @@ class BeaconGossip:
         topic = get_topic_name(BEACON_AGGREGATE_AND_PROOF_TOPIC, self.fork_digest)
         encoded = encode_message(aggregate_ssz)
         await self._host.publish(topic, encoded)
+
+    async def publish_sync_committee_contribution(self, contribution_ssz: bytes) -> None:
+        """Publish a sync committee contribution and proof."""
+        topic = get_topic_name(SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_TOPIC, self.fork_digest)
+        encoded = encode_message(contribution_ssz)
+        await self._host.publish(topic, encoded)
+        logger.debug(f"Published sync committee contribution: {len(contribution_ssz)} bytes")
 
     @property
     def peer_id(self) -> Optional[str]:
