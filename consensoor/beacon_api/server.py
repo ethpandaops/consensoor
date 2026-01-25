@@ -9,6 +9,7 @@ from aiohttp import web
 from .utils import get_local_ip, generate_peer_id
 from .spec import build_spec_response
 from ..spec.network_config import get_config as get_network_config
+from ..version import get_cl_version, get_cl_commit, CL_CLIENT_NAME
 
 logger = logging.getLogger(__name__)
 
@@ -75,9 +76,15 @@ class BeaconAPI:
 
     async def get_version(self, request: web.Request) -> web.Response:
         """GET /eth/v1/node/version"""
+        version = get_cl_version()
+        commit = get_cl_commit()
+        if commit:
+            version_str = f"{CL_CLIENT_NAME}/v{version}/{commit[:8]}"
+        else:
+            version_str = f"{CL_CLIENT_NAME}/v{version}"
         return web.json_response({
             "data": {
-                "version": "consensoor/v0.1.0"
+                "version": version_str
             }
         })
 
@@ -411,9 +418,12 @@ class BeaconAPI:
 
         try:
             slot = int(block_id)
-            for root, block in self.node.store.blocks.items():
-                if hasattr(block, "message") and int(block.message.slot) == slot:
-                    return root, block
+            block = self.node.store.get_block_by_slot(slot)
+            if block:
+                from ..crypto import hash_tree_root
+                msg = block.message if hasattr(block, "message") else block
+                root = hash_tree_root(msg)
+                return root, block
             return None, None
         except ValueError:
             return None, None
@@ -428,11 +438,21 @@ class BeaconAPI:
             return "phase0"
 
         body = block.body
+
+        # For post-Electra blocks, check slot against fork epochs
+        if hasattr(body, "execution_requests"):
+            from ..spec.network_config import get_config
+            from ..spec.constants import SLOTS_PER_EPOCH
+            config = get_config()
+            slot = int(block.slot)
+            epoch = slot // SLOTS_PER_EPOCH()
+            if hasattr(config, 'fulu_fork_epoch') and epoch >= config.fulu_fork_epoch:
+                return "fulu"
+            return "electra"
+
         if hasattr(body, "signed_execution_payload_header"):
-            return "fulu"
+            return "gloas"
         if hasattr(body, "blob_kzg_commitments"):
-            if hasattr(body, "execution_requests"):
-                return "electra"
             return "deneb"
         if hasattr(body, "execution_payload"):
             if hasattr(body.execution_payload, "withdrawals"):

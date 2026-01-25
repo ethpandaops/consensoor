@@ -105,20 +105,38 @@ class Store:
     def _detect_fork(self, obj: Any) -> str:
         """Detect the fork type of a state or block."""
         type_name = type(obj).__name__
-        if "Fulu" in type_name or "Gloas" in type_name:
+
+        # For Fulu state types
+        if "Fulu" in type_name:
             return "fulu"
-        elif "Electra" in type_name:
+        if "Gloas" in type_name:
+            return "gloas"
+
+        # For blocks, check slot against fork epochs since Electra/Fulu share block types
+        if "Electra" in type_name:
+            msg = obj.message if hasattr(obj, "message") else obj
+            if hasattr(msg, "slot"):
+                from ..spec.network_config import get_config
+                from ..spec.constants import SLOTS_PER_EPOCH
+                try:
+                    config = get_config()
+                    slot = int(msg.slot)
+                    epoch = slot // SLOTS_PER_EPOCH()
+                    if hasattr(config, 'fulu_fork_epoch') and epoch >= config.fulu_fork_epoch:
+                        return "fulu"
+                except Exception:
+                    pass
             return "electra"
-        elif "Deneb" in type_name:
+
+        if "Deneb" in type_name:
             return "deneb"
-        elif "Capella" in type_name:
+        if "Capella" in type_name:
             return "capella"
-        elif "Bellatrix" in type_name:
+        if "Bellatrix" in type_name:
             return "bellatrix"
-        elif "Altair" in type_name:
+        if "Altair" in type_name:
             return "altair"
-        else:
-            return "phase0"
+        return "phase0"
 
     def _get_state_types(self):
         """Get all beacon state types for deserialization."""
