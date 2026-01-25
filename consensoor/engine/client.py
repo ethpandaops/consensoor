@@ -23,6 +23,8 @@ def get_fork_for_timestamp(timestamp: int) -> str:
     from ..spec.network_config import get_config
     config = get_config()
 
+    if hasattr(config, 'gloas_fork_epoch') and timestamp >= _epoch_to_timestamp(config.gloas_fork_epoch, config):
+        return "gloas"
     if hasattr(config, 'fulu_fork_epoch') and timestamp >= _epoch_to_timestamp(config.fulu_fork_epoch, config):
         return "fulu"
     if hasattr(config, 'electra_fork_epoch') and timestamp >= _epoch_to_timestamp(config.electra_fork_epoch, config):
@@ -119,6 +121,8 @@ class EngineAPIClient:
                 return 2**63
             return genesis_time + epoch * SLOTS_PER_EPOCH() * config.seconds_per_slot
 
+        if hasattr(config, 'gloas_fork_epoch') and timestamp >= epoch_start_time(config.gloas_fork_epoch):
+            return "gloas"
         if hasattr(config, 'fulu_fork_epoch') and timestamp >= epoch_start_time(config.fulu_fork_epoch):
             return "fulu"
         if hasattr(config, 'electra_fork_epoch') and timestamp >= epoch_start_time(config.electra_fork_epoch):
@@ -245,15 +249,28 @@ class EngineAPIClient:
         fork = self._get_fork_for_timestamp(timestamp)
         logger.debug(f"forkchoice_updated: timestamp={timestamp}, fork={fork}")
 
-        if fork in ("fulu", "electra", "deneb"):
+        if fork in ("gloas", "fulu", "electra", "deneb"):
             return await self.forkchoice_updated_v3(forkchoice_state, payload_attributes)
         elif fork == "capella":
             return await self.forkchoice_updated_v2(forkchoice_state, payload_attributes)
         else:
             return await self.forkchoice_updated_v1(forkchoice_state, payload_attributes)
 
+    async def get_payload_v6(self, payload_id: bytes) -> GetPayloadResponse:
+        """Get an execution payload by ID (Amsterdam/Gloas)."""
+        result = await self._call("engine_getPayloadV6", ["0x" + payload_id.hex()])
+        exec_payload = result.get('executionPayload', {})
+        exec_requests = result.get('executionRequests')
+        logger.debug(
+            f"getPayloadV6 raw response: executionRequests={exec_requests}, "
+            f"blockHash={exec_payload.get('blockHash')}, "
+            f"timestamp={exec_payload.get('timestamp')}, "
+            f"stateRoot={exec_payload.get('stateRoot')}"
+        )
+        return GetPayloadResponse.from_dict(result)
+
     async def get_payload_v5(self, payload_id: bytes) -> GetPayloadResponse:
-        """Get an execution payload by ID (Osaka/Fulu and beyond)."""
+        """Get an execution payload by ID (Osaka/Fulu)."""
         result = await self._call("engine_getPayloadV5", ["0x" + payload_id.hex()])
         exec_payload = result.get('executionPayload', {})
         exec_requests = result.get('executionRequests')
@@ -297,7 +314,9 @@ class EngineAPIClient:
         fork = self._get_fork_for_timestamp(timestamp)
         logger.info(f"get_payload: timestamp={timestamp}, fork={fork}, payload_id={payload_id.hex()}")
 
-        if fork == "fulu":
+        if fork == "gloas":
+            return await self.get_payload_v6(payload_id)
+        elif fork == "fulu":
             return await self.get_payload_v5(payload_id)
         elif fork == "electra":
             return await self.get_payload_v4(payload_id)
@@ -365,9 +384,9 @@ class EngineAPIClient:
         fork = self._get_fork_for_timestamp(timestamp)
         logger.debug(f"new_payload: timestamp={timestamp}, fork={fork}")
 
-        if fork == "fulu":
-            return await self.new_payload_v4(execution_payload, versioned_hashes or [], parent_beacon_block_root or b"\x00" * 32, execution_requests or [])
-        elif fork == "electra":
+        if fork == "gloas":
+            return await self.new_payload_v5(execution_payload, versioned_hashes or [], parent_beacon_block_root or b"\x00" * 32, execution_requests or [])
+        elif fork in ("fulu", "electra"):
             return await self.new_payload_v4(execution_payload, versioned_hashes or [], parent_beacon_block_root or b"\x00" * 32, execution_requests or [])
         elif fork == "deneb":
             return await self.new_payload_v3(execution_payload, versioned_hashes or [], parent_beacon_block_root or b"\x00" * 32)
@@ -379,6 +398,7 @@ class EngineAPIClient:
     async def exchange_capabilities(self) -> list[str]:
         """Exchange capabilities with the execution layer."""
         capabilities = [
+            "engine_newPayloadV5",
             "engine_newPayloadV4",
             "engine_newPayloadV3",
             "engine_newPayloadV2",
@@ -386,6 +406,8 @@ class EngineAPIClient:
             "engine_forkchoiceUpdatedV3",
             "engine_forkchoiceUpdatedV2",
             "engine_forkchoiceUpdatedV1",
+            "engine_getPayloadV6",
+            "engine_getPayloadV5",
             "engine_getPayloadV4",
             "engine_getPayloadV3",
             "engine_getPayloadV2",
