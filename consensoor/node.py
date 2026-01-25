@@ -324,6 +324,14 @@ class BeaconNode:
         except Exception as e:
             logger.error(f"Failed to connect to Engine API: {e}")
 
+        try:
+            el_info = await self.engine.get_client_version()
+            if el_info:
+                self.config.set_el_client_info(el_info)
+                logger.info(f"EL client: {el_info.get('name', 'unknown')} commit={el_info.get('commit', 'unknown')}")
+        except Exception as e:
+            logger.debug(f"Could not get EL client version: {e}")
+
     async def _setup_beacon_sync(self) -> None:
         """Set up beacon sync from upstream beacon node if configured."""
         if not self.config.checkpoint_sync_url:
@@ -379,6 +387,10 @@ class BeaconNode:
                         logger.info(f"Using fork_digest from bootnode ENR: {extracted.hex()}")
                         break
 
+            # Compute all fork digests for multi-fork subscription
+            all_fork_digests = self._get_all_fork_digests(net_config, genesis_validators_root)
+            logger.info(f"All fork digests for subscription: {[d.hex() for d in all_fork_digests]}")
+
             self.beacon_gossip = BeaconGossip(
                 fork_version=fork_version,
                 genesis_validators_root=genesis_validators_root,
@@ -388,6 +400,7 @@ class BeaconNode:
                 next_fork_epoch=next_fork_epoch,
                 fork_digest_override=fork_digest_override,
                 supernode=self.config.supernode,
+                all_fork_digests=all_fork_digests,
             )
 
             self.beacon_gossip.subscribe_blocks(self._on_p2p_block)
@@ -432,6 +445,71 @@ class BeaconNode:
 
         current_version = net_config.get_fork_version(current_epoch)
         return current_version, FAR_FUTURE_EPOCH
+
+    def _get_all_fork_digests(self, net_config, genesis_validators_root: bytes) -> list[bytes]:
+        """Get fork digests for all scheduled forks.
+
+        Returns a list of fork_digests from genesis through future forks.
+        This allows subscribing to gossipsub topics for all forks to handle
+        fork transitions correctly.
+        """
+        from .p2p.encoding import compute_fork_digest
+
+        FAR_FUTURE_EPOCH = 2**64 - 1
+        digests = []
+
+        forks = [
+            (net_config.genesis_fork_version, "genesis"),
+            (net_config.altair_fork_version, "altair"),
+            (net_config.bellatrix_fork_version, "bellatrix"),
+            (net_config.capella_fork_version, "capella"),
+            (net_config.deneb_fork_version, "deneb"),
+            (net_config.electra_fork_version, "electra"),
+            (net_config.fulu_fork_version, "fulu"),
+        ]
+
+        fork_epochs = [
+            0,  # genesis
+            net_config.altair_fork_epoch,
+            net_config.bellatrix_fork_epoch,
+            net_config.capella_fork_epoch,
+            net_config.deneb_fork_epoch,
+            net_config.electra_fork_epoch,
+            net_config.fulu_fork_epoch,
+        ]
+
+        for i, (fork_version, fork_name) in enumerate(forks):
+            fork_epoch = fork_epochs[i]
+            if fork_epoch < FAR_FUTURE_EPOCH:
+                digest = compute_fork_digest(fork_version, genesis_validators_root)
+                digests.append(digest)
+                logger.debug(f"Fork digest for {fork_name}: {digest.hex()}")
+
+        return digests
+
+    async def _update_fork_digest_for_epoch(self, epoch: int) -> None:
+        """Update the fork_digest for publishing when crossing fork boundaries.
+
+        Call this at the start of each epoch to ensure messages are published
+        to the correct gossipsub topic.
+        """
+        if not self.beacon_gossip or not self.state:
+            return
+
+        try:
+            from .spec.network_config import get_config as get_network_config
+            from .p2p.encoding import compute_fork_digest
+
+            net_config = get_network_config()
+            genesis_validators_root = bytes(self.state.genesis_validators_root)
+
+            # Get the fork version for this epoch
+            fork_version = net_config.get_fork_version(epoch)
+            new_digest = compute_fork_digest(fork_version, genesis_validators_root)
+
+            self.beacon_gossip.update_fork_digest(new_digest)
+        except Exception as e:
+            logger.error(f"Failed to update fork_digest for epoch {epoch}: {e}")
 
     async def _setup_beacon_api(self) -> None:
         """Set up Beacon API server."""
@@ -575,6 +653,8 @@ class BeaconNode:
             logger.info(f"New epoch: {epoch}")
             # Prune old attestations from pool
             self.attestation_pool.prune(slot)
+            # Update fork_digest for publishing if we've crossed a fork boundary
+            await self._update_fork_digest_for_epoch(epoch)
 
         # Compute attester duties for current epoch if not cached
         await self._ensure_attester_duties(epoch)
@@ -863,10 +943,15 @@ class BeaconNode:
             execution_payload_dict = payload_response.execution_payload
             block_hash = execution_payload_dict.get("blockHash", "unknown")
             block_number = execution_payload_dict.get("blockNumber", "unknown")
+            exec_requests = payload_response.execution_requests
             logger.info(
                 f"Got execution payload: block_hash={block_hash[:18]}, "
-                f"block_number={block_number}, value={payload_response.block_value}"
+                f"block_number={block_number}, value={payload_response.block_value}, "
+                f"execution_requests_count={len(exec_requests) if exec_requests else 0}"
             )
+
+            # Extract execution_requests from payload response (Electra/Fulu)
+            el_execution_requests = payload_response.execution_requests or []
 
             signed_block = await self.block_builder.build_block(
                 slot, proposer_key, execution_payload_dict
@@ -881,13 +966,26 @@ class BeaconNode:
 
             versioned_hashes = []
             parent_beacon_root = bytes(block.parent_root)
-            execution_requests = []
+
+            # Log the SSZ payload's blockHash to verify it matches the original
+            ssz_block_hash = bytes(execution_payload.block_hash).hex()
+            ssz_timestamp = int(execution_payload.timestamp)
+            original_timestamp = int(execution_payload_dict.get("timestamp", "0x0"), 16)
+            logger.info(
+                f"Payload round-trip check: "
+                f"original_blockHash={block_hash}, "
+                f"ssz_blockHash=0x{ssz_block_hash}, "
+                f"original_timestamp={original_timestamp}, "
+                f"ssz_timestamp={ssz_timestamp}, "
+                f"original_stateRoot={execution_payload_dict.get('stateRoot')}, "
+                f"ssz_stateRoot=0x{bytes(execution_payload.state_root).hex()}"
+            )
 
             status = await self.engine.new_payload(
                 execution_payload,
                 versioned_hashes,
                 parent_beacon_root,
-                execution_requests,
+                el_execution_requests,
                 timestamp=int(execution_payload.timestamp),
             )
 

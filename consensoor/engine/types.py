@@ -77,6 +77,7 @@ class GetPayloadResponse:
     block_value: int
     blobs_bundle: Optional[dict] = None
     should_override_builder: bool = False
+    execution_requests: Optional[list] = None  # Electra/Fulu: EIP-7685 requests
 
     @classmethod
     def from_dict(cls, data: dict) -> "GetPayloadResponse":
@@ -86,6 +87,7 @@ class GetPayloadResponse:
                 block_value=int(data.get("blockValue", "0x0"), 16),
                 blobs_bundle=data.get("blobsBundle"),
                 should_override_builder=data.get("shouldOverrideBuilder", False),
+                execution_requests=data.get("executionRequests"),
             )
         else:
             return cls(
@@ -93,6 +95,7 @@ class GetPayloadResponse:
                 block_value=0,
                 blobs_bundle=None,
                 should_override_builder=False,
+                execution_requests=None,
             )
 
 

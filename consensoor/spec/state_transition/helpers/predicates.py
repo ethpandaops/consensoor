@@ -164,16 +164,23 @@ def is_valid_indexed_attestation(
     Returns:
         True if indexed attestation is valid
     """
+    import logging
+    logger = logging.getLogger(__name__)
+
     indices = list(indexed_attestation.attesting_indices)
 
     # Verify indices are sorted and unique
     if len(indices) == 0:
+        logger.warning("IndexedAttestation validation failed: no indices")
         return False
     if indices != sorted(set(indices)):
+        logger.warning(f"IndexedAttestation validation failed: indices not sorted/unique: {indices[:10]}...")
         return False
 
     # Verify all indices are valid validator indices
     if any(i >= len(state.validators) for i in indices):
+        invalid = [i for i in indices if i >= len(state.validators)]
+        logger.warning(f"IndexedAttestation validation failed: invalid indices {invalid}, max={len(state.validators)}")
         return False
 
     # Verify aggregate signature
@@ -182,14 +189,41 @@ def is_valid_indexed_attestation(
     from .misc import compute_epoch_at_slot
 
     pubkeys = [bytes(state.validators[i].pubkey) for i in indices]
+    target_epoch = int(indexed_attestation.data.target.epoch)
     domain = get_domain(
         state,
         DOMAIN_BEACON_ATTESTER,
-        int(indexed_attestation.data.target.epoch),
+        target_epoch,
     )
+
+    # Debug: log domain computation details
+    fork_version = bytes(state.fork.current_version) if target_epoch >= int(state.fork.epoch) else bytes(state.fork.previous_version)
+    genesis_root = bytes(state.genesis_validators_root)
+    data_root = hash_tree_root(indexed_attestation.data)
+    logger.debug(
+        f"IndexedAttestation verify: target_epoch={target_epoch}, "
+        f"fork_epoch={state.fork.epoch}, fork_version={fork_version.hex()}, "
+        f"genesis_root={genesis_root.hex()[:16]}, domain={domain.hex()[:16]}, "
+        f"data_root={data_root.hex()[:16]}"
+    )
+
     signing_root = compute_signing_root(indexed_attestation.data, domain)
 
-    return bls_verify(pubkeys, signing_root, bytes(indexed_attestation.signature))
+    sig_valid = bls_verify(pubkeys, signing_root, bytes(indexed_attestation.signature))
+    if not sig_valid:
+        # Log detailed attestation data for debugging
+        att_data = indexed_attestation.data
+        logger.warning(
+            f"BLS FAILED: slot={att_data.slot}, index={att_data.index}, "
+            f"bbr={bytes(att_data.beacon_block_root).hex()[:16]}, "
+            f"src={att_data.source.epoch}/{bytes(att_data.source.root).hex()[:16]}, "
+            f"tgt={att_data.target.epoch}/{bytes(att_data.target.root).hex()[:16]}, "
+            f"state_slot={state.slot}, fork={state.fork.epoch}, fv={fork_version.hex()}, "
+            f"domain={domain.hex()[:16]}, signing_root={signing_root.hex()[:16]}, "
+            f"data_root={data_root.hex()[:16]}, indices={indices[:10]}, "
+            f"sig={bytes(indexed_attestation.signature).hex()[:32]}"
+        )
+    return sig_valid
 
 
 def is_valid_indexed_payload_attestation(

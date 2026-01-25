@@ -23,7 +23,7 @@ from ..spec.constants import MAX_VALIDATORS_PER_COMMITTEE, MAX_COMMITTEES_PER_SL
 Phase0AggregationBits = Bitlist[MAX_VALIDATORS_PER_COMMITTEE()]
 ElectraAggregationBits = Bitlist[MAX_VALIDATORS_PER_COMMITTEE() * MAX_COMMITTEES_PER_SLOT()]
 ElectraCommitteeBits = Bitvector[MAX_COMMITTEES_PER_SLOT()]
-from ..crypto import sign as bls_sign
+from ..crypto import sign as bls_sign, hash_tree_root
 from .types import ValidatorKey, ProposerDuty, AttesterDuty
 from .shuffling import get_beacon_proposer_index
 
@@ -210,6 +210,15 @@ class ValidatorClient:
                 return None
 
             domain = get_domain(state, DOMAIN_BEACON_ATTESTER, epoch)
+
+            # Debug: log domain computation details for signing
+            fork_version = bytes(state.fork.current_version) if epoch >= int(state.fork.epoch) else bytes(state.fork.previous_version)
+            genesis_root = bytes(state.genesis_validators_root)
+            logger.debug(
+                f"Attestation sign: epoch={epoch}, state_slot={state.slot}, "
+                f"fork_epoch={state.fork.epoch}, fork_version={fork_version.hex()}, "
+                f"genesis_root={genesis_root.hex()[:16]}, domain={domain.hex()[:16]}"
+            )
 
             if self._is_electra_fork(state):
                 # Electra+ attestations use committee_bits

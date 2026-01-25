@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 *$py.class
+consensoor/_version.py
 *.so
 .Python
 build/

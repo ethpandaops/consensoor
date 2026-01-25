@@ -2,8 +2,12 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir build
+RUN apt-get update && apt-get install -y --no-install-recommends git && \
+    rm -rf /var/lib/apt/lists/*
 
+RUN pip install --no-cache-dir build setuptools_scm
+
+COPY .git/ .git/
 COPY pyproject.toml .
 COPY consensoor/ consensoor/
 

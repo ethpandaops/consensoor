@@ -129,6 +129,32 @@ class EngineAPIClient:
             return "capella"
         return "bellatrix"
 
+    async def new_payload_v5(
+        self,
+        execution_payload,
+        versioned_hashes: list[bytes],
+        parent_beacon_block_root: bytes,
+        execution_requests: list,
+    ) -> PayloadStatus:
+        """Send a new payload to the execution layer (Engine API v5 - Osaka/Fulu)."""
+        payload_dict = self._payload_to_dict(execution_payload)
+
+        params = [
+            payload_dict,
+            ["0x" + h.hex() for h in versioned_hashes],
+            "0x" + parent_beacon_block_root.hex(),
+            execution_requests,
+        ]
+
+        logger.debug(
+            f"newPayloadV5: blockHash={payload_dict.get('blockHash')}, "
+            f"execution_requests={execution_requests}, "
+            f"parent_beacon_root={parent_beacon_block_root.hex()[:16]}"
+        )
+
+        result = await self._call("engine_newPayloadV5", params)
+        return PayloadStatus.from_dict(result)
+
     async def new_payload_v4(
         self,
         execution_payload,
@@ -145,6 +171,15 @@ class EngineAPIClient:
             "0x" + parent_beacon_block_root.hex(),
             execution_requests,
         ]
+
+        logger.info(
+            f"newPayloadV4: blockHash={payload_dict.get('blockHash')}, "
+            f"stateRoot={payload_dict.get('stateRoot')}, "
+            f"timestamp={payload_dict.get('timestamp')}, "
+            f"execution_requests={execution_requests}, "
+            f"parent_beacon_root={parent_beacon_block_root.hex()[:16]}, "
+            f"full_params_len={len(params)}"
+        )
 
         result = await self._call("engine_newPayloadV4", params)
         return PayloadStatus.from_dict(result)
@@ -220,11 +255,23 @@ class EngineAPIClient:
     async def get_payload_v5(self, payload_id: bytes) -> GetPayloadResponse:
         """Get an execution payload by ID (Osaka/Fulu and beyond)."""
         result = await self._call("engine_getPayloadV5", ["0x" + payload_id.hex()])
+        exec_payload = result.get('executionPayload', {})
+        exec_requests = result.get('executionRequests')
+        logger.debug(
+            f"getPayloadV5 raw response: executionRequests={exec_requests}, "
+            f"blockHash={exec_payload.get('blockHash')}, "
+            f"timestamp={exec_payload.get('timestamp')}, "
+            f"stateRoot={exec_payload.get('stateRoot')}"
+        )
         return GetPayloadResponse.from_dict(result)
 
     async def get_payload_v4(self, payload_id: bytes) -> GetPayloadResponse:
         """Get an execution payload by ID (Electra/Prague)."""
         result = await self._call("engine_getPayloadV4", ["0x" + payload_id.hex()])
+        logger.debug(
+            f"getPayloadV4 raw response: executionRequests={result.get('executionRequests')}, "
+            f"blockHash={result.get('executionPayload', {}).get('blockHash')}"
+        )
         return GetPayloadResponse.from_dict(result)
 
     async def get_payload_v3(self, payload_id: bytes) -> GetPayloadResponse:
@@ -248,7 +295,7 @@ class EngineAPIClient:
             timestamp = int(time.time())
 
         fork = self._get_fork_for_timestamp(timestamp)
-        logger.debug(f"get_payload: timestamp={timestamp}, fork={fork}")
+        logger.info(f"get_payload: timestamp={timestamp}, fork={fork}, payload_id={payload_id.hex()}")
 
         if fork == "fulu":
             return await self.get_payload_v5(payload_id)
@@ -347,6 +394,19 @@ class EngineAPIClient:
         result = await self._call("engine_exchangeCapabilities", [capabilities])
         return result
 
+    async def get_client_version(self) -> Optional[dict]:
+        """Get execution layer client version info via engine_getClientVersionV1."""
+        try:
+            from ..version import get_cl_client_version_info
+            cl_info = get_cl_client_version_info()
+            result = await self._call("engine_getClientVersionV1", [cl_info])
+            if result and isinstance(result, list) and len(result) > 0:
+                return result[0]
+            return result
+        except Exception as e:
+            logger.debug(f"engine_getClientVersionV1 not supported or failed: {e}")
+            return None
+
     async def close(self) -> None:
         """Close the client session."""
         if self._session and not self._session.closed:
@@ -355,6 +415,11 @@ class EngineAPIClient:
 
     def _payload_to_dict(self, payload) -> dict:
         """Convert an ExecutionPayload to Engine API format."""
+        txs = []
+        for tx in payload.transactions:
+            tx_bytes = bytes(tx)
+            txs.append("0x" + tx_bytes.hex())
+
         result = {
             "parentHash": "0x" + bytes(payload.parent_hash).hex(),
             "feeRecipient": "0x" + bytes(payload.fee_recipient).hex(),
@@ -369,8 +434,16 @@ class EngineAPIClient:
             "extraData": "0x" + bytes(payload.extra_data).hex(),
             "baseFeePerGas": hex(int(payload.base_fee_per_gas)),
             "blockHash": "0x" + bytes(payload.block_hash).hex(),
-            "transactions": ["0x" + bytes(tx).hex() for tx in payload.transactions],
+            "transactions": txs,
         }
+        logger.debug(
+            f"_payload_to_dict: blockHash={result['blockHash']}, "
+            f"stateRoot={result['stateRoot']}, "
+            f"receiptsRoot={result['receiptsRoot']}, "
+            f"parentHash={result['parentHash']}, "
+            f"prevRandao={result['prevRandao']}, "
+            f"extra_data_len={len(bytes(payload.extra_data))}, tx_count={len(txs)}"
+        )
         if hasattr(payload, 'withdrawals'):
             result["withdrawals"] = [
                 {

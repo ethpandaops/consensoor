@@ -91,8 +91,11 @@ class AttestationPool:
         is_electra_block = current_epoch >= electra_fork_epoch
         electra_start_slot = electra_fork_epoch * slots_per_epoch
 
-        # Group attestations by data_root for aggregation
-        by_data_root: dict[bytes, list[PooledAttestation]] = defaultdict(list)
+        # Group attestations for aggregation
+        # Pre-Electra: group by data_root only
+        # Electra: group by (data_root, committee_bits) because aggregation_bits positions
+        # depend on which committees are included
+        by_key: dict[bytes, list[PooledAttestation]] = defaultdict(list)
 
         for (slot, committee_index), pooled_list in self._attestations.items():
             if slot >= current_slot or slot < min_slot:
@@ -105,16 +108,24 @@ class AttestationPool:
                 continue
 
             for pooled in pooled_list:
-                by_data_root[pooled.data_root].append(pooled)
+                if is_electra_block and hasattr(pooled.attestation, 'committee_bits'):
+                    # Electra: include committee_bits in the grouping key
+                    # Convert committee_bits to a hashable tuple
+                    committee_bits_tuple = tuple(bool(b) for b in pooled.attestation.committee_bits)
+                    key = pooled.data_root + bytes(committee_bits_tuple)
+                else:
+                    # Pre-Electra: just use data_root
+                    key = pooled.data_root
+                by_key[key].append(pooled)
 
-        # Aggregate attestations with the same data_root
+        # Aggregate attestations within each group
         result = []
-        for data_root, pooled_list in by_data_root.items():
+        for key, pooled_list in by_key.items():
             try:
                 aggregated = self._aggregate_attestations(pooled_list, is_electra_block)
                 result.append(aggregated)
             except Exception as e:
-                logger.warning(f"Failed to aggregate attestations for data_root {data_root.hex()[:16]}: {e}")
+                logger.warning(f"Failed to aggregate attestations for key {key[:16].hex()}: {e}")
                 # Fall back to first attestation in the group
                 if pooled_list:
                     result.append(pooled_list[0].attestation)
@@ -127,7 +138,7 @@ class AttestationPool:
 
         logger.info(
             f"Returning {len(result)} aggregated attestations for block at slot {current_slot} "
-            f"(is_electra={is_electra_block}, max={max_attestations}, groups={len(by_data_root)})"
+            f"(is_electra={is_electra_block}, max={max_attestations}, groups={len(by_key)})"
         )
         return result
 
@@ -181,11 +192,37 @@ class AttestationPool:
         if len(aggregatable) == 0:
             return first
 
+        # Debug: log committee_bits for Electra attestations being aggregated
+        if is_electra and len(aggregatable) > 1:
+            cb_list = []
+            for p in aggregatable:
+                if hasattr(p.attestation, 'committee_bits'):
+                    cb = [i for i, b in enumerate(p.attestation.committee_bits) if b]
+                    cb_list.append(cb)
+            logger.debug(f"Aggregating {len(aggregatable)} Electra attestations, committee_bits: {cb_list}")
+
         if len(aggregatable) == 1:
             return aggregatable[0].attestation
 
         # Aggregate BLS signatures from disjoint attestations
         signatures = [bytes(p.attestation.signature) for p in aggregatable]
+
+        # Log signature details for debugging
+        for i, p in enumerate(aggregatable):
+            att = p.attestation
+            att_bits = {j for j, bit in enumerate(att.aggregation_bits) if bit}
+            logger.info(
+                f"Aggregation signature {i}: slot={att.data.slot}, "
+                f"target_epoch={att.data.target.epoch}, "
+                f"source_epoch={att.data.source.epoch}, "
+                f"beacon_block_root={bytes(att.data.beacon_block_root).hex()[:16]}, "
+                f"target_root={bytes(att.data.target.root).hex()[:16]}, "
+                f"source_root={bytes(att.data.source.root).hex()[:16]}, "
+                f"data_root={p.data_root.hex()[:16]}, "
+                f"agg_bits={att_bits}, "
+                f"sig={bytes(att.signature).hex()[:32]}"
+            )
+
         try:
             aggregated_sig = aggregate_signatures(signatures)
         except Exception as e:

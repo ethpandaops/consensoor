@@ -72,6 +72,7 @@ class BeaconGossip:
         syncnets: Optional[bytes] = None,
         fork_digest_override: Optional[bytes] = None,
         supernode: bool = False,
+        all_fork_digests: Optional[list[bytes]] = None,
     ):
         # Use override if provided, otherwise compute from fork_version and genesis_validators_root
         computed_digest = compute_fork_digest(fork_version, genesis_validators_root)
@@ -84,6 +85,12 @@ class BeaconGossip:
                 )
         else:
             self.fork_digest = computed_digest
+
+        # Subscribe to all provided fork digests (for multi-fork devnets)
+        self._all_fork_digests = all_fork_digests or [self.fork_digest]
+        if self.fork_digest not in self._all_fork_digests:
+            self._all_fork_digests.append(self.fork_digest)
+
         self._handlers: dict[str, MessageHandler] = {}
 
         config = P2PConfig(
@@ -129,11 +136,16 @@ class BeaconGossip:
         self._handlers[ATTESTER_SLASHING_TOPIC] = handler
 
     async def activate_subscriptions(self) -> None:
-        """Activate all registered subscriptions on the P2P host."""
+        """Activate all registered subscriptions on the P2P host.
+
+        Subscribes to topics for ALL fork digests to handle fork transitions.
+        """
         for base_topic, handler in self._handlers.items():
-            topic = get_topic_name(base_topic, self.fork_digest)
-            await self._host.subscribe(topic, self._wrap_handler(handler))
-            logger.info(f"Subscribed to {base_topic}")
+            wrapped_handler = self._wrap_handler(handler)
+            for fork_digest in self._all_fork_digests:
+                topic = get_topic_name(base_topic, fork_digest)
+                await self._host.subscribe(topic, wrapped_handler)
+                logger.info(f"Subscribed to {base_topic} (fork_digest={fork_digest.hex()})")
 
     def _wrap_handler(self, handler: MessageHandler) -> MessageHandler:
         """Wrap a handler to decode incoming messages."""
@@ -146,12 +158,22 @@ class BeaconGossip:
 
         return wrapped
 
+    def update_fork_digest(self, fork_digest: bytes) -> None:
+        """Update the current fork digest for publishing messages.
+
+        Call this when crossing fork boundaries to ensure messages are
+        published to the correct topic.
+        """
+        if fork_digest != self.fork_digest:
+            logger.info(f"Updating fork_digest for publishing: {self.fork_digest.hex()} -> {fork_digest.hex()}")
+            self.fork_digest = fork_digest
+
     async def publish_block(self, block_ssz: bytes) -> None:
         """Publish a signed beacon block."""
         topic = get_topic_name(BEACON_BLOCK_TOPIC, self.fork_digest)
         encoded = encode_message(block_ssz)
         await self._host.publish(topic, encoded)
-        logger.info(f"Published block: {len(block_ssz)} bytes")
+        logger.info(f"Published block: {len(block_ssz)} bytes (topic={topic})")
 
     async def publish_aggregate(self, aggregate_ssz: bytes) -> None:
         """Publish an aggregate attestation."""

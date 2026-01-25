@@ -1,6 +1,7 @@
 """Configuration for consensoor node."""
 
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
@@ -23,6 +24,7 @@ class Config:
     log_level: str = "INFO"
     checkpoint_sync_url: str = ""
     supernode: bool = False
+    _el_client_info: Optional[dict] = field(default=None, repr=False)
 
     @property
     def jwt_secret(self) -> bytes:
@@ -37,5 +39,9 @@ class Config:
 
     @property
     def graffiti_bytes(self) -> bytes:
-        graffiti_bytes = self.graffiti.encode("utf-8")[:32]
-        return graffiti_bytes + b"\x00" * (32 - len(graffiti_bytes))
+        from .version import build_graffiti
+        return build_graffiti(self.graffiti, self._el_client_info)
+
+    def set_el_client_info(self, el_info: Optional[dict]) -> None:
+        """Set EL client info for graffiti generation."""
+        object.__setattr__(self, "_el_client_info", el_info)

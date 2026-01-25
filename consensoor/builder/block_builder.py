@@ -175,9 +175,30 @@ class BlockBuilder:
             max_attestations = min(8, MAX_ATTESTATIONS_PRE_ELECTRA)
         net_config = get_config()
         electra_fork_epoch = getattr(net_config, 'electra_fork_epoch', 2**64 - 1)
-        attestations = self.node.attestation_pool.get_attestations_for_block(
-            slot, max_attestations, electra_fork_epoch
+        pool_attestations = self.node.attestation_pool.get_attestations_for_block(
+            slot, max_attestations * 2, electra_fork_epoch  # Get extra to account for filtering
         )
+
+        # Pre-validate attestations before including in block
+        # This catches attestations from forked chains that would fail BLS verification
+        from ..spec.state_transition.helpers.attestation import get_indexed_attestation
+        from ..spec.state_transition.helpers.predicates import is_valid_indexed_attestation
+
+        valid_attestations = []
+        for att in pool_attestations:
+            try:
+                indexed = get_indexed_attestation(temp_state, att)
+                if is_valid_indexed_attestation(temp_state, indexed):
+                    valid_attestations.append(att)
+                    if len(valid_attestations) >= max_attestations:
+                        break
+                else:
+                    logger.debug(f"Skipping invalid attestation: slot={att.data.slot}")
+            except Exception as e:
+                logger.debug(f"Error validating attestation: {e}")
+
+        attestations = valid_attestations
+        logger.info(f"Pre-validated {len(attestations)} of {len(pool_attestations)} attestations")
         body = self._build_block_body(temp_state, randao_reveal, execution_payload, fork, attestations)
         logger.debug(f"Block body attestations count after build: {len(body.attestations)}")
 
@@ -313,6 +334,13 @@ class BlockBuilder:
             transactions.append(list(tx_bytes))
 
         extra_data_bytes = hex_to_bytes(payload_dict.get("extraData", "0x"))
+
+        # Debug: log input values
+        logger.debug(
+            f"_build_execution_payload: blockHash={payload_dict['blockHash']}, "
+            f"stateRoot={payload_dict['stateRoot']}, parentHash={payload_dict['parentHash']}, "
+            f"receiptsRoot={payload_dict['receiptsRoot']}"
+        )
 
         base_fields = {
             "parent_hash": Hash32(hex_to_bytes(payload_dict["parentHash"])),

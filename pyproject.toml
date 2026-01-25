@@ -1,6 +1,6 @@
 [project]
 name = "consensoor"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Lightweight Python consensus layer client for local testing"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"  # Python 3.13 breaks remerkleable SSZ hash_tree_root
@@ -28,9 +28,12 @@ dev = [
 consensoor = "consensoor.cli:main"
 
 [build-system]
-requires = ["setuptools>=68.0"]
+requires = ["setuptools>=68.0", "setuptools_scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["consensoor*"]
+
+[tool.setuptools_scm]
+version_file = "consensoor/_version.py"
