@@ -123,6 +123,16 @@ class P2PHost:
             "earliest_available_slot": 0,
         }
 
+    def update_fork_digest(self, fork_digest: bytes) -> None:
+        """Update fork digest used in status and ENR responses."""
+        if fork_digest != self.config.fork_digest:
+            logger.info(
+                f"Updating P2P fork_digest: {self.config.fork_digest.hex()} -> {fork_digest.hex()}"
+            )
+            self.config.fork_digest = fork_digest
+            if self._listen_ip:
+                self._enr = self._generate_enr(self._listen_ip, self.config.listen_port)
+
     async def start(self) -> None:
         """Start the P2P host in a separate Trio thread."""
         try:

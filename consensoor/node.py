@@ -440,6 +440,7 @@ class BeaconNode:
 
             current_epoch = self.head_slot // constants.SLOTS_PER_EPOCH()
             next_fork_version, next_fork_epoch = self._get_next_fork_info(net_config, current_epoch)
+            blob_params = self._get_blob_params_for_epoch(net_config, current_epoch)
 
             # Try to extract fork_digest from bootnode ENRs for compatibility
             fork_digest_override = None
@@ -464,6 +465,7 @@ class BeaconNode:
                 next_fork_version=next_fork_version,
                 next_fork_epoch=next_fork_epoch,
                 fork_digest_override=fork_digest_override,
+                blob_params=blob_params,
                 supernode=self.config.supernode,
                 all_fork_digests=all_fork_digests,
             )
@@ -558,6 +560,7 @@ class BeaconNode:
         fork transitions correctly.
         """
         from .p2p.encoding import compute_fork_digest
+        from .spec import constants
 
         FAR_FUTURE_EPOCH = 2**64 - 1
         digests = []
@@ -585,11 +588,67 @@ class BeaconNode:
         for i, (fork_version, fork_name) in enumerate(forks):
             fork_epoch = fork_epochs[i]
             if fork_epoch < FAR_FUTURE_EPOCH:
-                digest = compute_fork_digest(fork_version, genesis_validators_root)
+                blob_params = None
+                if fork_name == "fulu":
+                    # Base Fulu digest uses default max blobs (Electra), not BPO overrides
+                    blob_params = (fork_epoch, constants.MAX_BLOBS_PER_BLOCK_ELECTRA)
+                digest = compute_fork_digest(
+                    fork_version,
+                    genesis_validators_root,
+                    blob_params=blob_params,
+                )
                 digests.append(digest)
                 logger.debug(f"Fork digest for {fork_name}: {digest.hex()}")
 
+        # Add BPO fork digests (PeerDAS blob param overrides)
+        if getattr(net_config, "blob_schedule", None):
+            for entry in net_config.blob_schedule:
+                try:
+                    entry_epoch = entry.get("epoch", entry.get("EPOCH"))
+                    max_blobs = entry.get("max_blobs_per_block", entry.get("MAX_BLOBS_PER_BLOCK"))
+                    if entry_epoch is None or max_blobs is None:
+                        continue
+                    entry_epoch = int(entry_epoch)
+                    max_blobs = int(max_blobs)
+                    if net_config.fulu_fork_epoch < FAR_FUTURE_EPOCH and entry_epoch >= net_config.fulu_fork_epoch:
+                        digest = compute_fork_digest(
+                            net_config.fulu_fork_version,
+                            genesis_validators_root,
+                            blob_params=(entry_epoch, max_blobs),
+                        )
+                        digests.append(digest)
+                        logger.debug(f"BPO fork digest for epoch {entry_epoch}: {digest.hex()}")
+                except Exception as e:
+                    logger.debug(f"Failed to parse blob schedule entry {entry}: {e}")
+
         return digests
+
+    def _get_blob_params_for_epoch(self, net_config, epoch: int) -> tuple[int, int] | None:
+        """Get blob params (epoch, max_blobs) for fork digest modification."""
+        from .spec import constants
+
+        FAR_FUTURE_EPOCH = 2**64 - 1
+        if epoch < net_config.fulu_fork_epoch or net_config.fulu_fork_epoch >= FAR_FUTURE_EPOCH:
+            return None
+
+        if getattr(net_config, "blob_schedule", None):
+            selected_epoch = None
+            selected_max_blobs = None
+            for entry in net_config.blob_schedule:
+                entry_epoch = entry.get("epoch", entry.get("EPOCH"))
+                max_blobs = entry.get("max_blobs_per_block", entry.get("MAX_BLOBS_PER_BLOCK"))
+                if entry_epoch is None or max_blobs is None:
+                    continue
+                entry_epoch = int(entry_epoch)
+                max_blobs = int(max_blobs)
+                if entry_epoch <= epoch and (selected_epoch is None or entry_epoch >= selected_epoch):
+                    selected_epoch = entry_epoch
+                    selected_max_blobs = max_blobs
+            if selected_epoch is not None and selected_max_blobs is not None:
+                return selected_epoch, selected_max_blobs
+
+        # Default Fulu blob params when no schedule is present
+        return net_config.fulu_fork_epoch, constants.MAX_BLOBS_PER_BLOCK_ELECTRA
 
     async def _update_fork_digest_for_epoch(self, epoch: int) -> None:
         """Update the fork_digest for publishing when crossing fork boundaries.
@@ -615,7 +674,12 @@ class BeaconNode:
 
             # Get the fork version for this epoch
             fork_version = net_config.get_fork_version(epoch)
-            new_digest = compute_fork_digest(fork_version, genesis_validators_root)
+            blob_params = self._get_blob_params_for_epoch(net_config, epoch)
+            new_digest = compute_fork_digest(
+                fork_version,
+                genesis_validators_root,
+                blob_params=blob_params,
+            )
 
             self.beacon_gossip.update_fork_digest(new_digest)
         except Exception as e:

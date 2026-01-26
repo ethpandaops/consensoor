@@ -74,11 +74,16 @@ class BeaconGossip:
         attnets: Optional[bytes] = None,
         syncnets: Optional[bytes] = None,
         fork_digest_override: Optional[bytes] = None,
+        blob_params: Optional[tuple[int, int]] = None,
         supernode: bool = False,
         all_fork_digests: Optional[list[bytes]] = None,
     ):
         # Use override if provided, otherwise compute from fork_version and genesis_validators_root
-        computed_digest = compute_fork_digest(fork_version, genesis_validators_root)
+        computed_digest = compute_fork_digest(
+            fork_version,
+            genesis_validators_root,
+            blob_params=blob_params,
+        )
         if fork_digest_override:
             self.fork_digest = fork_digest_override
             if fork_digest_override != computed_digest:
@@ -193,6 +198,7 @@ class BeaconGossip:
         if fork_digest != self.fork_digest:
             logger.info(f"Updating fork_digest for publishing: {self.fork_digest.hex()} -> {fork_digest.hex()}")
             self.fork_digest = fork_digest
+            self._host.update_fork_digest(fork_digest)
 
     async def publish_block(self, block_ssz: bytes) -> None:
         """Publish a signed beacon block."""

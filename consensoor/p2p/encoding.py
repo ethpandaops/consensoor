@@ -10,7 +10,11 @@ from typing import Union
 from ..crypto import sha256
 
 
-def compute_fork_digest(current_version: bytes, genesis_validators_root: bytes) -> bytes:
+def compute_fork_digest(
+    current_version: bytes,
+    genesis_validators_root: bytes,
+    blob_params: tuple[int, int] | None = None,
+) -> bytes:
     """Compute the fork digest for topic encoding.
 
     fork_digest = ForkDigest(compute_fork_data_root(current_version, genesis_validators_root)[:4])
@@ -23,6 +27,22 @@ def compute_fork_digest(current_version: bytes, genesis_validators_root: bytes) 
         genesis_validators_root=Root(genesis_validators_root),
     )
     fork_data_root = hash_tree_root(fork_data)
+
+    if blob_params:
+        epoch, max_blobs_per_block = blob_params
+        # BPO fork digest: xor base digest with hash(epoch || max_blobs) per DAS Guardian
+        from ..crypto import sha256
+
+        blob_param_bytes = (
+            epoch.to_bytes(8, "little") +
+            max_blobs_per_block.to_bytes(8, "little")
+        )
+        blob_param_hash = sha256(blob_param_bytes)
+        return bytes(
+            fork_data_root[i] ^ blob_param_hash[i]
+            for i in range(4)
+        )
+
     return fork_data_root[:4]
 
 
