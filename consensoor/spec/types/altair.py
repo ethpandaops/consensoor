@@ -26,7 +26,7 @@ from ..constants import (
     JUSTIFICATION_BITS_LENGTH,
     MAX_PROPOSER_SLASHINGS,
     MAX_ATTESTER_SLASHINGS_PRE_ELECTRA,
-    MAX_ATTESTATIONS_PRE_ELECTRA,
+    MAX_ATTESTATIONS,
     MAX_DEPOSITS,
     MAX_VOLUNTARY_EXITS,
     FINALIZED_ROOT_DEPTH,
@@ -120,7 +120,7 @@ class AltairBeaconBlockBody(Container):
     graffiti: Bytes32
     proposer_slashings: List[ProposerSlashing, MAX_PROPOSER_SLASHINGS]
     attester_slashings: List[Phase0AttesterSlashing, MAX_ATTESTER_SLASHINGS_PRE_ELECTRA]
-    attestations: List[Phase0Attestation, MAX_ATTESTATIONS_PRE_ELECTRA]
+    attestations: List[Phase0Attestation, MAX_ATTESTATIONS()]
     deposits: List[Deposit, MAX_DEPOSITS]
     voluntary_exits: List[SignedVoluntaryExit, MAX_VOLUNTARY_EXITS]
     sync_aggregate: SyncAggregate

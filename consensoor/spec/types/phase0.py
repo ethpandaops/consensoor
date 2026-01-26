@@ -19,7 +19,7 @@ from ..constants import (
     JUSTIFICATION_BITS_LENGTH,
     MAX_PROPOSER_SLASHINGS,
     MAX_ATTESTER_SLASHINGS_PRE_ELECTRA,
-    MAX_ATTESTATIONS_PRE_ELECTRA,
+    MAX_ATTESTATIONS,
     MAX_DEPOSITS,
     MAX_VOLUNTARY_EXITS,
     MAX_VALIDATORS_PER_COMMITTEE,
@@ -149,7 +149,7 @@ class Phase0BeaconBlockBody(Container):
     graffiti: Bytes32
     proposer_slashings: List[ProposerSlashing, MAX_PROPOSER_SLASHINGS]
     attester_slashings: List[Phase0AttesterSlashing, MAX_ATTESTER_SLASHINGS_PRE_ELECTRA]
-    attestations: List[Phase0Attestation, MAX_ATTESTATIONS_PRE_ELECTRA]
+    attestations: List[Phase0Attestation, MAX_ATTESTATIONS()]
     deposits: List[Deposit, MAX_DEPOSITS]
     voluntary_exits: List[SignedVoluntaryExit, MAX_VOLUNTARY_EXITS]
 
@@ -183,8 +183,8 @@ class Phase0BeaconState(Container):
     balances: List[Gwei, VALIDATOR_REGISTRY_LIMIT]
     randao_mixes: Vector[Bytes32, EPOCHS_PER_HISTORICAL_VECTOR()]
     slashings: Vector[Gwei, EPOCHS_PER_SLASHINGS_VECTOR()]
-    previous_epoch_attestations: List[PendingAttestation, MAX_ATTESTATIONS_PRE_ELECTRA * SLOTS_PER_EPOCH()]
-    current_epoch_attestations: List[PendingAttestation, MAX_ATTESTATIONS_PRE_ELECTRA * SLOTS_PER_EPOCH()]
+    previous_epoch_attestations: List[PendingAttestation, MAX_ATTESTATIONS() * SLOTS_PER_EPOCH()]
+    current_epoch_attestations: List[PendingAttestation, MAX_ATTESTATIONS() * SLOTS_PER_EPOCH()]
     justification_bits: Bitvector[JUSTIFICATION_BITS_LENGTH]
     previous_justified_checkpoint: Checkpoint
     current_justified_checkpoint: Checkpoint

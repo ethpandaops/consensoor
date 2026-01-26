@@ -433,7 +433,7 @@ def process_operations(state: "BeaconState", body, is_gloas: bool = False) -> No
         MAX_ATTESTER_SLASHINGS,
         MAX_ATTESTER_SLASHINGS_PRE_ELECTRA,
         MAX_ATTESTATIONS,
-        MAX_ATTESTATIONS_PRE_ELECTRA,
+        MAX_ATTESTATIONS_ELECTRA,
         MAX_DEPOSITS,
         MAX_VOLUNTARY_EXITS,
         MAX_BLS_TO_EXECUTION_CHANGES,
@@ -442,7 +442,7 @@ def process_operations(state: "BeaconState", body, is_gloas: bool = False) -> No
     # Determine fork-appropriate limits
     is_electra = hasattr(state, "pending_deposits")
     max_attester_slashings = MAX_ATTESTER_SLASHINGS if is_electra else MAX_ATTESTER_SLASHINGS_PRE_ELECTRA
-    max_attestations = MAX_ATTESTATIONS if is_electra else MAX_ATTESTATIONS_PRE_ELECTRA
+    max_attestations = MAX_ATTESTATIONS_ELECTRA() if is_electra else MAX_ATTESTATIONS()
 
     # Verify operation counts don't exceed limits
     assert len(body.proposer_slashings) <= MAX_PROPOSER_SLASHINGS, (

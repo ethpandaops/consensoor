@@ -186,6 +186,7 @@ class BeaconNode:
         self._genesis_time: int = 0
         self._slot_ticker_task: Optional[asyncio.Task] = None
         self._current_payload_id: Optional[bytes] = None
+        self._fork_digest_override: Optional[bytes] = None  # For devnets with custom fork digests
 
     async def start(self) -> None:
         """Start the beacon node."""
@@ -447,6 +448,7 @@ class BeaconNode:
                     extracted = extract_fork_digest_from_enr(peer)
                     if extracted:
                         fork_digest_override = extracted
+                        self._fork_digest_override = extracted  # Store for epoch updates
                         logger.info(f"Using fork_digest from bootnode ENR: {extracted.hex()}")
                         break
 
@@ -596,6 +598,12 @@ class BeaconNode:
         to the correct gossipsub topic.
         """
         if not self.beacon_gossip or not self.state:
+            return
+
+        # If we have a fork_digest_override (from devnet ENR), always use that
+        # Devnets use custom fork digests that don't match computed values
+        if self._fork_digest_override:
+            self.beacon_gossip.update_fork_digest(self._fork_digest_override)
             return
 
         try:

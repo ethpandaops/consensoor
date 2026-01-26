@@ -42,7 +42,7 @@ from ..spec.constants import (
     DOMAIN_RANDAO,
     DOMAIN_BEACON_PROPOSER,
     SYNC_COMMITTEE_SIZE,
-    MAX_ATTESTATIONS_PRE_ELECTRA,
+    MAX_ATTESTATIONS,
     MAX_ATTESTATIONS_ELECTRA,
 )
 from ..spec.network_config import get_config
@@ -170,9 +170,9 @@ class BlockBuilder:
         # With 12s slots, we can handle ~8 attestations (800ms BLS time)
         # Attestation aggregation helps by combining multiple validators into fewer attestations
         if fork in ("electra", "fulu"):
-            max_attestations = min(8, MAX_ATTESTATIONS_ELECTRA)
+            max_attestations = min(8, MAX_ATTESTATIONS_ELECTRA())
         else:
-            max_attestations = min(8, MAX_ATTESTATIONS_PRE_ELECTRA)
+            max_attestations = min(8, MAX_ATTESTATIONS())
         net_config = get_config()
         electra_fork_epoch = getattr(net_config, 'electra_fork_epoch', 2**64 - 1)
         pool_attestations = self.node.attestation_pool.get_attestations_for_block(

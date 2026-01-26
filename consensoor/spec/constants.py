@@ -106,10 +106,13 @@ def MAX_COMMITTEES_PER_SLOT() -> int:
 MAX_PROPOSER_SLASHINGS: Final[int] = 16
 MAX_ATTESTER_SLASHINGS: Final[int] = 2  # Pre-Electra (Phase0-Deneb)
 MAX_ATTESTER_SLASHINGS_PRE_ELECTRA: Final[int] = 2
-MAX_ATTESTATIONS: Final[int] = 8  # Electra
-MAX_ATTESTATIONS_PRE_ELECTRA: Final[int] = 128
 MAX_DEPOSITS: Final[int] = 16
 MAX_VOLUNTARY_EXITS: Final[int] = 16
+
+
+def MAX_ATTESTATIONS() -> int:
+    """Phase0 MAX_ATTESTATIONS - mainnet=128, minimal=128."""
+    return 128
 
 MIN_DEPOSIT_AMOUNT: Final[int] = 10**9
 MAX_EFFECTIVE_BALANCE: Final[int] = 32 * 10**9
@@ -268,7 +271,11 @@ def MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT() -> int:
 # =============================================================================
 
 MAX_ATTESTER_SLASHINGS_ELECTRA: Final[int] = 1
-MAX_ATTESTATIONS_ELECTRA: Final[int] = 8
+
+
+def MAX_ATTESTATIONS_ELECTRA() -> int:
+    """Electra MAX_ATTESTATIONS - mainnet=8, minimal=8."""
+    return 8
 
 MIN_ACTIVATION_BALANCE: Final[int] = 32 * 10**9
 MAX_EFFECTIVE_BALANCE_ELECTRA: Final[int] = 2048 * 10**9

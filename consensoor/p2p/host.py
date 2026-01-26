@@ -332,7 +332,7 @@ class P2PHost:
         status_v1_protocol = TProtocol("/eth2/beacon_chain/req/status/1/ssz_snappy")
         self._host.set_stream_handler(status_v1_protocol, self._handle_status_v1_request)
 
-        # Status v2 (Fulu+) - includes custody_group_count and earliest_available_slot
+        # Status v2 (Fulu+) - includes earliest_available_slot
         status_v2_protocol = TProtocol("/eth2/beacon_chain/req/status/2/ssz_snappy")
         self._host.set_stream_handler(status_v2_protocol, self._handle_status_v2_request)
 
@@ -417,7 +417,8 @@ class P2PHost:
     async def _handle_status_v2_request(self, stream) -> None:
         """Handle incoming status/2 request (Fulu+).
 
-        Status v2 adds custody_group_count and earliest_available_slot fields.
+        Status v2 adds earliest_available_slot field (8 bytes).
+        Note: custody_group_count is exchanged via metadata/3, not status.
         """
         import varint
 
@@ -432,20 +433,17 @@ class P2PHost:
             finalized_epoch = status["finalized_epoch"]
             head_root = status["head_root"]
             head_slot = status["head_slot"]
-            custody_group_count = self.config.custody_group_count
             earliest_available_slot = status.get("earliest_available_slot", 0)
 
-            # Status v2: 100 bytes
+            # Status v2: 92 bytes
             # fork_digest (4) + finalized_root (32) + finalized_epoch (8) +
-            # head_root (32) + head_slot (8) + custody_group_count (8) +
-            # earliest_available_slot (8)
+            # head_root (32) + head_slot (8) + earliest_available_slot (8)
             status_ssz = (
                 self.config.fork_digest +
                 finalized_root +
                 finalized_epoch.to_bytes(8, "little") +
                 head_root +
                 head_slot.to_bytes(8, "little") +
-                custody_group_count.to_bytes(8, "little") +
                 earliest_available_slot.to_bytes(8, "little")
             )
 
@@ -457,7 +455,7 @@ class P2PHost:
 
             await stream.write(response)
             await stream.close()
-            logger.debug(f"Sent status/2 response to {peer_id[:16]}: slot={head_slot}, cgc={custody_group_count}")
+            logger.debug(f"Sent status/2 response to {peer_id[:16]}: slot={head_slot}, earliest={earliest_available_slot}")
 
         except Exception as e:
             logger.warning(f"Error handling status/2 request: {e}")
@@ -766,7 +764,7 @@ class P2PHost:
                         logger.debug(f"Could not add peer to mesh for {topic}: {e}")
 
             # Try to open a status stream to keep connection alive and verify it works
-            # Use status/2 for Fulu (includes custody_group_count and earliest_available_slot)
+            # Use status/2 for Fulu (includes earliest_available_slot)
             try:
                 from libp2p.custom_types import TProtocol
                 import varint
@@ -795,15 +793,14 @@ class P2PHost:
                 head_slot = status["head_slot"]
 
                 if use_v2:
-                    custody_group_count = self.config.custody_group_count
                     earliest_available_slot = status.get("earliest_available_slot", 0)
+                    # Status v2: 92 bytes (v1 + earliest_available_slot)
                     status_ssz = (
                         self.config.fork_digest +
                         finalized_root +
                         finalized_epoch.to_bytes(8, "little") +
                         head_root +
                         head_slot.to_bytes(8, "little") +
-                        custody_group_count.to_bytes(8, "little") +
                         earliest_available_slot.to_bytes(8, "little")
                     )
                 else:

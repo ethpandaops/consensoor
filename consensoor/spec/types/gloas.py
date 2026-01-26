@@ -185,7 +185,7 @@ class BeaconBlockBody(Container):
     graffiti: Bytes32
     proposer_slashings: List[ProposerSlashing, MAX_PROPOSER_SLASHINGS]
     attester_slashings: List[AttesterSlashing, MAX_ATTESTER_SLASHINGS_ELECTRA]
-    attestations: List[Attestation, MAX_ATTESTATIONS_ELECTRA]
+    attestations: List[Attestation, MAX_ATTESTATIONS_ELECTRA()]
     deposits: List[Deposit, MAX_DEPOSITS]
     voluntary_exits: List[SignedVoluntaryExit, MAX_VOLUNTARY_EXITS]
     sync_aggregate: SyncAggregate
