@@ -14,6 +14,7 @@ _PREFIX_BLOCK = b"b:"
 _PREFIX_BLOCK_SLOT = b"bs:"
 _PREFIX_BLOCK_PARENT = b"bp:"
 _PREFIX_PAYLOAD = b"p:"
+_PREFIX_BLOBS = b"bl:"
 _PREFIX_META = b"m:"
 
 
@@ -32,6 +33,7 @@ class Store:
         self._state_cache: dict[bytes, object] = {}
         self._block_cache: dict[bytes, object] = {}
         self._payload_cache: dict[bytes, object] = {}
+        self._blob_cache: dict[bytes, list] = {}  # block_root -> list of blob sidecars
         self._bid_cache: dict[int, object] = {}
         self._cache_limit = 128
 
@@ -312,6 +314,70 @@ class Store:
     def get_bid(self, slot: int) -> Optional[object]:
         """Get an execution payload bid by slot."""
         return self._bid_cache.get(slot)
+
+    def save_blobs(self, block_root: bytes, slot: int, blobs_bundle: dict, kzg_commitments: list) -> None:
+        """Save blob sidecars for a block.
+
+        Args:
+            block_root: The block root
+            slot: The block slot
+            blobs_bundle: The blobs bundle from getPayload (commitments, proofs, blobs)
+            kzg_commitments: The KZG commitments from the block body
+        """
+        import json
+
+        blobs = blobs_bundle.get("blobs", [])
+        commitments = blobs_bundle.get("commitments", [])
+        proofs = blobs_bundle.get("proofs", [])
+
+        sidecars = []
+        for i in range(len(blobs)):
+            sidecar = {
+                "index": str(i),
+                "blob": blobs[i] if i < len(blobs) else "0x" + "00" * 131072,
+                "kzg_commitment": commitments[i] if i < len(commitments) else "0x" + "00" * 48,
+                "kzg_proof": proofs[i] if i < len(proofs) else "0x" + "00" * 48,
+                "signed_block_header": {
+                    "message": {
+                        "slot": str(slot),
+                        "proposer_index": "0",
+                        "parent_root": "0x" + "00" * 32,
+                        "state_root": "0x" + "00" * 32,
+                        "body_root": "0x" + "00" * 32,
+                    },
+                    "signature": "0x" + "00" * 96,
+                },
+                "kzg_commitment_inclusion_proof": ["0x" + "00" * 32] * 17,
+            }
+            sidecars.append(sidecar)
+
+        self._blob_cache[block_root] = sidecars
+        self._trim_cache(self._blob_cache)
+
+        try:
+            data = json.dumps(sidecars).encode()
+            self._db.put(_PREFIX_BLOBS + block_root, data)
+            logger.debug(f"Saved {len(sidecars)} blob sidecars for block {block_root.hex()[:16]}")
+        except Exception as e:
+            logger.warning(f"Failed to persist blobs to LevelDB: {e}")
+
+    def get_blobs(self, block_root: bytes) -> list:
+        """Get blob sidecars for a block."""
+        import json
+
+        if block_root in self._blob_cache:
+            return self._blob_cache[block_root]
+
+        try:
+            value = self._db.get(_PREFIX_BLOBS + block_root)
+            if value:
+                sidecars = json.loads(value.decode())
+                self._blob_cache[block_root] = sidecars
+                return sidecars
+        except Exception as e:
+            logger.warning(f"Failed to load blobs from LevelDB: {e}")
+
+        return []
 
     def set_head(self, root: bytes) -> None:
         """Set the current head root."""

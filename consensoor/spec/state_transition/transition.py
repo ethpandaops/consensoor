@@ -113,21 +113,45 @@ def process_slots(state: "BeaconState", slot: int) -> "BeaconState":
     Returns:
         The state after processing (may be a different type after fork upgrade)
     """
+    import time
     assert slot > int(state.slot), (
         f"Target slot {slot} <= state slot {state.slot}"
     )
 
+    start_slot = int(state.slot)
+    slots_to_process = slot - start_slot
+    if slots_to_process > 10:
+        logger.warning(f"process_slots: processing {slots_to_process} slots ({start_slot} -> {slot})")
+
+    slot_times = []
+    epoch_times = []
+
     while int(state.slot) < slot:
+        t0 = time.time()
         process_slot(state)
+        slot_time = time.time() - t0
+        slot_times.append(slot_time)
 
         # At epoch boundary, process epoch and check for fork upgrade
         if (int(state.slot) + 1) % SLOTS_PER_EPOCH() == 0:
+            t0 = time.time()
             process_epoch(state)
+            epoch_time = time.time() - t0
+            epoch_times.append(epoch_time)
             next_epoch = (int(state.slot) + 1) // SLOTS_PER_EPOCH()
             state = upgrade_fork_if_needed(state, next_epoch)
 
         # Advance slot
         state.slot = int(state.slot) + 1
+
+    if slots_to_process > 10:
+        avg_slot = sum(slot_times) / len(slot_times) if slot_times else 0
+        avg_epoch = sum(epoch_times) / len(epoch_times) if epoch_times else 0
+        logger.warning(
+            f"process_slots done: {slots_to_process} slots, "
+            f"avg_slot={avg_slot*1000:.1f}ms, avg_epoch={avg_epoch*1000:.1f}ms, "
+            f"total_slot={sum(slot_times)*1000:.1f}ms, total_epoch={sum(epoch_times)*1000:.1f}ms"
+        )
 
     return state
 
@@ -219,37 +243,88 @@ def process_epoch(state: "BeaconState") -> None:
         process_proposer_lookahead,
     )
 
+    import time
+    timings = {}
+
+    t0 = time.time()
     process_justification_and_finalization(state)
+    timings['justification'] = time.time() - t0
+
     # Inactivity updates only for Altair+ (uses inactivity_scores)
     if hasattr(state, "inactivity_scores"):
+        t0 = time.time()
         process_inactivity_updates(state)
+        timings['inactivity'] = time.time() - t0
+
+    t0 = time.time()
     process_rewards_and_penalties(state)
+    timings['rewards'] = time.time() - t0
+
+    t0 = time.time()
     process_registry_updates(state)
+    timings['registry'] = time.time() - t0
+
+    t0 = time.time()
     process_slashings(state)
+    timings['slashings'] = time.time() - t0
+
+    t0 = time.time()
     process_eth1_data_reset(state)
+    timings['eth1_reset'] = time.time() - t0
 
     # Electra+ epoch processing (before effective balance updates per spec)
     if hasattr(state, "pending_deposits"):
+        t0 = time.time()
         process_pending_deposits(state)
-    if hasattr(state, "pending_consolidations"):
-        process_pending_consolidations(state)
-    if hasattr(state, "builder_pending_payments"):
-        process_builder_pending_payments(state)
+        timings['pending_deposits'] = time.time() - t0
 
+    if hasattr(state, "pending_consolidations"):
+        t0 = time.time()
+        process_pending_consolidations(state)
+        timings['pending_consolidations'] = time.time() - t0
+
+    if hasattr(state, "builder_pending_payments"):
+        t0 = time.time()
+        process_builder_pending_payments(state)
+        timings['builder_payments'] = time.time() - t0
+
+    t0 = time.time()
     process_effective_balance_updates(state)
+    timings['effective_balance'] = time.time() - t0
+
+    t0 = time.time()
     process_slashings_reset(state)
+    timings['slashings_reset'] = time.time() - t0
+
+    t0 = time.time()
     process_randao_mixes_reset(state)
+    timings['randao_reset'] = time.time() - t0
+
+    t0 = time.time()
     process_historical_summaries_update(state)
+    timings['historical_summaries'] = time.time() - t0
+
     # Participation updates (handles both Phase0 and Altair+)
+    t0 = time.time()
     process_participation_flag_updates(state)
+    timings['participation'] = time.time() - t0
 
     # Altair+ epoch processing
     if hasattr(state, "current_sync_committee"):
+        t0 = time.time()
         process_sync_committee_updates(state)
+        timings['sync_committee'] = time.time() - t0
 
     # Fulu+ epoch processing
     if hasattr(state, "proposer_lookahead"):
+        t0 = time.time()
         process_proposer_lookahead(state)
+        timings['proposer_lookahead'] = time.time() - t0
+
+    # Log slow operations (>10ms)
+    slow_ops = {k: v*1000 for k, v in timings.items() if v > 0.01}
+    if slow_ops:
+        logger.debug(f"process_epoch timings (ms): {slow_ops}")
 
 
 def process_block(state: "BeaconState", block: "BeaconBlock") -> None:

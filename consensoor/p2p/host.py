@@ -844,14 +844,26 @@ class P2PHost:
             fanout = getattr(self._gossipsub, 'fanout', {})
             peers_in_mesh = {}
 
+            # Aggregate mesh status by base topic name (ignore fork digest variations)
+            topic_summary: dict[str, set] = {}
             for topic, peer_set in mesh.items():
                 short_topic = topic.split("/")[-2] if "/" in topic else topic[:30]
-                peer_ids = [str(p)[:16] for p in peer_set] if peer_set else []
-                peers_in_mesh[short_topic] = len(peer_ids)
+                if short_topic not in topic_summary:
+                    topic_summary[short_topic] = set()
+                if peer_set:
+                    topic_summary[short_topic].update(str(p)[:16] for p in peer_set)
+                peers_in_mesh[short_topic] = len(topic_summary[short_topic])
+
+            # Log only once per base topic type
+            empty_topics = []
+            for short_topic, peer_ids in topic_summary.items():
                 if peer_ids:
-                    logger.info(f"Mesh[{short_topic}]: {len(peer_ids)} peers - {peer_ids}")
+                    logger.debug(f"Mesh[{short_topic}]: {len(peer_ids)} peers")
                 else:
-                    logger.warning(f"Mesh[{short_topic}]: EMPTY - no peers to forward messages!")
+                    empty_topics.append(short_topic)
+
+            if empty_topics:
+                logger.warning(f"Empty mesh for topics: {empty_topics}")
 
             # Try to add connected peers to mesh if mesh is empty
             for topic in self._subscriptions.keys():

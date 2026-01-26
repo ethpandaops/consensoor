@@ -915,11 +915,13 @@ class BeaconNode:
                 slot
             )
 
+        validator_indices = [d.validator_index for d in slot_duties]
         logger.info(
-            f"Producing {len(slot_duties)} attestations for slot {slot} "
-            f"(at {time_into_slot:.2f}s into slot, target={expected_offset:.2f}s)"
+            f"[ATTESTER] slot={slot} count={len(slot_duties)} time={time_into_slot:.2f}s validators={validator_indices}"
         )
 
+        produced_count = 0
+        broadcast_count = 0
         for duty in slot_duties:
             try:
                 attestation = self.validator_client.produce_attestation(
@@ -927,10 +929,7 @@ class BeaconNode:
                 )
                 if attestation:
                     self.attestation_pool.add(attestation)
-                    logger.debug(
-                        f"Attestation produced: slot={slot}, committee={duty.committee_index}, "
-                        f"validator={duty.validator_index}"
-                    )
+                    produced_count += 1
 
                     # Broadcast via P2P as aggregate
                     if self.beacon_gossip:
@@ -938,10 +937,13 @@ class BeaconNode:
                             await self._broadcast_attestation_as_aggregate(
                                 attestation, duty.validator_index, duty.pubkey
                             )
+                            broadcast_count += 1
                         except Exception as e:
                             logger.error(f"Failed to broadcast attestation: {e}")
             except Exception as e:
                 logger.error(f"Failed to produce attestation for duty {duty}: {e}")
+
+        logger.info(f"Attestations: slot={slot}, produced={produced_count}, broadcast={broadcast_count}")
 
     def _is_electra_fork(self) -> bool:
         """Check if current state is at Electra or later fork."""
@@ -1236,7 +1238,19 @@ class BeaconNode:
             block_root = hash_tree_root(block)
             execution_payload = block.body.execution_payload
 
+            # Extract versioned hashes from blobs bundle (EIP-4844)
             versioned_hashes = []
+            if payload_response.blobs_bundle:
+                blobs_bundle = payload_response.blobs_bundle
+                commitments = blobs_bundle.get("commitments", [])
+                if commitments:
+                    from hashlib import sha256
+                    for commitment in commitments:
+                        commitment_bytes = bytes.fromhex(commitment.replace("0x", ""))
+                        versioned_hash = b'\x01' + sha256(commitment_bytes).digest()[1:]
+                        versioned_hashes.append(versioned_hash)
+                    logger.info(f"Extracted {len(versioned_hashes)} versioned hashes from blobs bundle")
+
             parent_beacon_root = bytes(block.parent_root)
 
             # Log the SSZ payload's blockHash to verify it matches the original
@@ -1252,6 +1266,39 @@ class BeaconNode:
                 f"original_stateRoot={execution_payload_dict.get('stateRoot')}, "
                 f"ssz_stateRoot=0x{bytes(execution_payload.state_root).hex()}"
             )
+
+            # Detailed payload comparison for debugging blockhash mismatch
+            reconstructed_dict = self.engine._payload_to_dict(execution_payload)
+            diff_fields = []
+            for key in set(execution_payload_dict.keys()) | set(reconstructed_dict.keys()):
+                orig_val = execution_payload_dict.get(key)
+                recon_val = reconstructed_dict.get(key)
+                if orig_val != recon_val:
+                    if key in ('transactions', 'withdrawals'):
+                        orig_len = len(orig_val) if orig_val else 0
+                        recon_len = len(recon_val) if recon_val else 0
+                        if orig_len != recon_len:
+                            diff_fields.append(f"{key}: len {orig_len} vs {recon_len}")
+                        else:
+                            for i, (o, r) in enumerate(zip(orig_val or [], recon_val or [])):
+                                if o != r:
+                                    diff_fields.append(f"{key}[{i}]: {str(o)[:50]} vs {str(r)[:50]}")
+                                    break
+                    else:
+                        diff_fields.append(f"{key}: {orig_val} vs {recon_val}")
+            if diff_fields:
+                logger.warning(f"Payload dict differences: {diff_fields}")
+            else:
+                logger.info("Payload dict round-trip: no differences detected")
+
+            # Log execution requests being sent
+            if el_execution_requests:
+                logger.info(f"Sending {len(el_execution_requests)} execution_requests to newPayload")
+                for i, req in enumerate(el_execution_requests):
+                    if isinstance(req, str):
+                        logger.debug(f"  execution_request[{i}]: {req[:66]}...")
+                    else:
+                        logger.debug(f"  execution_request[{i}]: type={type(req)}")
 
             status = await self.engine.new_payload(
                 execution_payload,
@@ -1273,6 +1320,15 @@ class BeaconNode:
             # Apply the produced block to state FIRST so subsequent forkchoice calls
             # use the updated state
             self.store.save_block(block_root, signed_block)
+
+            # Save blob sidecars if present
+            if payload_response.blobs_bundle and versioned_hashes:
+                kzg_commitments = []
+                if hasattr(block.body, "blob_kzg_commitments"):
+                    kzg_commitments = [bytes(c) for c in block.body.blob_kzg_commitments]
+                self.store.save_blobs(block_root, slot, payload_response.blobs_bundle, kzg_commitments)
+                logger.info(f"Saved {len(versioned_hashes)} blob sidecars for block at slot {slot}")
+
             self.head_slot = slot
             self.head_root = block_root
             self.store.set_head(block_root)

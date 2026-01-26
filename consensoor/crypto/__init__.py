@@ -141,7 +141,14 @@ def fast_aggregate_verify(pubkeys: Sequence[bytes], message: bytes, signature: b
     try:
         if len(pubkeys) == 0:
             g2_point_at_infinity = b'\xc0' + b'\x00' * 95
-            return signature == g2_point_at_infinity
+            result = signature == g2_point_at_infinity
+            if not result:
+                logger.error(
+                    f"fast_aggregate_verify: empty pubkeys but sig != infinity. "
+                    f"sig_len={len(signature)}, sig={signature.hex()[:32]}..., "
+                    f"expected={g2_point_at_infinity.hex()[:32]}..."
+                )
+            return result
 
         if _USE_BLSPY:
             pks = [G1Element.from_bytes(pk) for pk in pubkeys]

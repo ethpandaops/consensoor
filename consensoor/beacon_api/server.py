@@ -46,6 +46,7 @@ class BeaconAPI:
         self.app.router.add_get("/eth/v1/beacon/headers", self.get_headers)
         self.app.router.add_get("/eth/v1/beacon/headers/{block_id}", self.get_header)
         self.app.router.add_get("/eth/v2/beacon/blocks/{block_id}", self.get_block)
+        self.app.router.add_get("/eth/v1/beacon/blob_sidecars/{block_id}", self.get_blob_sidecars)
         self.app.router.add_get("/eth/v2/debug/beacon/states/{state_id}", self.get_debug_state)
         self.app.router.add_get("/eth/v1/config/spec", self.get_spec)
         self.app.router.add_get("/eth/v1/events", self.get_events)
@@ -549,6 +550,20 @@ class BeaconAPI:
             "execution_optimistic": False,
             "finalized": False,
             "data": block_json,
+        })
+
+    async def get_blob_sidecars(self, request: web.Request) -> web.Response:
+        """GET /eth/v1/beacon/blob_sidecars/{block_id}"""
+        block_id = request.match_info["block_id"]
+        root, signed_block = self._resolve_block_id(block_id)
+
+        if root is None:
+            return web.json_response({"message": "Block not found"}, status=404)
+
+        sidecars = self.node.store.get_blobs(root)
+
+        return web.json_response({
+            "data": sidecars,
         })
 
     def _signed_block_to_json(self, signed_block) -> dict:

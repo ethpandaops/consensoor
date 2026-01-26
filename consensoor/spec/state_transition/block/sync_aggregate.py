@@ -75,11 +75,27 @@ def process_sync_aggregate(
         )
 
     # Verify aggregate signature (even with zero participants)
-    assert bls_verify(
+    import logging
+    _logger = logging.getLogger(__name__)
+    sig_bytes = bytes(sync_aggregate.sync_committee_signature)
+    g2_infinity = b'\xc0' + b'\x00' * 95
+    _logger.debug(
+        f"Sync aggregate verify: participants={len(participant_pubkeys)}, "
+        f"state_slot={int(state.slot)}, previous_slot={previous_slot}, "
+        f"sig_is_infinity={sig_bytes == g2_infinity}, "
+        f"sig_len={len(sig_bytes)}, sig_prefix={sig_bytes[:4].hex()}"
+    )
+    verify_result = bls_verify(
         [bytes(pk) for pk in participant_pubkeys],
         signing_root,
-        bytes(sync_aggregate.sync_committee_signature),
-    ), "Invalid sync aggregate signature"
+        sig_bytes,
+    )
+    if not verify_result:
+        _logger.error(
+            f"Sync aggregate signature verification FAILED: "
+            f"participants={len(participant_pubkeys)}, sig_bytes[:8]={sig_bytes[:8].hex()}"
+        )
+    assert verify_result, "Invalid sync aggregate signature"
 
     # Compute participant and proposer rewards
     total_active_balance = get_total_active_balance(state)
