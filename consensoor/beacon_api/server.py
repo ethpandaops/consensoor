@@ -957,7 +957,13 @@ class BeaconAPI:
         if state_id == "head":
             return self.node.state
         if state_id == "genesis":
-            return self.node.state if self.node.state and int(self.node.state.slot) == 0 else None
+            # First try current state if at slot 0
+            if self.node.state and int(self.node.state.slot) == 0:
+                return self.node.state
+            # Then try to fetch from store
+            if self.node.store:
+                return self.node.store.get_state_by_slot(0)
+            return None
         if state_id in ("finalized", "justified"):
             return self.node.state
         if state_id.startswith("0x"):
@@ -972,20 +978,21 @@ class BeaconAPI:
                         header = self.node.state.latest_block_header
                         if bytes(header.state_root) == root:
                             return self.node.state
-                    stored_state = self.node.store.get_state(root)
-                    if stored_state:
-                        return stored_state
-                    block = self.node.store.get_block(root)
-                    if block and hasattr(block, "message"):
-                        block_state_root = bytes(block.message.state_root)
-                        stored_state = self.node.store.get_state(block_state_root)
+                    if self.node.store:
+                        stored_state = self.node.store.get_state(root)
                         if stored_state:
                             return stored_state
-                        if self.node.state:
-                            from ..crypto import hash_tree_root
-                            current_state_root = hash_tree_root(self.node.state)
-                            if current_state_root == block_state_root:
-                                return self.node.state
+                        block = self.node.store.get_block(root)
+                        if block and hasattr(block, "message"):
+                            block_state_root = bytes(block.message.state_root)
+                            stored_state = self.node.store.get_state(block_state_root)
+                            if stored_state:
+                                return stored_state
+                            if self.node.state:
+                                from ..crypto import hash_tree_root
+                                current_state_root = hash_tree_root(self.node.state)
+                                if current_state_root == block_state_root:
+                                    return self.node.state
             except ValueError:
                 pass
             return None
@@ -993,6 +1000,9 @@ class BeaconAPI:
             slot = int(state_id)
             if self.node.state and int(self.node.state.slot) == slot:
                 return self.node.state
+            # Try to fetch from store if current state doesn't match
+            if self.node.store:
+                return self.node.store.get_state_by_slot(slot)
             return None
         except ValueError:
             return None

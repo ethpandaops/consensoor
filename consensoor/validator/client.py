@@ -320,7 +320,10 @@ class ValidatorClient:
                 else:
                     beacon_block_root = block_root_entry
 
-            epoch = slot // SLOTS_PER_EPOCH()
+            # Domain uses epoch of previous_slot per Altair spec
+            # Sync committee messages at slot N sign the block root at N-1
+            # and use the domain for epoch of N-1 (the signed block's slot)
+            epoch = compute_epoch_at_slot(previous_slot)
             domain = get_domain(state, DOMAIN_SYNC_COMMITTEE, epoch)
             signing_root = compute_signing_root(beacon_block_root, domain)
             signature = bls_sign(validator_key.privkey, signing_root)

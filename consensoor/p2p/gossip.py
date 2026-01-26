@@ -12,6 +12,7 @@ import rlp
 from .host import P2PHost, P2PConfig
 from .encoding import (
     get_topic_name,
+    get_blob_sidecar_topic,
     encode_message,
     decode_message,
     compute_fork_digest,
@@ -22,6 +23,7 @@ from .encoding import (
     ATTESTER_SLASHING_TOPIC,
     BLS_TO_EXECUTION_CHANGE_TOPIC,
     SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_TOPIC,
+    BLOB_SIDECAR_TOPIC_PREFIX,
 )
 
 logger = logging.getLogger(__name__)
@@ -140,17 +142,36 @@ class BeaconGossip:
         """Subscribe to sync committee contribution and proof messages."""
         self._handlers[SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_TOPIC] = handler
 
+    def subscribe_blob_sidecars(self, handler: MessageHandler) -> None:
+        """Subscribe to blob sidecar messages on all subnets."""
+        self._blob_sidecar_handler = handler
+
     async def activate_subscriptions(self) -> None:
         """Activate all registered subscriptions on the P2P host.
 
         Subscribes to topics for ALL fork digests to handle fork transitions.
         """
+        subscribed_topics = []
         for base_topic, handler in self._handlers.items():
             wrapped_handler = self._wrap_handler(handler)
             for fork_digest in self._all_fork_digests:
                 topic = get_topic_name(base_topic, fork_digest)
                 await self._host.subscribe(topic, wrapped_handler)
-                logger.info(f"Subscribed to {base_topic} (fork_digest={fork_digest.hex()})")
+            subscribed_topics.append(base_topic)
+
+        # Subscribe to blob sidecar topics (6 subnets: 0-5)
+        blob_subnet_count = 0
+        if hasattr(self, '_blob_sidecar_handler') and self._blob_sidecar_handler:
+            wrapped_handler = self._wrap_handler(self._blob_sidecar_handler)
+            for fork_digest in self._all_fork_digests:
+                for subnet_id in range(6):
+                    topic = get_blob_sidecar_topic(subnet_id, fork_digest)
+                    await self._host.subscribe(topic, wrapped_handler)
+                    blob_subnet_count += 1
+            subscribed_topics.append(f"blob_sidecar (6 subnets)")
+
+        fork_count = len(self._all_fork_digests)
+        logger.info(f"Subscribed to gossip topics: {subscribed_topics} ({fork_count} fork digests)")
 
     def _wrap_handler(self, handler: MessageHandler) -> MessageHandler:
         """Wrap a handler to decode incoming messages."""
@@ -192,6 +213,18 @@ class BeaconGossip:
         encoded = encode_message(contribution_ssz)
         await self._host.publish(topic, encoded)
         logger.debug(f"Published sync committee contribution: {len(contribution_ssz)} bytes")
+
+    def set_status_provider(self, provider: Callable[[], dict]) -> None:
+        """Set the status provider callback for P2P status messages.
+
+        The provider should return a dict with:
+        - head_slot: int
+        - head_root: bytes (32 bytes)
+        - finalized_epoch: int
+        - finalized_root: bytes (32 bytes)
+        - earliest_available_slot: int (optional, defaults to 0)
+        """
+        self._host.set_status_provider(provider)
 
     @property
     def peer_id(self) -> Optional[str]:

@@ -311,13 +311,45 @@ class Store:
         """Get an execution payload bid by slot."""
         return self._bid_cache.get(slot)
 
-    def save_blobs(self, block_root: bytes, slot: int, blobs_bundle: dict, kzg_commitments: list) -> None:
-        """Save blob sidecars for a block."""
+    def save_blobs(self, block_root: bytes, slot: int, blobs_bundle: dict, kzg_commitments: list, signed_block=None) -> None:
+        """Save blob sidecars for a block.
+
+        Args:
+            block_root: Root hash of the block
+            slot: Slot number
+            blobs_bundle: Dict with blobs, commitments, proofs from execution layer
+            kzg_commitments: List of KZG commitments from block body
+            signed_block: Optional signed beacon block for header info
+        """
         import json
 
         blobs = blobs_bundle.get("blobs", [])
         commitments = blobs_bundle.get("commitments", [])
         proofs = blobs_bundle.get("proofs", [])
+
+        # Extract header info from signed block if available
+        header_info = {
+            "slot": str(slot),
+            "proposer_index": "0",
+            "parent_root": "0x" + "00" * 32,
+            "state_root": "0x" + "00" * 32,
+            "body_root": "0x" + "00" * 32,
+        }
+        signature = "0x" + "00" * 96
+
+        if signed_block is not None:
+            block = signed_block.message if hasattr(signed_block, "message") else signed_block
+            if hasattr(block, "proposer_index"):
+                header_info["proposer_index"] = str(block.proposer_index)
+            if hasattr(block, "parent_root"):
+                header_info["parent_root"] = "0x" + bytes(block.parent_root).hex()
+            if hasattr(block, "state_root"):
+                header_info["state_root"] = "0x" + bytes(block.state_root).hex()
+            if hasattr(block, "body"):
+                from ..crypto import hash_tree_root
+                header_info["body_root"] = "0x" + hash_tree_root(block.body).hex()
+            if hasattr(signed_block, "signature"):
+                signature = "0x" + bytes(signed_block.signature).hex()
 
         sidecars = []
         for i in range(len(blobs)):
@@ -327,14 +359,8 @@ class Store:
                 "kzg_commitment": commitments[i] if i < len(commitments) else "0x" + "00" * 48,
                 "kzg_proof": proofs[i] if i < len(proofs) else "0x" + "00" * 48,
                 "signed_block_header": {
-                    "message": {
-                        "slot": str(slot),
-                        "proposer_index": "0",
-                        "parent_root": "0x" + "00" * 32,
-                        "state_root": "0x" + "00" * 32,
-                        "body_root": "0x" + "00" * 32,
-                    },
-                    "signature": "0x" + "00" * 96,
+                    "message": header_info,
+                    "signature": signature,
                 },
                 "kzg_commitment_inclusion_proof": ["0x" + "00" * 32] * 17,
             }

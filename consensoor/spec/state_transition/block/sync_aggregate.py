@@ -15,6 +15,7 @@ from ...constants import (
     EFFECTIVE_BALANCE_INCREMENT,
 )
 from ..helpers.accessors import get_current_epoch, get_total_active_balance, get_base_reward_per_increment
+from ..helpers.misc import compute_epoch_at_slot
 from ..helpers.domain import get_domain, compute_signing_root
 from ..helpers.beacon_committee import get_beacon_proposer_index
 from ..helpers.mutators import increase_balance, decrease_balance
@@ -53,10 +54,11 @@ def process_sync_aggregate(
     from ..helpers.accessors import get_block_root_at_slot
 
     # The signature is over the previous slot's block root
+    # Domain must use the epoch of previous_slot, not current slot (per Altair spec)
     domain = get_domain(
         state,
         DOMAIN_SYNC_COMMITTEE,
-        get_current_epoch(state),
+        compute_epoch_at_slot(previous_slot),
     )
 
     # Get the block root being signed

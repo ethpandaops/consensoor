@@ -396,6 +396,14 @@ class BlockBuilder:
             f"{participant_count}/{SYNC_COMMITTEE_SIZE()} participants, sig_is_infinity={sig_bytes == g2_infinity}"
         )
 
+        # Pre-validate sync aggregate signature before including in block
+        # This catches sync aggregates from forked chains that would fail verification
+        if participant_count > 0:
+            sync_aggregate = self._validate_sync_aggregate(state, sync_aggregate)
+            new_count = sum(1 for b in sync_aggregate.sync_committee_bits if b)
+            if new_count != participant_count:
+                logger.info(f"Sync aggregate failed validation, using empty aggregate")
+
         if attestations:
             logger.info(f"Including {len(attestations)} attestations in block body")
             for i, att in enumerate(attestations[:3]):  # Log first 3 for debugging
@@ -435,3 +443,69 @@ class BlockBuilder:
         base_fields["execution_requests"] = empty_execution_requests
 
         return ElectraBeaconBlockBody(**base_fields)
+
+    def _validate_sync_aggregate(self, state, sync_aggregate: SyncAggregate) -> SyncAggregate:
+        """Validate sync aggregate signature before including in block.
+
+        If validation fails (e.g., due to fork mismatch or stale contributions),
+        returns an empty sync aggregate with G2 infinity signature.
+
+        Args:
+            state: Beacon state
+            sync_aggregate: Sync aggregate to validate
+
+        Returns:
+            Original sync aggregate if valid, empty aggregate if invalid
+        """
+        from ..spec.state_transition.helpers.accessors import get_block_root_at_slot
+        from ..spec.state_transition.helpers.domain import get_domain, compute_signing_root
+        from ..spec.state_transition.helpers.misc import compute_epoch_at_slot
+        from ..spec.constants import DOMAIN_SYNC_COMMITTEE
+        from ..crypto import bls_verify
+
+        try:
+            # Get participant pubkeys
+            committee_pubkeys = list(state.current_sync_committee.pubkeys)
+            participant_pubkeys = [
+                committee_pubkeys[i]
+                for i in range(SYNC_COMMITTEE_SIZE())
+                if sync_aggregate.sync_committee_bits[i]
+            ]
+
+            if not participant_pubkeys:
+                return sync_aggregate
+
+            # Compute signing root (same as process_sync_aggregate)
+            previous_slot = max(int(state.slot), 1) - 1
+            domain = get_domain(
+                state,
+                DOMAIN_SYNC_COMMITTEE,
+                compute_epoch_at_slot(previous_slot),
+            )
+            block_root = get_block_root_at_slot(state, previous_slot)
+            signing_root = compute_signing_root(block_root, domain)
+
+            # Verify signature
+            sig_bytes = bytes(sync_aggregate.sync_committee_signature)
+            is_valid = bls_verify(
+                [bytes(pk) for pk in participant_pubkeys],
+                signing_root,
+                sig_bytes,
+            )
+
+            if is_valid:
+                return sync_aggregate
+
+            logger.warning(
+                f"Sync aggregate pre-validation failed: "
+                f"participants={len(participant_pubkeys)}, previous_slot={previous_slot}"
+            )
+
+        except Exception as e:
+            logger.warning(f"Error validating sync aggregate: {e}")
+
+        # Return empty sync aggregate on failure
+        return SyncAggregate(
+            sync_committee_bits=Bitvector[SYNC_COMMITTEE_SIZE()](),
+            sync_committee_signature=BLSSignature(b"\xc0" + b"\x00" * 95),
+        )

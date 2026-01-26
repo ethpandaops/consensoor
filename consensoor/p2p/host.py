@@ -94,6 +94,34 @@ class P2PHost:
         self._enr: Optional[str] = None
         self._listen_ip: Optional[str] = None
         self._private_key_bytes: Optional[bytes] = None
+        self._status_provider: Optional[Callable[[], dict]] = None
+
+    def set_status_provider(self, provider: Callable[[], dict]) -> None:
+        """Set the status provider callback.
+
+        The provider should return a dict with:
+        - head_slot: int
+        - head_root: bytes (32 bytes)
+        - finalized_epoch: int
+        - finalized_root: bytes (32 bytes)
+        - earliest_available_slot: int (optional, defaults to 0)
+        """
+        self._status_provider = provider
+
+    def _get_chain_status(self) -> dict:
+        """Get current chain status from provider or return defaults."""
+        if self._status_provider:
+            try:
+                return self._status_provider()
+            except Exception as e:
+                logger.warning(f"Status provider error: {e}")
+        return {
+            "head_slot": 0,
+            "head_root": b"\x00" * 32,
+            "finalized_epoch": 0,
+            "finalized_root": b"\x00" * 32,
+            "earliest_available_slot": 0,
+        }
 
     async def start(self) -> None:
         """Start the P2P host in a separate Trio thread."""
@@ -352,10 +380,11 @@ class P2PHost:
 
             await stream.read(1024)
 
-            finalized_root = b"\x00" * 32
-            finalized_epoch = 0
-            head_root = b"\x00" * 32
-            head_slot = 0
+            status = self._get_chain_status()
+            finalized_root = status["finalized_root"]
+            finalized_epoch = status["finalized_epoch"]
+            head_root = status["head_root"]
+            head_slot = status["head_slot"]
 
             # Status v1: 84 bytes
             # fork_digest (4) + finalized_root (32) + finalized_epoch (8) +
@@ -376,7 +405,7 @@ class P2PHost:
 
             await stream.write(response)
             await stream.close()
-            logger.debug(f"Sent status/1 response to {peer_id[:16]}...")
+            logger.debug(f"Sent status/1 response to {peer_id[:16]}: slot={head_slot}, finalized_epoch={finalized_epoch}")
 
         except Exception as e:
             logger.warning(f"Error handling status/1 request: {e}")
@@ -398,12 +427,13 @@ class P2PHost:
 
             await stream.read(1024)
 
-            finalized_root = b"\x00" * 32
-            finalized_epoch = 0
-            head_root = b"\x00" * 32
-            head_slot = 0
+            status = self._get_chain_status()
+            finalized_root = status["finalized_root"]
+            finalized_epoch = status["finalized_epoch"]
+            head_root = status["head_root"]
+            head_slot = status["head_slot"]
             custody_group_count = self.config.custody_group_count
-            earliest_available_slot = 0
+            earliest_available_slot = status.get("earliest_available_slot", 0)
 
             # Status v2: 100 bytes
             # fork_digest (4) + finalized_root (32) + finalized_epoch (8) +
@@ -427,7 +457,7 @@ class P2PHost:
 
             await stream.write(response)
             await stream.close()
-            logger.debug(f"Sent status/2 response to {peer_id[:16]} (cgc={custody_group_count})...")
+            logger.debug(f"Sent status/2 response to {peer_id[:16]}: slot={head_slot}, cgc={custody_group_count}")
 
         except Exception as e:
             logger.warning(f"Error handling status/2 request: {e}")
@@ -757,15 +787,16 @@ class P2PHost:
                     use_v2 = False
                     logger.info(f"Status/1 stream opened successfully to {peer_info.peer_id.to_base58()[:16]}")
 
-                # Build our status message
-                finalized_root = b"\x00" * 32
-                finalized_epoch = 0
-                head_root = b"\x00" * 32
-                head_slot = 0
+                # Build our status message from chain state
+                status = self._get_chain_status()
+                finalized_root = status["finalized_root"]
+                finalized_epoch = status["finalized_epoch"]
+                head_root = status["head_root"]
+                head_slot = status["head_slot"]
 
                 if use_v2:
                     custody_group_count = self.config.custody_group_count
-                    earliest_available_slot = 0
+                    earliest_available_slot = status.get("earliest_available_slot", 0)
                     status_ssz = (
                         self.config.fork_digest +
                         finalized_root +
@@ -910,7 +941,7 @@ class P2PHost:
                     if self._pubsub and topic not in self._subscriptions:
                         subscription = await self._pubsub.subscribe(topic)
                         self._subscriptions[topic] = subscription
-                        logger.info(f"Subscribed to gossipsub topic: {topic}")
+                        logger.debug(f"Subscribed to gossipsub topic: {topic}")
                         # Start a task to read messages from this subscription
                         nursery.start_soon(self._read_subscription_trio, topic, subscription)
                 except queue.Empty:

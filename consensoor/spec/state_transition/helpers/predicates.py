@@ -196,23 +196,14 @@ def is_valid_indexed_attestation(
         target_epoch,
     )
 
-    # Debug: log domain computation details
-    fork_version = bytes(state.fork.current_version) if target_epoch >= int(state.fork.epoch) else bytes(state.fork.previous_version)
-    genesis_root = bytes(state.genesis_validators_root)
-    data_root = hash_tree_root(indexed_attestation.data)
-    logger.debug(
-        f"IndexedAttestation verify: target_epoch={target_epoch}, "
-        f"fork_epoch={state.fork.epoch}, fork_version={fork_version.hex()}, "
-        f"genesis_root={genesis_root.hex()[:16]}, domain={domain.hex()[:16]}, "
-        f"data_root={data_root.hex()[:16]}"
-    )
-
     signing_root = compute_signing_root(indexed_attestation.data, domain)
 
     sig_valid = bls_verify(pubkeys, signing_root, bytes(indexed_attestation.signature))
     if not sig_valid:
         # Log detailed attestation data for debugging
         att_data = indexed_attestation.data
+        fork_version = bytes(state.fork.current_version) if target_epoch >= int(state.fork.epoch) else bytes(state.fork.previous_version)
+        data_root = hash_tree_root(indexed_attestation.data)
         logger.warning(
             f"BLS FAILED: slot={att_data.slot}, index={att_data.index}, "
             f"bbr={bytes(att_data.beacon_block_root).hex()[:16]}, "

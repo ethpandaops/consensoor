@@ -28,6 +28,33 @@ from .math import integer_squareroot
 if TYPE_CHECKING:
     from ...types import BeaconState, Attestation, IndexedAttestation, AttestationData
 
+# Cache for unslashed participating indices (keyed by (slot, flag_index, epoch))
+_unslashed_participating_cache: dict[tuple[int, int, int], Set[int]] = {}
+_active_validator_indices_cache: dict[tuple[int, int], list[int]] = {}
+_CACHE_MAX_SIZE = 64
+
+
+def _trim_cache(cache: dict) -> None:
+    """Trim cache to prevent unbounded growth."""
+    if len(cache) > _CACHE_MAX_SIZE:
+        keys_to_remove = list(cache.keys())[: len(cache) - _CACHE_MAX_SIZE // 2]
+        for key in keys_to_remove:
+            del cache[key]
+
+
+def _get_active_validator_indices_cached(state: "BeaconState", epoch: int) -> list[int]:
+    """Cached version of active validator indices lookup."""
+    slot = int(state.slot)
+    key = (slot, epoch)
+    if key in _active_validator_indices_cache:
+        return _active_validator_indices_cache[key]
+
+    result = [i for i, v in enumerate(state.validators) if is_active_validator(v, epoch)]
+
+    _active_validator_indices_cache[key] = result
+    _trim_cache(_active_validator_indices_cache)
+    return result
+
 
 def is_attestation_same_slot(state: "BeaconState", data: "AttestationData") -> bool:
     """Check if the attestation is for the block proposed at the attestation slot."""
@@ -237,6 +264,12 @@ def get_unslashed_participating_indices(
     Returns:
         Set of unslashed validator indices with the flag set
     """
+    # Check cache first
+    slot = int(state.slot)
+    cache_key = (slot, flag_index, epoch)
+    if cache_key in _unslashed_participating_cache:
+        return _unslashed_participating_cache[cache_key]
+
     previous_epoch = get_previous_epoch(state)
     current_epoch = get_current_epoch(state)
 
@@ -250,11 +283,10 @@ def get_unslashed_participating_indices(
         else:
             epoch_participation = state.previous_epoch_participation
 
-        active_validator_indices = [
-            i for i, v in enumerate(state.validators) if is_active_validator(v, epoch)
-        ]
+        # Use cached active validator indices
+        active_validator_indices = _get_active_validator_indices_cached(state, epoch)
 
-        return set(
+        result = set(
             i
             for i in active_validator_indices
             if has_flag(int(epoch_participation[i]), flag_index)
@@ -262,7 +294,11 @@ def get_unslashed_participating_indices(
         )
     else:
         # Phase0 path: use PendingAttestation objects
-        return get_unslashed_participating_indices_phase0(state, flag_index, epoch)
+        result = get_unslashed_participating_indices_phase0(state, flag_index, epoch)
+
+    _unslashed_participating_cache[cache_key] = result
+    _trim_cache(_unslashed_participating_cache)
+    return result
 
 
 def get_unslashed_participating_indices_phase0(

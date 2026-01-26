@@ -39,6 +39,21 @@ from ....crypto import sha256
 if TYPE_CHECKING:
     from ...types import BeaconState, Validator
 
+# Cache for expensive epoch-level computations (keyed by state slot)
+_total_active_balance_cache: dict[int, int] = {}
+_base_reward_per_increment_cache: dict[int, int] = {}
+_eligible_validator_indices_cache: dict[int, list[int]] = {}
+_CACHE_MAX_SIZE = 64
+
+
+def _trim_cache(cache: dict) -> None:
+    """Trim cache to prevent unbounded growth."""
+    if len(cache) > _CACHE_MAX_SIZE:
+        # Remove oldest entries (arbitrary order in Python 3.7+)
+        keys_to_remove = list(cache.keys())[: len(cache) - _CACHE_MAX_SIZE // 2]
+        for key in keys_to_remove:
+            del cache[key]
+
 
 def get_current_epoch(state: "BeaconState") -> int:
     """Return the current epoch of the state.
@@ -260,9 +275,17 @@ def get_total_active_balance(state: "BeaconState") -> int:
     Returns:
         Total active balance
     """
-    return get_total_balance(
+    slot = int(state.slot)
+    if slot in _total_active_balance_cache:
+        return _total_active_balance_cache[slot]
+
+    result = get_total_balance(
         state, set(get_active_validator_indices(state, get_current_epoch(state)))
     )
+
+    _total_active_balance_cache[slot] = result
+    _trim_cache(_total_active_balance_cache)
+    return result
 
 
 def get_base_reward_per_increment(state: "BeaconState") -> int:
@@ -274,11 +297,19 @@ def get_base_reward_per_increment(state: "BeaconState") -> int:
     Returns:
         Base reward per increment in Gwei
     """
-    return (
+    slot = int(state.slot)
+    if slot in _base_reward_per_increment_cache:
+        return _base_reward_per_increment_cache[slot]
+
+    result = (
         EFFECTIVE_BALANCE_INCREMENT
         * BASE_REWARD_FACTOR
         // integer_squareroot(get_total_active_balance(state))
     )
+
+    _base_reward_per_increment_cache[slot] = result
+    _trim_cache(_base_reward_per_increment_cache)
+    return result
 
 
 def get_base_reward(state: "BeaconState", index: int) -> int:
@@ -364,13 +395,21 @@ def get_eligible_validator_indices(state: "BeaconState") -> Sequence[int]:
     Returns:
         Sequence of eligible validator indices
     """
+    slot = int(state.slot)
+    if slot in _eligible_validator_indices_cache:
+        return _eligible_validator_indices_cache[slot]
+
     previous_epoch = get_previous_epoch(state)
-    return [
+    result = [
         i
         for i, v in enumerate(state.validators)
         if is_active_validator(v, previous_epoch)
         or (v.slashed and previous_epoch + 1 < int(v.withdrawable_epoch))
     ]
+
+    _eligible_validator_indices_cache[slot] = result
+    _trim_cache(_eligible_validator_indices_cache)
+    return result
 
 
 def get_max_effective_balance(validator: "Validator") -> int:

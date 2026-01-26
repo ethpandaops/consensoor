@@ -25,7 +25,17 @@ from .spec.types import (
     PayloadAttestationMessage,
     Attestation,
     SignedElectraBeaconBlock,
+    BLSSignature,
+    Eth1Data,
 )
+from .spec.types.electra import (
+    ElectraBeaconBlock,
+    ElectraBeaconBlockBody,
+    ExecutionRequests,
+)
+from .spec.types.altair import SyncAggregate
+from .spec.types.deneb import ExecutionPayload
+from .spec.types.base import Bytes32
 from .spec.types.bellatrix import SignedBellatrixBeaconBlock
 from .spec.types.capella import SignedCapellaBeaconBlock
 from .spec.types.deneb import SignedDenebBeaconBlock
@@ -301,6 +311,37 @@ class BeaconNode:
         self.store.set_head(self.head_root)
         logger.info(f"Genesis block root: {self.head_root.hex()}")
 
+        # Create and save genesis block for API compatibility
+        # The genesis block body is empty with default values
+        genesis_body = ElectraBeaconBlockBody(
+            randao_reveal=BLSSignature(b'\x00' * 96),
+            eth1_data=Eth1Data(),
+            graffiti=Bytes32(b'\x00' * 32),
+            proposer_slashings=[],
+            attester_slashings=[],
+            attestations=[],
+            deposits=[],
+            voluntary_exits=[],
+            sync_aggregate=SyncAggregate(),
+            execution_payload=ExecutionPayload(),
+            bls_to_execution_changes=[],
+            blob_kzg_commitments=[],
+            execution_requests=ExecutionRequests(),
+        )
+        genesis_block = ElectraBeaconBlock(
+            slot=int(header.slot),
+            proposer_index=int(header.proposer_index),
+            parent_root=header.parent_root,
+            state_root=genesis_state_root,
+            body=genesis_body,
+        )
+        signed_genesis_block = SignedElectraBeaconBlock(
+            message=genesis_block,
+            signature=BLSSignature(b'\x00' * 96),
+        )
+        self.store.save_block(self.head_root, signed_genesis_block)
+        logger.info(f"Saved genesis block to store")
+
         # Update metrics
         from .spec import constants
         epoch = self.head_slot // constants.SLOTS_PER_EPOCH()
@@ -428,6 +469,8 @@ class BeaconNode:
             self.beacon_gossip.subscribe_blocks(self._on_p2p_block)
             self.beacon_gossip.subscribe_aggregates(self._on_p2p_aggregate)
             self.beacon_gossip.subscribe_sync_committee_contributions(self._on_p2p_sync_committee_contribution)
+            self.beacon_gossip.subscribe_blob_sidecars(self._on_p2p_blob_sidecar)
+            self.beacon_gossip.set_status_provider(self._get_chain_status)
 
             await self.beacon_gossip.start()
             await self.beacon_gossip.activate_subscriptions()
@@ -443,6 +486,42 @@ class BeaconNode:
         except Exception as e:
             logger.error(f"Failed to start P2P: {e}")
             self.beacon_gossip = None
+
+    def _get_chain_status(self) -> dict:
+        """Get current chain status for P2P status messages.
+
+        Returns a dict with head_slot, head_root, finalized_epoch,
+        finalized_root, and earliest_available_slot.
+        """
+        from .crypto import hash_tree_root
+
+        head_slot = 0
+        head_root = b"\x00" * 32
+        finalized_epoch = 0
+        finalized_root = b"\x00" * 32
+
+        if self.state:
+            head_slot = int(self.state.slot)
+            finalized_epoch = int(self.state.finalized_checkpoint.epoch)
+            finalized_root = bytes(self.state.finalized_checkpoint.root)
+
+        if self.head_root:
+            head_root = self.head_root
+        elif self.state:
+            head_root = hash_tree_root(self.state.latest_block_header)
+
+        if self.store.finalized_root and self.store.finalized_root != b"\x00" * 32:
+            finalized_root = self.store.finalized_root
+        if self.store.finalized_epoch > 0:
+            finalized_epoch = self.store.finalized_epoch
+
+        return {
+            "head_slot": head_slot,
+            "head_root": head_root,
+            "finalized_epoch": finalized_epoch,
+            "finalized_root": finalized_root,
+            "earliest_available_slot": 0,
+        }
 
     def _get_next_fork_info(self, net_config, current_epoch: int) -> tuple[bytes, int]:
         """Get the next scheduled fork version and epoch.
@@ -1326,7 +1405,7 @@ class BeaconNode:
                 kzg_commitments = []
                 if hasattr(block.body, "blob_kzg_commitments"):
                     kzg_commitments = [bytes(c) for c in block.body.blob_kzg_commitments]
-                self.store.save_blobs(block_root, slot, payload_response.blobs_bundle, kzg_commitments)
+                self.store.save_blobs(block_root, slot, payload_response.blobs_bundle, kzg_commitments, signed_block)
                 logger.info(f"Saved {len(versioned_hashes)} blob sidecars for block at slot {slot}")
 
             self.head_slot = slot
@@ -1617,6 +1696,80 @@ class BeaconNode:
             )
         except Exception as e:
             logger.error(f"Error processing P2P sync committee contribution: {e}")
+
+    async def _on_p2p_blob_sidecar(self, data: bytes, from_peer: str) -> None:
+        """Handle a blob sidecar received via libp2p gossipsub."""
+        try:
+            from .spec.types.deneb import BlobSidecar
+
+            sidecar = BlobSidecar.decode_bytes(data)
+            slot = int(sidecar.signed_block_header.message.slot)
+            index = int(sidecar.index)
+            block_root = bytes(sidecar.signed_block_header.message.parent_root)
+
+            # Compute the block root from the header
+            block_header = sidecar.signed_block_header.message
+            block_root = hash_tree_root(block_header)
+
+            logger.info(
+                f"P2P: Received blob sidecar slot={slot}, index={index}, "
+                f"block_root={block_root.hex()[:16]}, from={from_peer[:16]}"
+            )
+
+            # Store the blob sidecar
+            self._store_received_blob_sidecar(block_root, slot, sidecar)
+
+        except Exception as e:
+            logger.error(f"Error processing P2P blob sidecar: {e}")
+
+    def _store_received_blob_sidecar(self, block_root: bytes, slot: int, sidecar) -> None:
+        """Store a received blob sidecar in the store."""
+        # Get existing blobs for this block (if any)
+        existing_blobs = self.store.get_blobs(block_root)
+
+        # Convert sidecar to JSON format for storage
+        index = int(sidecar.index)
+
+        sidecar_json = {
+            "index": str(index),
+            "blob": "0x" + bytes(sidecar.blob).hex(),
+            "kzg_commitment": "0x" + bytes(sidecar.kzg_commitment).hex(),
+            "kzg_proof": "0x" + bytes(sidecar.kzg_proof).hex(),
+            "signed_block_header": {
+                "message": {
+                    "slot": str(sidecar.signed_block_header.message.slot),
+                    "proposer_index": str(sidecar.signed_block_header.message.proposer_index),
+                    "parent_root": "0x" + bytes(sidecar.signed_block_header.message.parent_root).hex(),
+                    "state_root": "0x" + bytes(sidecar.signed_block_header.message.state_root).hex(),
+                    "body_root": "0x" + bytes(sidecar.signed_block_header.message.body_root).hex(),
+                },
+                "signature": "0x" + bytes(sidecar.signed_block_header.signature).hex(),
+            },
+            "kzg_commitment_inclusion_proof": [
+                "0x" + bytes(p).hex() for p in sidecar.kzg_commitment_inclusion_proof
+            ],
+        }
+
+        # Check if we already have this blob index
+        existing_indices = {int(b["index"]) for b in existing_blobs}
+        if index in existing_indices:
+            return  # Already have this blob
+
+        # Add to existing blobs
+        updated_blobs = existing_blobs + [sidecar_json]
+        updated_blobs.sort(key=lambda b: int(b["index"]))
+
+        # Store directly in the store's blob cache and DB
+        import json
+        from .store.store import PREFIX_BLOBS
+
+        self.store._blob_cache[block_root] = updated_blobs
+        try:
+            data = json.dumps(updated_blobs).encode()
+            self.store._db.put(PREFIX_BLOBS + block_root, data)
+            logger.info(f"Stored blob sidecar: slot={slot}, index={index}, block_root={block_root.hex()[:16]}")
+        except Exception as e:
+            logger.warning(f"Failed to persist blob sidecar to LevelDB: {e}")
 
     async def _apply_block_to_state(self, block, block_root: bytes, signed_block=None) -> None:
         """Apply a received block to the local state using full state transition.
