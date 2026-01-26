@@ -16,7 +16,7 @@ Built for the Gloas fork (ePBS - Enshrined Proposer-Builder Separation).
 - Supports both mainnet and minimal presets
 - Auto-fetches upstream config from ethereum/consensus-specs if not provided
 - Designed for Kurtosis local devnets
-- Dynamic graffiti with EL+CL version encoding (Prysm-style)
+- Dynamic graffiti with EL+CL version encoding
 - Automatic git version injection via setuptools_scm
 - Prometheus metrics for monitoring
 - LevelDB-backed persistent storage
@@ -125,15 +125,20 @@ consensoor/
 │   ├── constants.py    # Preset values organized by fork
 │   └── network_config.py   # Runtime config from YAML or upstream
 ├── crypto/             # BLS signatures (blspy), hashing
+│   └── crypto.py       # BLS sign/verify, hash_tree_root
 ├── p2p/                # libp2p networking
 │   ├── host.py         # P2P host with ENR generation
 │   ├── gossip.py       # Beacon gossip topics
 │   └── encoding.py     # Message encoding (snappy)
 ├── network/            # UDP gossip layer (legacy)
+│   └── gossip.py       # Simple UDP gossip for local testing
 ├── engine/             # Engine API client
 │   ├── types.py        # Payload types and responses
 │   └── client.py       # JSON-RPC client
 ├── store/              # State and block storage (LevelDB)
+│   └── store.py        # LevelDB-backed persistent store
+├── metrics/            # Prometheus metrics
+│   └── metrics.py      # Metric definitions and helpers
 ├── validator/          # Validator duties
 │   ├── types.py        # ValidatorKey, ProposerDuty, etc.
 │   ├── shuffling.py    # Proposer selection algorithms
@@ -147,6 +152,7 @@ consensoor/
 ├── beacon_sync/        # State synchronization
 │   ├── client.py       # Remote beacon client (SSE)
 │   └── sync.py         # State sync manager
+├── version.py          # Version info and graffiti builder
 ├── node.py             # Main orchestration
 ├── config.py           # Node configuration
 └── cli.py              # CLI entry point
