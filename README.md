@@ -16,6 +16,10 @@ Built for the Gloas fork (ePBS - Enshrined Proposer-Builder Separation).
 - Supports both mainnet and minimal presets
 - Auto-fetches upstream config from ethereum/consensus-specs if not provided
 - Designed for Kurtosis local devnets
+- Dynamic graffiti with EL+CL version encoding (Prysm-style)
+- Automatic git version injection via setuptools_scm
+- Prometheus metrics for monitoring
+- LevelDB-backed persistent storage
 
 ## Requirements
 
@@ -83,6 +87,34 @@ docker run consensoor run \
   --engine-api-url http://el:8551 \
   --preset minimal
 ```
+
+The Docker build automatically embeds the git commit hash via `setuptools_scm`. This enables:
+- Automatic version tracking in logs and metrics
+- EL+CL version graffiti (see below)
+
+## Graffiti with Version Encoding
+
+Consensoor encodes EL and CL client version info in the block graffiti:
+
+```
+GEabcdCOxxxx consensoor
+│ │    │ │
+│ │    │ └── CL commit (first 4 chars)
+│ │    └──── CL client code (CO = consensoor)
+│ └───────── EL commit (first 4 chars)
+└─────────── EL client code (GE = Geth, RH = Reth, etc.)
+```
+
+**Client codes:**
+| Code | EL Client | Code | CL Client |
+|------|-----------|------|-----------|
+| GE | Geth | CO | Consensoor |
+| NM | Nethermind | LH | Lighthouse |
+| BU | Besu | PR | Prysm |
+| ER | Erigon | TK | Teku |
+| RH | Reth | NB | Nimbus |
+
+The EL client info is obtained via `engine_getClientVersionV1`. If unavailable, only the CL info is included.
 
 ## Architecture
 

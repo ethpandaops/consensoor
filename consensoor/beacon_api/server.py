@@ -39,16 +39,23 @@ class BeaconAPI:
         self.app.router.add_get("/eth/v1/node/peers", self.get_peers)
         self.app.router.add_get("/eth/v1/beacon/genesis", self.get_genesis)
         self.app.router.add_get("/eth/v1/beacon/states/{state_id}/root", self.get_state_root)
+        self.app.router.add_get("/eth/v1/beacon/states/{state_id}/fork", self.get_state_fork)
         self.app.router.add_get("/eth/v1/beacon/states/{state_id}/finality_checkpoints", self.get_finality_checkpoints)
         self.app.router.add_get("/eth/v1/beacon/states/{state_id}/validators", self.get_validators)
         self.app.router.add_get("/eth/v1/beacon/states/{state_id}/validators/{validator_id}", self.get_validator)
         self.app.router.add_get("/eth/v1/beacon/states/{state_id}/validator_balances", self.get_validator_balances)
+        self.app.router.add_get("/eth/v1/beacon/states/{state_id}/committees", self.get_committees)
+        self.app.router.add_get("/eth/v1/beacon/states/{state_id}/sync_committees", self.get_sync_committees)
+        self.app.router.add_get("/eth/v1/beacon/states/{state_id}/randao", self.get_randao)
         self.app.router.add_get("/eth/v1/beacon/headers", self.get_headers)
         self.app.router.add_get("/eth/v1/beacon/headers/{block_id}", self.get_header)
         self.app.router.add_get("/eth/v2/beacon/blocks/{block_id}", self.get_block)
+        self.app.router.add_get("/eth/v1/beacon/blocks/{block_id}/root", self.get_block_root)
         self.app.router.add_get("/eth/v1/beacon/blob_sidecars/{block_id}", self.get_blob_sidecars)
         self.app.router.add_get("/eth/v2/debug/beacon/states/{state_id}", self.get_debug_state)
         self.app.router.add_get("/eth/v1/config/spec", self.get_spec)
+        self.app.router.add_get("/eth/v1/config/fork_schedule", self.get_fork_schedule)
+        self.app.router.add_get("/eth/v1/config/deposit_contract", self.get_deposit_contract)
         self.app.router.add_get("/eth/v1/events", self.get_events)
 
     async def start(self):
@@ -179,6 +186,43 @@ class BeaconAPI:
                 "data": {"root": "0x" + self.node.head_root.hex()}
             })
         return web.json_response({"message": "State not found"}, status=404)
+
+    async def get_state_fork(self, request: web.Request) -> web.Response:
+        """GET /eth/v1/beacon/states/{state_id}/fork"""
+        state_id = request.match_info["state_id"]
+        state = self._resolve_state(state_id)
+        if state is None:
+            return web.json_response({"message": "State not found"}, status=404)
+
+        return web.json_response({
+            "execution_optimistic": False,
+            "finalized": False,
+            "data": {
+                "previous_version": "0x" + bytes(state.fork.previous_version).hex(),
+                "current_version": "0x" + bytes(state.fork.current_version).hex(),
+                "epoch": str(state.fork.epoch),
+            }
+        })
+
+    def _resolve_state(self, state_id: str):
+        """Resolve state_id to a state object."""
+        if state_id == "head":
+            return self.node.state
+        if state_id == "finalized":
+            return self.node.state
+        if state_id == "justified":
+            return self.node.state
+        if state_id == "genesis":
+            return self.node.store.get_state_by_slot(0)
+        if state_id.startswith("0x"):
+            root = bytes.fromhex(state_id[2:])
+            return self.node.store.get_state(root)
+        try:
+            slot = int(state_id)
+            return self.node.store.get_state_by_slot(slot)
+        except ValueError:
+            pass
+        return None
 
     async def get_finality_checkpoints(self, request: web.Request) -> web.Response:
         """GET /eth/v1/beacon/states/{state_id}/finality_checkpoints"""
@@ -368,6 +412,115 @@ class BeaconAPI:
             "data": balances_data
         })
 
+    async def get_committees(self, request: web.Request) -> web.Response:
+        """GET /eth/v1/beacon/states/{state_id}/committees"""
+        state_id = request.match_info["state_id"]
+        state = self._resolve_state(state_id)
+        if state is None:
+            return web.json_response({"message": "State not found"}, status=404)
+
+        from ..spec.constants import SLOTS_PER_EPOCH
+        from ..spec.state_transition.helpers.beacon_committee import get_beacon_committee
+
+        epoch_param = request.query.get("epoch")
+        index_param = request.query.get("index")
+        slot_param = request.query.get("slot")
+
+        current_epoch = int(state.slot) // SLOTS_PER_EPOCH()
+        target_epoch = int(epoch_param) if epoch_param else current_epoch
+
+        committees_data = []
+        start_slot = target_epoch * SLOTS_PER_EPOCH()
+        end_slot = start_slot + SLOTS_PER_EPOCH()
+
+        for slot in range(start_slot, end_slot):
+            if slot_param and int(slot_param) != slot:
+                continue
+
+            committee_count = max(1, len(state.validators) // 32 // SLOTS_PER_EPOCH())
+            for committee_index in range(committee_count):
+                if index_param and int(index_param) != committee_index:
+                    continue
+
+                try:
+                    committee = get_beacon_committee(state, slot, committee_index)
+                    committees_data.append({
+                        "index": str(committee_index),
+                        "slot": str(slot),
+                        "validators": [str(v) for v in committee],
+                    })
+                except Exception:
+                    pass
+
+        return web.json_response({
+            "execution_optimistic": False,
+            "finalized": False,
+            "data": committees_data
+        })
+
+    async def get_sync_committees(self, request: web.Request) -> web.Response:
+        """GET /eth/v1/beacon/states/{state_id}/sync_committees"""
+        state_id = request.match_info["state_id"]
+        state = self._resolve_state(state_id)
+        if state is None:
+            return web.json_response({"message": "State not found"}, status=404)
+
+        if not hasattr(state, "current_sync_committee"):
+            return web.json_response({"message": "Sync committees not available for this fork"}, status=400)
+
+        from ..spec.constants import SYNC_COMMITTEE_SIZE, SYNC_COMMITTEE_SUBNET_COUNT
+
+        sync_committee = state.current_sync_committee
+        all_pubkeys = {bytes(v.pubkey): i for i, v in enumerate(state.validators)}
+
+        validators = []
+        for pubkey in sync_committee.pubkeys:
+            pk_bytes = bytes(pubkey)
+            if pk_bytes in all_pubkeys:
+                validators.append(str(all_pubkeys[pk_bytes]))
+            else:
+                validators.append("0")
+
+        subcommittee_size = SYNC_COMMITTEE_SIZE() // SYNC_COMMITTEE_SUBNET_COUNT
+        validator_aggregates = []
+        for i in range(SYNC_COMMITTEE_SUBNET_COUNT):
+            start = i * subcommittee_size
+            end = start + subcommittee_size
+            validator_aggregates.append(validators[start:end])
+
+        return web.json_response({
+            "execution_optimistic": False,
+            "finalized": False,
+            "data": {
+                "validators": validators,
+                "validator_aggregates": validator_aggregates,
+            }
+        })
+
+    async def get_randao(self, request: web.Request) -> web.Response:
+        """GET /eth/v1/beacon/states/{state_id}/randao"""
+        state_id = request.match_info["state_id"]
+        state = self._resolve_state(state_id)
+        if state is None:
+            return web.json_response({"message": "State not found"}, status=404)
+
+        from ..spec.constants import SLOTS_PER_EPOCH, EPOCHS_PER_HISTORICAL_VECTOR
+
+        epoch_param = request.query.get("epoch")
+        current_epoch = int(state.slot) // SLOTS_PER_EPOCH()
+        target_epoch = int(epoch_param) if epoch_param else current_epoch
+
+        randao_index = target_epoch % EPOCHS_PER_HISTORICAL_VECTOR()
+        randao_mix = bytes(state.randao_mixes[randao_index])
+
+        return web.json_response({
+            "execution_optimistic": False,
+            "finalized": False,
+            "data": {
+                "randao": "0x" + randao_mix.hex(),
+            }
+        })
+
     async def get_headers(self, request: web.Request) -> web.Response:
         """GET /eth/v1/beacon/headers
 
@@ -552,6 +705,22 @@ class BeaconAPI:
             "data": block_json,
         })
 
+    async def get_block_root(self, request: web.Request) -> web.Response:
+        """GET /eth/v1/beacon/blocks/{block_id}/root"""
+        block_id = request.match_info["block_id"]
+        root, signed_block = self._resolve_block_id(block_id)
+
+        if root is None:
+            return web.json_response({"message": "Block not found"}, status=404)
+
+        return web.json_response({
+            "execution_optimistic": False,
+            "finalized": False,
+            "data": {
+                "root": "0x" + root.hex(),
+            }
+        })
+
     async def get_blob_sidecars(self, request: web.Request) -> web.Response:
         """GET /eth/v1/beacon/blob_sidecars/{block_id}"""
         block_id = request.match_info["block_id"]
@@ -680,6 +849,84 @@ class BeaconAPI:
         """GET /eth/v1/config/spec"""
         spec = build_spec_response()
         return web.json_response({"data": spec})
+
+    async def get_fork_schedule(self, request: web.Request) -> web.Response:
+        """GET /eth/v1/config/fork_schedule"""
+        from ..spec.network_config import get_config
+        config = get_config()
+
+        forks = []
+
+        if hasattr(config, 'genesis_fork_version'):
+            forks.append({
+                "previous_version": "0x" + config.genesis_fork_version.hex(),
+                "current_version": "0x" + config.genesis_fork_version.hex(),
+                "epoch": "0",
+            })
+
+        if hasattr(config, 'altair_fork_epoch') and hasattr(config, 'altair_fork_version'):
+            forks.append({
+                "previous_version": "0x" + config.genesis_fork_version.hex(),
+                "current_version": "0x" + config.altair_fork_version.hex(),
+                "epoch": str(config.altair_fork_epoch),
+            })
+
+        if hasattr(config, 'bellatrix_fork_epoch') and hasattr(config, 'bellatrix_fork_version'):
+            prev = config.altair_fork_version if hasattr(config, 'altair_fork_version') else config.genesis_fork_version
+            forks.append({
+                "previous_version": "0x" + prev.hex(),
+                "current_version": "0x" + config.bellatrix_fork_version.hex(),
+                "epoch": str(config.bellatrix_fork_epoch),
+            })
+
+        if hasattr(config, 'capella_fork_epoch') and hasattr(config, 'capella_fork_version'):
+            prev = config.bellatrix_fork_version if hasattr(config, 'bellatrix_fork_version') else config.genesis_fork_version
+            forks.append({
+                "previous_version": "0x" + prev.hex(),
+                "current_version": "0x" + config.capella_fork_version.hex(),
+                "epoch": str(config.capella_fork_epoch),
+            })
+
+        if hasattr(config, 'deneb_fork_epoch') and hasattr(config, 'deneb_fork_version'):
+            prev = config.capella_fork_version if hasattr(config, 'capella_fork_version') else config.genesis_fork_version
+            forks.append({
+                "previous_version": "0x" + prev.hex(),
+                "current_version": "0x" + config.deneb_fork_version.hex(),
+                "epoch": str(config.deneb_fork_epoch),
+            })
+
+        if hasattr(config, 'electra_fork_epoch') and hasattr(config, 'electra_fork_version'):
+            prev = config.deneb_fork_version if hasattr(config, 'deneb_fork_version') else config.genesis_fork_version
+            forks.append({
+                "previous_version": "0x" + prev.hex(),
+                "current_version": "0x" + config.electra_fork_version.hex(),
+                "epoch": str(config.electra_fork_epoch),
+            })
+
+        if hasattr(config, 'fulu_fork_epoch') and hasattr(config, 'fulu_fork_version'):
+            prev = config.electra_fork_version if hasattr(config, 'electra_fork_version') else config.genesis_fork_version
+            forks.append({
+                "previous_version": "0x" + prev.hex(),
+                "current_version": "0x" + config.fulu_fork_version.hex(),
+                "epoch": str(config.fulu_fork_epoch),
+            })
+
+        return web.json_response({"data": forks})
+
+    async def get_deposit_contract(self, request: web.Request) -> web.Response:
+        """GET /eth/v1/config/deposit_contract"""
+        from ..spec.network_config import get_config
+        config = get_config()
+
+        chain_id = getattr(config, 'deposit_chain_id', 1)
+        address = getattr(config, 'deposit_contract_address', b'\x00' * 20)
+
+        return web.json_response({
+            "data": {
+                "chain_id": str(chain_id),
+                "address": "0x" + (address.hex() if isinstance(address, bytes) else address),
+            }
+        })
 
     def _get_state_version(self, state) -> str:
         """Determine the fork version string for a state."""
