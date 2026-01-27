@@ -550,13 +550,22 @@ class BeaconAPI:
     def _resolve_block_id(self, block_id: str) -> tuple[Optional[bytes], Optional[object]]:
         """Resolve a block_id to (root, signed_block).
 
-        Supports: "head", "finalized", "0x..." (root), slot number.
+        Supports: "head", "genesis", "finalized", "0x..." (root), slot number.
         Returns (None, None) if not found.
         """
         if block_id == "head":
             if self.node.head_root:
                 block = self.node.store.get_block(self.node.head_root)
                 return self.node.head_root, block
+            return None, None
+
+        if block_id == "genesis":
+            block = self.node.store.get_block_by_slot(0)
+            if block:
+                from ..crypto import hash_tree_root
+                msg = block.message if hasattr(block, "message") else block
+                root = hash_tree_root(msg)
+                return root, block
             return None, None
 
         if block_id == "finalized":

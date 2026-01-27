@@ -12,7 +12,10 @@ from .phase0 import Validator, Eth1Data, BeaconBlockHeader, SignedBeaconBlockHea
 from .altair import SyncCommittee
 from .capella import HistoricalSummary
 from .deneb import ExecutionPayloadHeader
-from .electra import PendingDeposit, PendingPartialWithdrawal, PendingConsolidation
+from .electra import (
+    PendingDeposit, PendingPartialWithdrawal, PendingConsolidation,
+    SignedElectraBeaconBlock, ElectraBeaconBlock, ElectraBeaconBlockBody,
+)
 from ..constants import (
     SLOTS_PER_EPOCH,
     SLOTS_PER_HISTORICAL_ROOT,
@@ -109,11 +112,20 @@ class FuluBeaconState(Container):
     proposer_lookahead: Vector[ValidatorIndex, proposer_lookahead_length()]
 
 
+# Fulu reuses Electra block format (only state is different)
+FuluBeaconBlockBody = ElectraBeaconBlockBody
+FuluBeaconBlock = ElectraBeaconBlock
+FuluSignedBeaconBlock = SignedElectraBeaconBlock
+
+
 __all__ = [
     "Cell",
     "DataColumnSidecar",
     "DataColumnsByRootIdentifier",
     "MatrixEntry",
     "FuluBeaconState",
+    "FuluBeaconBlockBody",
+    "FuluBeaconBlock",
+    "FuluSignedBeaconBlock",
     "proposer_lookahead_length",
 ]

@@ -204,6 +204,14 @@ class BeaconGossip:
         """Publish a signed beacon block."""
         topic = get_topic_name(BEACON_BLOCK_TOPIC, self.fork_digest)
         encoded = encode_message(block_ssz)
+
+        # Debug: Log mesh state before publishing
+        mesh_info = self._host.get_mesh_info(topic)
+        logger.info(
+            f"Publishing block: topic={topic}, ssz_size={len(block_ssz)}, "
+            f"compressed_size={len(encoded)}, mesh_peers={mesh_info}"
+        )
+
         await self._host.publish(topic, encoded)
         logger.info(f"Published block: {len(block_ssz)} bytes (topic={topic})")
 
@@ -241,3 +249,16 @@ class BeaconGossip:
     def peer_count(self) -> int:
         """Get the number of connected peers."""
         return self._host.peer_count
+
+    async def request_blocks_by_range(self, start_slot: int, count: int, timeout: float = 15.0) -> list[bytes]:
+        """Request blocks by range from a peer via req/resp.
+
+        Args:
+            start_slot: First slot to request
+            count: Number of slots to request
+            timeout: Timeout in seconds
+
+        Returns:
+            List of SSZ-encoded signed beacon blocks
+        """
+        return await self._host.request_blocks_by_range(start_slot, count, timeout)

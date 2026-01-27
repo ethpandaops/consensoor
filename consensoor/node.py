@@ -186,6 +186,7 @@ class BeaconNode:
         self._genesis_time: int = 0
         self._slot_ticker_task: Optional[asyncio.Task] = None
         self._current_payload_id: Optional[bytes] = None
+        self._current_payload_beacon_root: Optional[bytes] = None  # Store head_root used in forkchoiceUpdated
         self._fork_digest_override: Optional[bytes] = None  # For devnets with custom fork digests
 
     async def start(self) -> None:
@@ -307,6 +308,10 @@ class BeaconNode:
         self.head_root = hash_tree_root(genesis_block_header)
         self.head_slot = int(self.state.slot)
         self._genesis_time = int(self.state.genesis_time)
+
+        # Save genesis block root and state for potential reorg handling
+        self._genesis_block_root = self.head_root
+        self._genesis_state = self.state.__class__.decode_bytes(bytes(self.state.encode_bytes()))
 
         self.store.save_state(self.head_root, self.state)
         self.store.set_head(self.head_root)
@@ -775,10 +780,14 @@ class BeaconNode:
                 "parentBeaconBlockRoot": "0x" + (self.head_root or b"\x00" * 32).hex(),
             }
 
+            # Debug: compare head_root with hash of latest_block_header
+            latest_header_hash = hash_tree_root(self.state.latest_block_header)
             logger.info(
                 f"Requesting payload for slot {slot}: head_hash={head_block_hash.hex()[:16]}, "
                 f"timestamp={timestamp}, prev_randao={prev_randao.hex()[:16]}, "
-                f"state_slot={self.state.slot}, target_epoch={target_epoch}, current_epoch={current_epoch}"
+                f"state_slot={self.state.slot}, target_epoch={target_epoch}, current_epoch={current_epoch}, "
+                f"head_root={self.head_root.hex()[:16] if self.head_root else 'None'}, "
+                f"latest_header_hash={latest_header_hash.hex()[:16]}"
             )
 
             response = await self.engine.forkchoice_updated(
@@ -788,15 +797,19 @@ class BeaconNode:
             if response.payload_id:
                 logger.info(f"Got fresh payload_id for slot {slot}: {response.payload_id.hex()}")
                 self._current_payload_id = response.payload_id
+                # Store the beacon root used in this forkchoiceUpdated for later use in newPayloadV5
+                self._current_payload_beacon_root = self.head_root or b"\x00" * 32
             else:
                 logger.warning(
                     f"Failed to get payload_id for slot {slot}: status={response.payload_status.status}"
                 )
                 self._current_payload_id = None
+                self._current_payload_beacon_root = None
 
         except Exception as e:
             logger.error(f"Failed to request payload for slot {slot}: {e}")
             self._current_payload_id = None
+            self._current_payload_beacon_root = None
 
     async def _slot_ticker(self) -> None:
         """Tick every slot and process duties with proper intra-slot timing.
@@ -867,6 +880,9 @@ class BeaconNode:
         slots_per_epoch = SLOTS_PER_EPOCH()
         epoch = slot // slots_per_epoch
         logger.info(f"Slot {slot} (epoch {epoch})")
+
+        # Check if we need to sync blocks via req/resp (fallback for gossipsub issues)
+        await self._sync_missing_blocks(slot)
 
         # NOTE: Don't update head_slot here - it should only be updated when we
         # actually have a block for a slot (either produced locally or received via P2P)
@@ -971,12 +987,15 @@ class BeaconNode:
             if response.payload_id:
                 logger.info(f"Payload prepared for slot {next_slot}: id={response.payload_id.hex()}")
                 self._current_payload_id = response.payload_id
+                # Store the beacon root used in this forkchoiceUpdated for later use in newPayloadV5
+                self._current_payload_beacon_root = self.head_root or b"\x00" * 32
             else:
                 logger.warning(
                     f"No payload_id returned for slot {next_slot}: status={response.payload_status.status}, "
                     f"head_hash={head_block_hash.hex()[:16]}"
                 )
                 self._current_payload_id = None
+                self._current_payload_beacon_root = None
 
         except Exception as e:
             logger.error(f"Failed to update forkchoice for slot {slot}: {e}")
@@ -1387,86 +1406,145 @@ class BeaconNode:
 
             block = signed_block.message
             block_root = hash_tree_root(block)
-            execution_payload = block.body.execution_payload
 
-            # Extract versioned hashes from blobs bundle (EIP-4844)
-            versioned_hashes = []
-            if payload_response.blobs_bundle:
-                blobs_bundle = payload_response.blobs_bundle
-                commitments = blobs_bundle.get("commitments", [])
-                if commitments:
-                    from hashlib import sha256
-                    for commitment in commitments:
-                        commitment_bytes = bytes.fromhex(commitment.replace("0x", ""))
-                        versioned_hash = b'\x01' + sha256(commitment_bytes).digest()[1:]
-                        versioned_hashes.append(versioned_hash)
-                    logger.info(f"Extracted {len(versioned_hashes)} versioned hashes from blobs bundle")
+            # Check if this is a GLOAS block (ePBS) - has signed_execution_payload_bid instead of execution_payload
+            is_gloas = hasattr(block.body, 'signed_execution_payload_bid')
 
-            parent_beacon_root = bytes(block.parent_root)
+            if is_gloas:
+                # GLOAS (ePBS): Extract block hash from bid
+                bid = block.body.signed_execution_payload_bid.message
+                new_block_hash = bytes(bid.block_hash)
+                payload_timestamp = int(execution_payload_dict.get("timestamp", "0x0"), 16)
+                logger.info(
+                    f"GLOAS block with self-build bid: block_hash={new_block_hash.hex()[:16]}, "
+                    f"builder_index={bid.builder_index}, timestamp={payload_timestamp}"
+                )
 
-            # Log the SSZ payload's blockHash to verify it matches the original
-            ssz_block_hash = bytes(execution_payload.block_hash).hex()
-            ssz_timestamp = int(execution_payload.timestamp)
-            original_timestamp = int(execution_payload_dict.get("timestamp", "0x0"), 16)
-            logger.info(
-                f"Payload round-trip check: "
-                f"original_blockHash={block_hash}, "
-                f"ssz_blockHash=0x{ssz_block_hash}, "
-                f"original_timestamp={original_timestamp}, "
-                f"ssz_timestamp={ssz_timestamp}, "
-                f"original_stateRoot={execution_payload_dict.get('stateRoot')}, "
-                f"ssz_stateRoot=0x{bytes(execution_payload.state_root).hex()}"
-            )
+                # Extract versioned hashes from blobs bundle (EIP-4844)
+                versioned_hashes = []
+                if payload_response.blobs_bundle:
+                    blobs_bundle = payload_response.blobs_bundle
+                    commitments = blobs_bundle.get("commitments", [])
+                    if commitments:
+                        from hashlib import sha256
+                        for commitment in commitments:
+                            commitment_bytes = bytes.fromhex(commitment.replace("0x", ""))
+                            versioned_hash = b'\x01' + sha256(commitment_bytes).digest()[1:]
+                            versioned_hashes.append(versioned_hash)
+                        logger.info(f"Extracted {len(versioned_hashes)} versioned hashes from blobs bundle")
 
-            # Detailed payload comparison for debugging blockhash mismatch
-            reconstructed_dict = self.engine._payload_to_dict(execution_payload)
-            diff_fields = []
-            for key in set(execution_payload_dict.keys()) | set(reconstructed_dict.keys()):
-                orig_val = execution_payload_dict.get(key)
-                recon_val = reconstructed_dict.get(key)
-                if orig_val != recon_val:
-                    if key in ('transactions', 'withdrawals'):
-                        orig_len = len(orig_val) if orig_val else 0
-                        recon_len = len(recon_val) if recon_val else 0
-                        if orig_len != recon_len:
-                            diff_fields.append(f"{key}: len {orig_len} vs {recon_len}")
-                        else:
-                            for i, (o, r) in enumerate(zip(orig_val or [], recon_val or [])):
-                                if o != r:
-                                    diff_fields.append(f"{key}[{i}]: {str(o)[:50]} vs {str(r)[:50]}")
-                                    break
+                # Use the beacon root that was stored when forkchoiceUpdated was called.
+                # This MUST match the parentBeaconBlockRoot used in that call, as Geth uses it
+                # to compute the block hash. self.head_root may have changed since then.
+                parent_beacon_root = self._current_payload_beacon_root or bytes(block.parent_root)
+
+                # For GLOAS self-build, validate with EL using raw payload dict
+                # (bypasses SSZ round-trip to avoid blockhash mismatch)
+                logger.info(
+                    f"GLOAS newPayloadV5: stored_beacon_root={self._current_payload_beacon_root.hex()[:16] if self._current_payload_beacon_root else 'None'}, "
+                    f"head_root={self.head_root.hex()[:16] if self.head_root else 'None'}, "
+                    f"block.parent_root={bytes(block.parent_root).hex()[:16]}, "
+                    f"using={parent_beacon_root.hex()[:16]}"
+                )
+                status = await self.engine.new_payload_v5_raw(
+                    execution_payload_dict,
+                    versioned_hashes,
+                    parent_beacon_root,
+                    el_execution_requests,
+                )
+
+                if status.status != PayloadStatusEnum.VALID:
+                    logger.error(f"GLOAS execution payload invalid: {status.status}")
+                    if status.status == PayloadStatusEnum.SYNCING:
+                        logger.info("EL is syncing, block may be valid later")
                     else:
-                        diff_fields.append(f"{key}: {orig_val} vs {recon_val}")
-            if diff_fields:
-                logger.warning(f"Payload dict differences: {diff_fields}")
+                        return
+
             else:
-                logger.info("Payload dict round-trip: no differences detected")
+                # Non-GLOAS: execution_payload is directly in block body
+                execution_payload = block.body.execution_payload
 
-            # Log execution requests being sent
-            if el_execution_requests:
-                logger.info(f"Sending {len(el_execution_requests)} execution_requests to newPayload")
-                for i, req in enumerate(el_execution_requests):
-                    if isinstance(req, str):
-                        logger.debug(f"  execution_request[{i}]: {req[:66]}...")
-                    else:
-                        logger.debug(f"  execution_request[{i}]: type={type(req)}")
+                # Extract versioned hashes from blobs bundle (EIP-4844)
+                versioned_hashes = []
+                if payload_response.blobs_bundle:
+                    blobs_bundle = payload_response.blobs_bundle
+                    commitments = blobs_bundle.get("commitments", [])
+                    if commitments:
+                        from hashlib import sha256
+                        for commitment in commitments:
+                            commitment_bytes = bytes.fromhex(commitment.replace("0x", ""))
+                            versioned_hash = b'\x01' + sha256(commitment_bytes).digest()[1:]
+                            versioned_hashes.append(versioned_hash)
+                        logger.info(f"Extracted {len(versioned_hashes)} versioned hashes from blobs bundle")
 
-            status = await self.engine.new_payload(
-                execution_payload,
-                versioned_hashes,
-                parent_beacon_root,
-                el_execution_requests,
-                timestamp=int(execution_payload.timestamp),
-            )
+                # Use the beacon root that was stored when forkchoiceUpdated was called.
+                # This MUST match the parentBeaconBlockRoot used in that call.
+                parent_beacon_root = self._current_payload_beacon_root or bytes(block.parent_root)
 
-            if status.status != PayloadStatusEnum.VALID:
-                logger.error(f"Execution payload invalid: {status.status}")
-                if status.status == PayloadStatusEnum.SYNCING:
-                    logger.info("EL is syncing, block may be valid later")
+                # Log the SSZ payload's blockHash to verify it matches the original
+                ssz_block_hash = bytes(execution_payload.block_hash).hex()
+                ssz_timestamp = int(execution_payload.timestamp)
+                original_timestamp = int(execution_payload_dict.get("timestamp", "0x0"), 16)
+                logger.info(
+                    f"Payload round-trip check: "
+                    f"original_blockHash={block_hash}, "
+                    f"ssz_blockHash=0x{ssz_block_hash}, "
+                    f"original_timestamp={original_timestamp}, "
+                    f"ssz_timestamp={ssz_timestamp}, "
+                    f"original_stateRoot={execution_payload_dict.get('stateRoot')}, "
+                    f"ssz_stateRoot=0x{bytes(execution_payload.state_root).hex()}"
+                )
+
+                # Detailed payload comparison for debugging blockhash mismatch
+                reconstructed_dict = self.engine._payload_to_dict(execution_payload)
+                diff_fields = []
+                for key in set(execution_payload_dict.keys()) | set(reconstructed_dict.keys()):
+                    orig_val = execution_payload_dict.get(key)
+                    recon_val = reconstructed_dict.get(key)
+                    if orig_val != recon_val:
+                        if key in ('transactions', 'withdrawals'):
+                            orig_len = len(orig_val) if orig_val else 0
+                            recon_len = len(recon_val) if recon_val else 0
+                            if orig_len != recon_len:
+                                diff_fields.append(f"{key}: len {orig_len} vs {recon_len}")
+                            else:
+                                for i, (o, r) in enumerate(zip(orig_val or [], recon_val or [])):
+                                    if o != r:
+                                        diff_fields.append(f"{key}[{i}]: {str(o)[:50]} vs {str(r)[:50]}")
+                                        break
+                        else:
+                            diff_fields.append(f"{key}: {orig_val} vs {recon_val}")
+                if diff_fields:
+                    logger.warning(f"Payload dict differences: {diff_fields}")
                 else:
-                    return
+                    logger.info("Payload dict round-trip: no differences detected")
 
-            new_block_hash = bytes(execution_payload.block_hash)
+                # Log execution requests being sent
+                if el_execution_requests:
+                    logger.info(f"Sending {len(el_execution_requests)} execution_requests to newPayload")
+                    for i, req in enumerate(el_execution_requests):
+                        if isinstance(req, str):
+                            logger.debug(f"  execution_request[{i}]: {req[:66]}...")
+                        else:
+                            logger.debug(f"  execution_request[{i}]: type={type(req)}")
+
+                status = await self.engine.new_payload(
+                    execution_payload,
+                    versioned_hashes,
+                    parent_beacon_root,
+                    el_execution_requests,
+                    timestamp=int(execution_payload.timestamp),
+                )
+
+                if status.status != PayloadStatusEnum.VALID:
+                    logger.error(f"Execution payload invalid: {status.status}")
+                    if status.status == PayloadStatusEnum.SYNCING:
+                        logger.info("EL is syncing, block may be valid later")
+                    else:
+                        return
+
+                new_block_hash = bytes(execution_payload.block_hash)
+                payload_timestamp = int(execution_payload.timestamp)
 
             # Apply the produced block to state FIRST so subsequent forkchoice calls
             # use the updated state
@@ -1492,6 +1570,22 @@ class BeaconNode:
 
             await self._apply_block_to_state(block, block_root, signed_block)
 
+            # Fill in state.latest_block_header.state_root with the actual post-state root.
+            # This is normally filled in during process_slot for the NEXT slot, but we need it
+            # now so that hash_tree_root(state.latest_block_header) == block_root for correct
+            # parentBeaconBlockRoot in forkchoiceUpdated/newPayload.
+            if bytes(self.state.latest_block_header.state_root) == b"\x00" * 32:
+                self.state.latest_block_header.state_root = bytes(block.state_root)
+                logger.debug(f"Filled in latest_block_header.state_root: {bytes(block.state_root).hex()[:16]}")
+
+            # For GLOAS self-build: update state.latest_block_hash after state transition
+            # This is needed because process_execution_payload_bid only stores the bid,
+            # but doesn't update latest_block_hash (which happens in payload reveal normally)
+            if is_gloas and hasattr(self.state, 'latest_block_hash'):
+                from .spec.types import Hash32
+                self.state.latest_block_hash = Hash32(new_block_hash)
+                logger.info(f"GLOAS: Updated state.latest_block_hash to {new_block_hash.hex()[:16]}")
+
             # Save state for epoch queries (Dora needs historical states by state_root)
             state_root = hash_tree_root(self.state)
             self.store.save_state(state_root, self.state)
@@ -1504,7 +1598,7 @@ class BeaconNode:
                 finalized_block_hash=b"\x00" * 32,  # Use zeros for now
             )
 
-            fc_response = await self.engine.forkchoice_updated(forkchoice_state, timestamp=int(execution_payload.timestamp))
+            fc_response = await self.engine.forkchoice_updated(forkchoice_state, timestamp=payload_timestamp)
             logger.info(
                 f"Block forkchoice updated: status={fc_response.payload_status.status}, "
                 f"new_head={new_block_hash.hex()[:16]}"
@@ -1560,6 +1654,11 @@ class BeaconNode:
 
                 # Apply full state transition
                 await self._apply_block_to_state(block, block_root, signed_block)
+
+                # Fill in state.latest_block_header.state_root with the actual post-state root
+                if bytes(self.state.latest_block_header.state_root) == b"\x00" * 32:
+                    self.state.latest_block_header.state_root = bytes(block.state_root)
+
                 await self._update_forkchoice()
 
         except Exception as e:
@@ -1621,6 +1720,57 @@ class BeaconNode:
         except Exception as e:
             logger.error(f"Error processing attestation: {e}")
 
+    async def _sync_missing_blocks(self, current_slot: int) -> None:
+        """Sync missing blocks via req/resp if we're behind.
+
+        This is a fallback for when gossipsub doesn't deliver blocks reliably.
+        Since py-libp2p gossipsub has issues with rust-libp2p, we aggressively
+        sync via req/resp to stay in sync with Lighthouse.
+        """
+        if not self.beacon_gossip or not self.state:
+            return
+
+        # Check if our state is behind the current slot
+        state_slot = int(self.state.slot)
+        slots_behind = current_slot - state_slot
+
+        # Sync if we're even 1 slot behind (aggressive sync for gossipsub workaround)
+        if slots_behind < 1:
+            return
+
+        # IMPORTANT: When we're on a different fork (e.g., our slot 1 vs peer's slot 1),
+        # we need to request from slot 1, not state_slot+1, because the peer's chain
+        # may have different blocks. This allows us to get the peer's complete chain.
+        # Request from slot 1 if we might be on a different fork.
+        if state_slot <= 1 and slots_behind > 1:
+            # We're at genesis or slot 1, peer is ahead - request from slot 1
+            start_slot = 1
+            count = min(current_slot, 32)  # Get up to 32 blocks to catch up
+        else:
+            start_slot = state_slot + 1
+            count = min(slots_behind, 16)
+
+        logger.info(f"State is {slots_behind} slots behind (state_slot={state_slot}, current={current_slot}). "
+                    f"Requesting blocks {start_slot} to {start_slot + count - 1} via req/resp")
+
+        try:
+            blocks = await self.beacon_gossip.request_blocks_by_range(start_slot, count)
+            if not blocks:
+                logger.warning(f"No blocks received from req/resp request")
+                return
+
+            logger.info(f"Received {len(blocks)} blocks via req/resp")
+
+            # Process each block
+            for block_ssz in blocks:
+                try:
+                    await self._on_p2p_block(block_ssz, "req/resp")
+                except Exception as e:
+                    logger.warning(f"Error processing synced block: {e}")
+
+        except Exception as e:
+            logger.warning(f"Block sync via req/resp failed: {e}")
+
     async def _on_p2p_block(self, data: bytes, from_peer: str) -> None:
         """Handle a beacon block received via libp2p gossipsub."""
         try:
@@ -1641,30 +1791,53 @@ class BeaconNode:
                 logger.debug(f"Block already known: {block_root.hex()[:16]}")
                 return
 
-            # Check if this block builds on our current head
-            # If not, we can't apply it without state regeneration
+            # Check if this block builds on our current head or a known parent
             logger.debug(
                 f"P2P: Parent check: parent_root={parent_root.hex()[:16]}, "
                 f"head_root={self.head_root.hex()[:16] if self.head_root else 'None'}, "
                 f"match={parent_root == self.head_root if self.head_root else 'N/A'}"
             )
+
+            # Get genesis root for comparison
+            genesis_root = self._genesis_block_root if hasattr(self, '_genesis_block_root') else None
+
+            # Check if this is a potential reorg opportunity
+            # If block builds on genesis (slot 1) and we're stuck at a low slot, consider reorg
             if self.head_root and parent_root != self.head_root:
-                # Check if the parent is in our store (we know about it)
-                if not self.store.get_block(parent_root):
+                # Check if parent is genesis - this could be an alternate slot 1 block
+                is_slot_1_block = int(block.slot) == 1 and parent_root == genesis_root
+
+                if is_slot_1_block and self.head_slot <= 1:
+                    # We both have slot 1, but different versions - this is a fork at slot 1
+                    # Reset to genesis and adopt this new chain if we're behind
                     logger.warning(
-                        f"P2P: Ignoring block slot={block.slot} - parent {parent_root.hex()[:16]} "
-                        f"not found (our head={self.head_root.hex()[:16] if self.head_root else 'None'})"
+                        f"P2P: Detected fork at slot 1. Resetting to genesis to adopt peer's chain. "
+                        f"Our slot 1={self.head_root.hex()[:16]}, peer's slot 1={block_root.hex()[:16]}"
                     )
-                    # Store the block anyway for later processing
-                    self.store.save_block(block_root, signed_block)
-                    return
+                    # Reset state to genesis
+                    self.state = self._genesis_state.__class__.decode_bytes(
+                        bytes(self._genesis_state.encode_bytes())
+                    )
+                    self.head_slot = 0
+                    self.head_root = genesis_root
+                    # Now we can process this block
+                elif not self.store.get_block(parent_root):
+                    # Check if parent is genesis
+                    if parent_root == genesis_root:
+                        logger.info(f"P2P: Block parent is genesis, will process")
+                    else:
+                        logger.warning(
+                            f"P2P: Ignoring block slot={block.slot} - parent {parent_root.hex()[:16]} "
+                            f"not found (our head={self.head_root.hex()[:16] if self.head_root else 'None'})"
+                        )
+                        self.store.save_block(block_root, signed_block)
+                        return
                 else:
                     logger.warning(
                         f"P2P: Block slot={block.slot} builds on different chain "
                         f"(parent={parent_root.hex()[:16]}, our head={self.head_root.hex()[:16]}). "
                         f"Would need state regeneration to apply."
                     )
-                    # Store the block anyway for later processing
                     self.store.save_block(block_root, signed_block)
                     return
 
@@ -1683,6 +1856,11 @@ class BeaconNode:
                     logger.debug(f"P2P: Calling _apply_block_to_state for slot={block.slot}")
                     await self._apply_block_to_state(block, block_root, signed_block)
                     logger.debug(f"P2P: _apply_block_to_state succeeded for slot={block.slot}")
+
+                    # Fill in state.latest_block_header.state_root with the actual post-state root
+                    if bytes(self.state.latest_block_header.state_root) == b"\x00" * 32:
+                        self.state.latest_block_header.state_root = bytes(block.state_root)
+
                     # State transition succeeded, update head
                     self.head_slot = int(block.slot)
                     self.head_root = block_root

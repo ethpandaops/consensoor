@@ -149,6 +149,13 @@ def build_spec_response() -> dict:
         # Gloas (ePBS)
         "PTC_SIZE": str(constants.PTC_SIZE()),
         "MAX_PAYLOAD_ATTESTATIONS": str(constants.MAX_PAYLOAD_ATTESTATIONS),
+        "BUILDER_REGISTRY_LIMIT": str(constants.BUILDER_REGISTRY_LIMIT),
+        "BUILDER_PENDING_WITHDRAWALS_LIMIT": str(constants.BUILDER_PENDING_WITHDRAWALS_LIMIT),
+        "MAX_BUILDERS_PER_WITHDRAWALS_SWEEP": str(constants.MAX_BUILDERS_PER_WITHDRAWALS_SWEEP),
+        "MIN_BUILDER_WITHDRAWABILITY_DELAY": str(net_config.min_builder_withdrawability_delay),
+        "DOMAIN_BEACON_BUILDER": "0x" + constants.DOMAIN_BEACON_BUILDER.hex(),
+        "DOMAIN_PTC_ATTESTER": "0x" + constants.DOMAIN_PTC_ATTESTER.hex(),
+        "DOMAIN_PROPOSER_PREFERENCES": "0x" + constants.DOMAIN_PROPOSER_PREFERENCES.hex(),
         # Networking constants
         "MAX_PAYLOAD_SIZE": str(constants.MAX_PAYLOAD_SIZE),
         "MAX_REQUEST_BLOCKS": str(constants.MAX_REQUEST_BLOCKS),

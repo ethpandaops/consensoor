@@ -12,10 +12,22 @@ from ..spec.types import (
     SyncAggregate,
     Root,
     Bytes32,
+    Hash32,
     BLSSignature,
     Slot,
+    Epoch,
     ValidatorIndex,
+    Gwei,
+    ExecutionAddress,
     Bitvector,
+)
+from ..spec.types.gloas import (
+    BeaconBlock as GloasBeaconBlock,
+    BeaconBlockBody as GloasBeaconBlockBody,
+    SignedBeaconBlock as SignedGloasBeaconBlock,
+    ExecutionPayloadBid,
+    SignedExecutionPayloadBid,
+    PayloadAttestation,
 )
 from ..spec.types.phase0 import ProposerSlashing, Deposit, SignedVoluntaryExit
 from ..spec.types.bellatrix import (
@@ -44,6 +56,8 @@ from ..spec.constants import (
     SYNC_COMMITTEE_SIZE,
     MAX_ATTESTATIONS,
     MAX_ATTESTATIONS_ELECTRA,
+    BUILDER_INDEX_SELF_BUILD,
+    MAX_PAYLOAD_ATTESTATIONS,
 )
 from ..spec.network_config import get_config
 from ..crypto import sign, compute_signing_root, hash_tree_root
@@ -53,6 +67,7 @@ AnySignedBeaconBlock = Union[
     SignedCapellaBeaconBlock,
     SignedDenebBeaconBlock,
     SignedElectraBeaconBlock,
+    SignedGloasBeaconBlock,
 ]
 
 if TYPE_CHECKING:
@@ -96,6 +111,8 @@ class BlockBuilder:
         config = get_config()
         epoch = slot // SLOTS_PER_EPOCH()
 
+        if hasattr(config, 'gloas_fork_epoch') and epoch >= config.gloas_fork_epoch:
+            return "gloas"
         if hasattr(config, 'fulu_fork_epoch') and epoch >= config.fulu_fork_epoch:
             return "fulu"
         if hasattr(config, 'electra_fork_epoch') and epoch >= config.electra_fork_epoch:
@@ -163,13 +180,11 @@ class BlockBuilder:
         t1 = time_mod.time()
         logger.debug(f"RANDAO reveal took {(t1-t0)*1000:.1f}ms")
 
-        execution_payload = self._build_execution_payload(execution_payload_dict, fork)
-
         # Get attestations from pool for inclusion (fork-specific limits)
         # NOTE: Limiting attestations due to slow BLS verification with py_ecc (~100ms each)
         # With 12s slots, we can handle ~8 attestations (800ms BLS time)
         # Attestation aggregation helps by combining multiple validators into fewer attestations
-        if fork in ("electra", "fulu"):
+        if fork in ("electra", "fulu", "gloas"):
             max_attestations = min(8, MAX_ATTESTATIONS_ELECTRA())
         else:
             max_attestations = min(8, MAX_ATTESTATIONS())
@@ -199,7 +214,30 @@ class BlockBuilder:
 
         attestations = valid_attestations
         logger.info(f"Pre-validated {len(attestations)} of {len(pool_attestations)} attestations")
-        body = self._build_block_body(temp_state, randao_reveal, execution_payload, fork, attestations)
+
+        # Build block body - GLOAS uses different structure (ePBS)
+        if fork == "gloas":
+            # GLOAS (ePBS): Build execution payload bid for self-build mode
+            execution_payload_bid = self._build_execution_payload_bid(
+                temp_state, slot, execution_payload_dict
+            )
+            # Self-build uses G2 point-at-infinity signature (no actual signing needed)
+            g2_point_at_infinity = b"\xc0" + b"\x00" * 95
+            signed_execution_payload_bid = SignedExecutionPayloadBid(
+                message=execution_payload_bid,
+                signature=BLSSignature(g2_point_at_infinity),
+            )
+            body = self._build_gloas_block_body(
+                temp_state, randao_reveal, signed_execution_payload_bid, attestations
+            )
+            logger.info(
+                f"Built GLOAS block body with self-build bid: "
+                f"block_hash={execution_payload_dict['blockHash'][:18]}"
+            )
+        else:
+            # Non-GLOAS: Build execution payload directly
+            execution_payload = self._build_execution_payload(execution_payload_dict, fork)
+            body = self._build_block_body(temp_state, randao_reveal, execution_payload, fork, attestations)
         logger.debug(f"Block body attestations count after build: {len(body.attestations)}")
 
         # Build block with placeholder state_root
@@ -270,6 +308,14 @@ class BlockBuilder:
                 state_root=Root(state_root),
                 body=body,
             )
+        elif fork == "gloas":
+            return GloasBeaconBlock(
+                slot=Slot(slot),
+                proposer_index=ValidatorIndex(proposer_index),
+                parent_root=Root(parent_root),
+                state_root=Root(state_root),
+                body=body,
+            )
         else:
             return ElectraBeaconBlock(
                 slot=Slot(slot),
@@ -293,6 +339,11 @@ class BlockBuilder:
             )
         elif fork == "deneb":
             return SignedDenebBeaconBlock(
+                message=block,
+                signature=BLSSignature(signature),
+            )
+        elif fork == "gloas":
+            return SignedGloasBeaconBlock(
                 message=block,
                 signature=BLSSignature(signature),
             )
@@ -508,4 +559,108 @@ class BlockBuilder:
         return SyncAggregate(
             sync_committee_bits=Bitvector[SYNC_COMMITTEE_SIZE()](),
             sync_committee_signature=BLSSignature(b"\xc0" + b"\x00" * 95),
+        )
+
+    def _build_execution_payload_bid(
+        self,
+        state,
+        slot: int,
+        execution_payload_dict: dict,
+    ) -> ExecutionPayloadBid:
+        """Build an ExecutionPayloadBid for self-build mode (ePBS).
+
+        In self-build mode, the proposer acts as their own builder.
+        The builder_index is set to BUILDER_INDEX_SELF_BUILD (2^64 - 1).
+        """
+        from ..spec.types.base import uint64
+
+        def hex_to_bytes(h: str) -> bytes:
+            return bytes.fromhex(h.replace("0x", ""))
+
+        def hex_to_int(h) -> int:
+            if h is None:
+                return 0
+            if isinstance(h, int):
+                return h
+            return int(h, 16)
+
+        # Get parent block info from state
+        parent_block_hash = bytes(state.latest_block_hash) if hasattr(state, "latest_block_hash") else b"\x00" * 32
+        parent_block_root = hash_tree_root(state.latest_block_header)
+
+        # Extract blob commitments root (empty for now)
+        blob_kzg_commitments_root = b"\x00" * 32
+
+        bid = ExecutionPayloadBid(
+            parent_block_hash=Hash32(parent_block_hash),
+            parent_block_root=Root(parent_block_root),
+            block_hash=Hash32(hex_to_bytes(execution_payload_dict["blockHash"])),
+            prev_randao=Bytes32(hex_to_bytes(execution_payload_dict["prevRandao"])),
+            fee_recipient=ExecutionAddress(hex_to_bytes(execution_payload_dict["feeRecipient"])),
+            gas_limit=uint64(hex_to_int(execution_payload_dict["gasLimit"])),
+            builder_index=uint64(BUILDER_INDEX_SELF_BUILD),
+            slot=Slot(slot),
+            value=Gwei(0),
+            execution_payment=Gwei(0),
+            blob_kzg_commitments_root=Root(blob_kzg_commitments_root),
+        )
+
+        logger.debug(
+            f"Built execution payload bid: slot={slot}, block_hash={execution_payload_dict['blockHash'][:18]}, "
+            f"builder_index=SELF_BUILD"
+        )
+
+        return bid
+
+    def _build_gloas_block_body(
+        self,
+        state,
+        randao_reveal: BLSSignature,
+        signed_execution_payload_bid: SignedExecutionPayloadBid,
+        attestations=None,
+    ) -> GloasBeaconBlockBody:
+        """Build a GLOAS (ePBS) block body.
+
+        GLOAS block body contains:
+        - signed_execution_payload_bid instead of execution_payload
+        - payload_attestations from PTC
+        """
+        current_slot = int(state.slot)
+        sync_aggregate_slot = current_slot
+        sync_aggregate = self.node.sync_committee_pool.get_sync_aggregate(sync_aggregate_slot)
+        participant_count = sum(1 for b in sync_aggregate.sync_committee_bits if b)
+        sig_bytes = bytes(sync_aggregate.sync_committee_signature)
+        g2_infinity = b'\xc0' + b'\x00' * 95
+        logger.info(
+            f"Sync aggregate for GLOAS block at slot {current_slot}: "
+            f"{participant_count}/{SYNC_COMMITTEE_SIZE()} participants, sig_is_infinity={sig_bytes == g2_infinity}"
+        )
+
+        # Pre-validate sync aggregate
+        if participant_count > 0:
+            sync_aggregate = self._validate_sync_aggregate(state, sync_aggregate)
+            new_count = sum(1 for b in sync_aggregate.sync_committee_bits if b)
+            if new_count != participant_count:
+                logger.info(f"Sync aggregate failed validation, using empty aggregate")
+
+        if attestations:
+            logger.info(f"Including {len(attestations)} attestations in GLOAS block body")
+
+        # TODO: Get payload attestations from PTC pool
+        # For now, empty payload_attestations since we're doing self-build
+        payload_attestations = []
+
+        return GloasBeaconBlockBody(
+            randao_reveal=randao_reveal,
+            eth1_data=state.eth1_data,
+            graffiti=Bytes32(self.node.config.graffiti_bytes),
+            proposer_slashings=[],
+            attester_slashings=[],
+            attestations=attestations or [],
+            deposits=[],
+            voluntary_exits=[],
+            sync_aggregate=sync_aggregate,
+            bls_to_execution_changes=[],
+            signed_execution_payload_bid=signed_execution_payload_bid,
+            payload_attestations=payload_attestations,
         )

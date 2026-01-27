@@ -177,6 +177,34 @@ class EngineAPIClient:
         result = await self._call("engine_newPayloadV5", params)
         return PayloadStatus.from_dict(result)
 
+    async def new_payload_v5_raw(
+        self,
+        payload_dict: dict,
+        versioned_hashes: list[bytes],
+        parent_beacon_block_root: bytes,
+        execution_requests: list,
+    ) -> PayloadStatus:
+        """Send a new payload to the execution layer using raw dict (no SSZ round-trip).
+
+        This is used for GLOAS/ePBS where the payload comes directly from getPayloadV6
+        and should be passed through without modification to avoid blockhash mismatch.
+        """
+        params = [
+            payload_dict,
+            ["0x" + h.hex() for h in versioned_hashes],
+            "0x" + parent_beacon_block_root.hex(),
+            execution_requests,
+        ]
+
+        logger.info(
+            f"newPayloadV5_raw: blockHash={payload_dict.get('blockHash')}, "
+            f"execution_requests={execution_requests}, "
+            f"parent_beacon_root={parent_beacon_block_root.hex()[:16]}"
+        )
+
+        result = await self._call("engine_newPayloadV5", params)
+        return PayloadStatus.from_dict(result)
+
     async def new_payload_v4(
         self,
         execution_payload,
@@ -333,8 +361,10 @@ class EngineAPIClient:
         logger.info(f"get_payload: timestamp={timestamp}, fork={fork}, payload_id={payload_id.hex()}")
 
         if fork == "gloas":
+            # GLOAS/Amsterdam uses V6 (distinct from Osaka/Fulu which uses V5)
             return await self.get_payload_v6(payload_id)
         elif fork == "fulu":
+            # Fulu/Osaka uses V5
             return await self.get_payload_v5(payload_id)
         elif fork == "electra":
             return await self.get_payload_v4(payload_id)
@@ -403,8 +433,10 @@ class EngineAPIClient:
         logger.debug(f"new_payload: timestamp={timestamp}, fork={fork}")
 
         if fork == "gloas":
+            # GLOAS/ePBS uses V5 ("Amsterdam" in Geth)
             return await self.new_payload_v5(execution_payload, versioned_hashes or [], parent_beacon_block_root or b"\x00" * 32, execution_requests or [])
         elif fork in ("fulu", "electra"):
+            # Fulu/Osaka and Electra/Prague use V4
             return await self.new_payload_v4(execution_payload, versioned_hashes or [], parent_beacon_block_root or b"\x00" * 32, execution_requests or [])
         elif fork == "deneb":
             return await self.new_payload_v3(execution_payload, versioned_hashes or [], parent_beacon_block_root or b"\x00" * 32)

@@ -5,6 +5,7 @@ py-libp2p uses Trio, so we run it in a separate thread.
 """
 
 import asyncio
+import hashlib
 import logging
 import threading
 import queue
@@ -14,10 +15,36 @@ from dataclasses import dataclass, field
 if TYPE_CHECKING:
     from libp2p.pubsub.pubsub import Pubsub
     from libp2p.pubsub.gossipsub import GossipSub
+    from libp2p.pubsub.pb import rpc_pb2
 
 from .. import metrics
 
 logger = logging.getLogger(__name__)
+
+
+# Ethereum consensus message domain for valid snappy-compressed messages
+MESSAGE_DOMAIN_VALID_SNAPPY = b"\x01\x00\x00\x00"
+
+
+def eth2_message_id(msg: "rpc_pb2.Message") -> bytes:
+    """Compute Ethereum consensus message ID for gossipsub.
+
+    Per Ethereum consensus P2P spec, the message_id is computed as:
+    - For snappy-compressed messages: sha256(MESSAGE_DOMAIN_VALID_SNAPPY + snappy_decompress(data))[:20]
+
+    This is used for duplicate detection and IHAVE/IWANT messages.
+    """
+    try:
+        import snappy
+        # msg.data is snappy-compressed, decompress it first
+        decompressed = snappy.decompress(msg.data)
+        # Prepend domain and hash
+        data_with_domain = MESSAGE_DOMAIN_VALID_SNAPPY + decompressed
+        return hashlib.sha256(data_with_domain).digest()[:20]
+    except Exception as e:
+        # Fallback to hashing raw data if decompression fails
+        logger.warning(f"Failed to decompress message for message_id: {e}")
+        return hashlib.sha256(msg.data).digest()[:20]
 
 MessageHandler = Callable[[bytes, str], Awaitable[None]]
 
@@ -85,6 +112,8 @@ class P2PHost:
         self._message_queue: queue.Queue = queue.Queue()
         self._publish_queue: queue.Queue = queue.Queue()
         self._subscribe_queue: queue.Queue = queue.Queue()
+        self._block_request_queue: queue.Queue = queue.Queue()  # For blocks_by_range requests
+        self._block_response_queue: queue.Queue = queue.Queue()  # For blocks_by_range responses
         self._peer_id: Optional[str] = None
         self._peer_count: int = 0
         self._connected_peers: dict[str, dict] = {}  # peer_id -> peer_info
@@ -217,10 +246,12 @@ class P2PHost:
             )
 
             # Create Pubsub with strict_signing=False for now (Ethereum uses custom signing)
+            # Pass eth2_message_id for Ethereum-specific message ID computation
             self._pubsub = Pubsub(
                 self._host,
                 self._gossipsub,
                 strict_signing=False,
+                msg_id_constructor=eth2_message_id,
             )
 
             async with self._host.run(listen_addrs=listen_addrs):
@@ -260,6 +291,7 @@ class P2PHost:
                             while not self._stop_event.is_set():
                                 await self._process_publish_queue_trio()
                                 await self._process_subscribe_queue_trio(nursery)
+                                await self._process_block_request_queue_trio()
 
                                 import time
                                 now = time.time()
@@ -956,6 +988,185 @@ class P2PHost:
         except Exception as e:
             logger.error(f"Error processing subscribe queue: {e}")
 
+    async def _process_block_request_queue_trio(self) -> None:
+        """Process block requests from the queue (Trio context)."""
+        import varint
+        try:
+            while True:
+                try:
+                    start_slot, count, request_id = self._block_request_queue.get_nowait()
+                    logger.info(f"Processing block request: start={start_slot}, count={count}, id={request_id}")
+
+                    # Find a connected peer to request from
+                    if not self._connected_peers:
+                        logger.warning("No connected peers for block request")
+                        self._block_response_queue.put((request_id, None, "No connected peers"))
+                        continue
+
+                    # Use the first connected peer
+                    peer_id_str = next(iter(self._connected_peers.keys()))
+                    peer_info = self._connected_peers[peer_id_str]
+
+                    try:
+                        from libp2p.peer.id import ID as PeerID
+                        from libp2p.custom_types import TProtocol
+
+                        # Try v2 first (Altair+), fallback to v1
+                        blocks_by_range_v2 = TProtocol("/eth2/beacon_chain/req/beacon_blocks_by_range/2/ssz_snappy")
+                        blocks_by_range_v1 = TProtocol("/eth2/beacon_chain/req/beacon_blocks_by_range/1/ssz_snappy")
+
+                        peer_id = PeerID.from_base58(peer_id_str)
+
+                        try:
+                            stream = await self._host.new_stream(peer_id, [blocks_by_range_v2])
+                            logger.info(f"Opened blocks_by_range/2 stream to {peer_id_str[:16]}")
+                        except Exception:
+                            stream = await self._host.new_stream(peer_id, [blocks_by_range_v1])
+                            logger.info(f"Opened blocks_by_range/1 stream to {peer_id_str[:16]}")
+
+                        # BeaconBlocksByRangeRequest: start_slot (8) + count (8) + step (8) = 24 bytes
+                        # step is always 1 post-Altair
+                        request_ssz = (
+                            start_slot.to_bytes(8, "little") +
+                            count.to_bytes(8, "little") +
+                            (1).to_bytes(8, "little")  # step = 1
+                        )
+
+                        compressed = self._snappy_frame_compress(request_ssz)
+                        length_prefix = varint.encode(len(request_ssz))
+                        message = length_prefix + compressed
+
+                        await stream.write(message)
+                        logger.info(f"Sent blocks_by_range request: start={start_slot}, count={count}")
+
+                        # Read responses - can be multiple blocks
+                        # Response format for blocks_by_range/2:
+                        # response_code (1) | context/fork_digest (4) | varint length | snappy framed data
+                        blocks = []
+                        import trio
+
+                        # Persistent buffer across all block reads
+                        read_buffer = b""
+
+                        async def buffered_read(n: int) -> bytes:
+                            """Read exactly n bytes using persistent buffer."""
+                            nonlocal read_buffer
+                            while len(read_buffer) < n:
+                                chunk = await stream.read(max(n - len(read_buffer), 4096))
+                                if not chunk:
+                                    result = read_buffer
+                                    read_buffer = b""
+                                    return result
+                                read_buffer += chunk
+                            result = read_buffer[:n]
+                            read_buffer = read_buffer[n:]
+                            return result
+
+                        with trio.move_on_after(10.0):
+                            while len(blocks) < count:
+                                # Read response code (1 byte)
+                                response_code = await buffered_read(1)
+                                if not response_code:
+                                    break
+
+                                if response_code[0] != 0:  # Error
+                                    logger.warning(f"Block request error: code={response_code[0]}")
+                                    break
+
+                                # Read context (4 bytes - fork digest for v2)
+                                context = await buffered_read(4)
+                                if len(context) < 4:
+                                    logger.warning("Failed to read context bytes")
+                                    break
+
+                                # Read varint - need up to 10 bytes
+                                varint_data = await buffered_read(10)
+                                if not varint_data:
+                                    break
+
+                                uncompressed_length, consumed = self._decode_varint(varint_data)
+                                # Put unconsumed varint bytes back
+                                read_buffer = varint_data[consumed:] + read_buffer
+                                logger.debug(f"Block response: context={context.hex()}, uncompressed_len={uncompressed_length}")
+
+                                # Read snappy stream identifier (10 bytes)
+                                stream_id = await buffered_read(10)
+                                if len(stream_id) < 10 or stream_id[:4] != b'\xff\x06\x00\x00':
+                                    logger.warning(f"Invalid snappy stream id: {stream_id.hex() if stream_id else 'empty'}")
+                                    break
+
+                                # Read chunks until we have the full block
+                                frame_data = stream_id
+                                decompressed_size = 0
+
+                                while decompressed_size < uncompressed_length:
+                                    # Read chunk header (type:1 + len:3)
+                                    chunk_header = await buffered_read(4)
+                                    if len(chunk_header) < 4:
+                                        logger.warning("Failed to read snappy chunk header")
+                                        break
+
+                                    chunk_type = chunk_header[0]
+                                    chunk_len = int.from_bytes(chunk_header[1:4], 'little')
+                                    frame_data += chunk_header
+
+                                    if chunk_len == 0:
+                                        break
+
+                                    # Read chunk data
+                                    chunk_data = await buffered_read(chunk_len)
+                                    if len(chunk_data) < chunk_len:
+                                        logger.warning(f"Failed to read chunk data: got {len(chunk_data)}, need {chunk_len}")
+                                        break
+                                    frame_data += chunk_data
+
+                                    # Estimate decompressed size from chunk
+                                    if chunk_type == 0x00:  # Compressed
+                                        decompressed_size += (chunk_len - 4) * 2
+                                    elif chunk_type == 0x01:  # Uncompressed
+                                        decompressed_size += (chunk_len - 4)
+
+                                # Decompress the complete frame
+                                try:
+                                    block_ssz = self._snappy_frame_decompress(frame_data)
+                                    if len(block_ssz) > 0:
+                                        block_ssz = block_ssz[:uncompressed_length]
+                                        blocks.append(block_ssz)
+                                        logger.info(f"Received block {len(blocks)}: {len(block_ssz)} bytes (frame: {len(frame_data)})")
+                                    else:
+                                        logger.warning("Decompressed block is empty")
+                                        break
+                                except Exception as e:
+                                    logger.warning(f"Failed to decompress block: {e}")
+                                    break
+
+                        await stream.close()
+                        logger.info(f"Block request complete: received {len(blocks)} blocks")
+                        self._block_response_queue.put((request_id, blocks, None))
+
+                    except Exception as e:
+                        logger.warning(f"Block request failed: {e}")
+                        self._block_response_queue.put((request_id, None, str(e)))
+
+                except queue.Empty:
+                    break
+        except Exception as e:
+            logger.error(f"Error processing block request queue: {e}")
+
+    def _snappy_frame_decompress(self, data: bytes) -> bytes:
+        """Decompress snappy framed data."""
+        import snappy
+        try:
+            decompressor = snappy.StreamDecompressor()
+            result = decompressor.decompress(data)
+            logger.debug(f"Snappy decompress: input={len(data)} bytes, output={len(result)} bytes")
+            return result
+        except Exception as e:
+            # Log first few bytes for debugging
+            prefix = data[:20].hex() if len(data) >= 20 else data.hex()
+            logger.error(f"Snappy decompress failed: {e}, data_len={len(data)}, prefix={prefix}")
+            raise
+
     async def _read_subscription_trio(self, topic: str, subscription) -> None:
         """Read messages from a gossipsub subscription and queue them (Trio context)."""
         logger.info(f"Started reading messages from topic: {topic}")
@@ -1018,6 +1229,25 @@ class P2PHost:
         self._publish_queue.put((topic, data))
         logger.debug(f"Queued message for {topic}: {len(data)} bytes")
 
+    def get_mesh_info(self, topic: str) -> str:
+        """Get mesh info for a topic for debugging."""
+        if not self._gossipsub:
+            return "no gossipsub"
+
+        mesh = getattr(self._gossipsub, 'mesh', {})
+        fanout = getattr(self._gossipsub, 'fanout', {})
+        peer_topics = getattr(self._pubsub, 'peer_topics', {}) if self._pubsub else {}
+
+        mesh_peers = list(mesh.get(topic, set()))
+        fanout_peers = list(fanout.get(topic, set()))
+        subscribed_peers = list(peer_topics.get(topic, set()))
+
+        return (
+            f"mesh={len(mesh_peers)} fanout={len(fanout_peers)} "
+            f"subscribed={len(subscribed_peers)} "
+            f"mesh_peers={[str(p)[:16] for p in mesh_peers[:3]]}"
+        )
+
     @property
     def peer_id(self) -> Optional[str]:
         """Get the local peer ID."""
@@ -1044,3 +1274,43 @@ class P2PHost:
         if self._listen_ip and self._peer_id:
             return f"/ip4/{self._listen_ip}/tcp/{self.config.listen_port}/p2p/{self._peer_id}"
         return None
+
+    async def request_blocks_by_range(self, start_slot: int, count: int, timeout: float = 15.0) -> list[bytes]:
+        """Request blocks by range from a peer.
+
+        Args:
+            start_slot: First slot to request
+            count: Number of slots to request
+            timeout: Timeout in seconds
+
+        Returns:
+            List of SSZ-encoded signed beacon blocks
+        """
+        import uuid
+        request_id = str(uuid.uuid4())[:8]
+
+        # Queue the request
+        self._block_request_queue.put((start_slot, count, request_id))
+        logger.info(f"Queued block request: start={start_slot}, count={count}, id={request_id}")
+
+        # Wait for response
+        start_time = asyncio.get_event_loop().time()
+        while True:
+            try:
+                resp_id, blocks, error = self._block_response_queue.get_nowait()
+                if resp_id == request_id:
+                    if error:
+                        logger.warning(f"Block request {request_id} failed: {error}")
+                        return []
+                    return blocks or []
+                else:
+                    # Put it back if it's not our response
+                    self._block_response_queue.put((resp_id, blocks, error))
+            except queue.Empty:
+                pass
+
+            if asyncio.get_event_loop().time() - start_time > timeout:
+                logger.warning(f"Block request {request_id} timed out")
+                return []
+
+            await asyncio.sleep(0.1)
