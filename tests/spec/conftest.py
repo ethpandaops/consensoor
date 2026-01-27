@@ -79,3 +79,17 @@ def spec_tests_dir(request):
 def preset(request):
     """Return the preset being used."""
     return request.config.getoption("--preset")
+
+
+@pytest.fixture(autouse=True)
+def clear_caches():
+    """Clear spec caches before each test to prevent cross-test pollution.
+
+    This is necessary because the caches are keyed by slot/epoch, not by
+    state identity. Different tests with states at the same slot would
+    otherwise get incorrect cached values.
+    """
+    from consensoor.spec.state_transition.helpers import clear_spec_caches
+    clear_spec_caches()
+    yield
+    clear_spec_caches()

@@ -135,10 +135,12 @@ class Store:
                     config = get_config()
                     slot = int(msg.slot)
                     epoch = slot // SLOTS_PER_EPOCH()
+                    logger.info(f"Fork detection for Electra type: slot={slot}, epoch={epoch}, fulu_fork_epoch={config.fulu_fork_epoch}")
                     if hasattr(config, 'fulu_fork_epoch') and epoch >= config.fulu_fork_epoch:
+                        logger.info(f"Detected as fulu (epoch {epoch} >= fulu_fork_epoch {config.fulu_fork_epoch})")
                         return "fulu"
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Fork detection exception: {e}")
             return "electra"
 
         if "Deneb" in type_name:

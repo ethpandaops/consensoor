@@ -622,8 +622,20 @@ class BeaconAPI:
             config = get_config()
             slot = int(block.slot)
             epoch = slot // SLOTS_PER_EPOCH()
+
+            logger.debug(f"Block version detection: slot={slot}, epoch={epoch}, fulu_fork_epoch={config.fulu_fork_epoch}")
+
+            # Check if we're in GLOAS epoch (return gloas for GLOAS blocks)
+            if hasattr(config, 'gloas_fork_epoch') and epoch >= config.gloas_fork_epoch:
+                logger.debug(f"Returning gloas (epoch {epoch} >= {config.gloas_fork_epoch})")
+                return "gloas"
+
+            # Check Fulu epoch
             if hasattr(config, 'fulu_fork_epoch') and epoch >= config.fulu_fork_epoch:
+                logger.debug(f"Returning fulu (epoch {epoch} >= fulu_fork_epoch {config.fulu_fork_epoch})")
                 return "fulu"
+
+            logger.debug(f"Returning electra (epoch {epoch})")
             return "electra"
 
         if hasattr(body, "signed_execution_payload_header") or hasattr(body, "signed_execution_payload_bid"):
@@ -694,9 +706,11 @@ class BeaconAPI:
     async def get_block(self, request: web.Request) -> web.Response:
         """GET /eth/v2/beacon/blocks/{block_id}"""
         block_id = request.match_info["block_id"]
+        logger.info(f"get_block request: block_id={block_id}")
         root, signed_block = self._resolve_block_id(block_id)
 
         if root is None or signed_block is None:
+            logger.warning(f"Block not found: block_id={block_id}")
             return web.json_response({"message": "Block not found"}, status=404)
 
         accept = request.headers.get("Accept", "application/json")
@@ -704,6 +718,7 @@ class BeaconAPI:
         if "application/octet-stream" in accept:
             ssz_bytes = signed_block.encode_bytes()
             version = self._get_block_version(signed_block)
+            logger.info(f"Returning block SSZ: block_id={block_id}, version={version}, size={len(ssz_bytes)}")
             return web.Response(
                 body=ssz_bytes,
                 content_type="application/octet-stream",
@@ -711,6 +726,7 @@ class BeaconAPI:
             )
 
         version = self._get_block_version(signed_block)
+        logger.info(f"Returning block JSON: block_id={block_id}, version={version}")
         block_json = self._signed_block_to_json(signed_block)
 
         return web.json_response({

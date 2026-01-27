@@ -26,11 +26,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install py-libp2p from local directory (with debug logging)
-# Copy from ../py-libp2p-upstream before building:
-#   cp -r ../py-libp2p-upstream ./py-libp2p-local
-COPY py-libp2p-local /tmp/py-libp2p
+# Clone and patch py-libp2p (fix messageIDs type from string to bytes for gossipsub)
 RUN apt-get update && apt-get install -y --no-install-recommends protobuf-compiler && \
+    git clone --depth 1 https://github.com/libp2p/py-libp2p.git /tmp/py-libp2p && \
     cd /tmp/py-libp2p && \
     sed -i 's/repeated string messageIDs/repeated bytes messageIDs/g' libp2p/pubsub/pb/rpc.proto && \
     protoc --python_out=. libp2p/pubsub/pb/rpc.proto && \

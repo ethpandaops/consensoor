@@ -42,6 +42,15 @@ def _trim_cache(cache: dict) -> None:
             del cache[key]
 
 
+def clear_attestation_caches() -> None:
+    """Clear all module-level caches in attestation.
+
+    This should be called between tests to prevent cache pollution.
+    """
+    _unslashed_participating_cache.clear()
+    _active_validator_indices_cache.clear()
+
+
 def _get_active_validator_indices_cached(state: "BeaconState", epoch: int) -> list[int]:
     """Cached version of active validator indices lookup."""
     slot = int(state.slot)

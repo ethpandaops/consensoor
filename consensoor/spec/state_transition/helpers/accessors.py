@@ -55,6 +55,16 @@ def _trim_cache(cache: dict) -> None:
             del cache[key]
 
 
+def clear_accessors_caches() -> None:
+    """Clear all module-level caches in accessors.
+
+    This should be called between tests to prevent cache pollution.
+    """
+    _total_active_balance_cache.clear()
+    _base_reward_per_increment_cache.clear()
+    _eligible_validator_indices_cache.clear()
+
+
 def get_current_epoch(state: "BeaconState") -> int:
     """Return the current epoch of the state.
 

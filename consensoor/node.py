@@ -274,16 +274,41 @@ class BeaconNode:
             ("Phase0", Phase0BeaconState),
         ]
 
+        detected_fork = None
         for fork_name, state_type in state_types:
             try:
                 self.state = state_type.decode_bytes(ssz_bytes)
                 fork_version = bytes(self.state.fork.current_version)
                 logger.info(f"Genesis state parsed as {fork_name} format (fork_version={fork_version.hex()})")
+                detected_fork = fork_name.lower()
                 break
             except Exception as e:
                 logger.debug(f"Failed to parse as {fork_name}: {e}")
         else:
             raise ValueError("Failed to parse genesis state as any known format")
+
+        # Update config fork epochs based on detected genesis fork
+        # This ensures correct fork detection even when config YAML isn't loaded
+        config = get_config()
+        FAR_FUTURE_EPOCH = 2**64 - 1
+        if detected_fork == "fulu" and config.fulu_fork_epoch == FAR_FUTURE_EPOCH:
+            logger.info("Genesis state is Fulu - setting fulu_fork_epoch=0 in config")
+            config.fulu_fork_epoch = 0
+            # Also set earlier forks to epoch 0 since Fulu implies all previous forks
+            config.electra_fork_epoch = 0
+            config.deneb_fork_epoch = 0
+            config.capella_fork_epoch = 0
+            config.bellatrix_fork_epoch = 0
+            config.altair_fork_epoch = 0
+        elif detected_fork == "gloas" and config.gloas_fork_epoch == FAR_FUTURE_EPOCH:
+            logger.info("Genesis state is GLOAS - setting gloas_fork_epoch=0 in config")
+            config.gloas_fork_epoch = 0
+            config.fulu_fork_epoch = 0
+            config.electra_fork_epoch = 0
+            config.deneb_fork_epoch = 0
+            config.capella_fork_epoch = 0
+            config.bellatrix_fork_epoch = 0
+            config.altair_fork_epoch = 0
 
         # Compute genesis block root per the spec:
         # The state's latest_block_header.state_root is ZERO_HASH at genesis.
@@ -313,6 +338,16 @@ class BeaconNode:
         self._genesis_block_root = self.head_root
         self._genesis_state = self.state.__class__.decode_bytes(bytes(self.state.encode_bytes()))
 
+        # Save state by genesis_state_root (original hash) BEFORE modifying latest_block_header
+        self.store.save_state(genesis_state_root, self.state)
+
+        # Update state's latest_block_header with actual state_root so that
+        # hash_tree_root(state.latest_block_header) == head_root
+        # This is critical for Dora/explorers that compute block root from state
+        self.state.latest_block_header.state_root = genesis_state_root
+        logger.info(f"Updated state.latest_block_header.state_root to {genesis_state_root.hex()[:16]}")
+
+        # Also save state by head_root (block_root) for flexibility
         self.store.save_state(self.head_root, self.state)
         self.store.set_head(self.head_root)
         logger.info(f"Genesis block root: {self.head_root.hex()}")

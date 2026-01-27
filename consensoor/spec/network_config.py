@@ -172,6 +172,12 @@ class NetworkConfig:
                     pass
                 setattr(config, attr_name, value)
 
+        # Log fork epochs for debugging
+        logger.info(
+            f"Config loaded: fulu_fork_epoch={config.fulu_fork_epoch}, "
+            f"gloas_fork_epoch={config.gloas_fork_epoch}, "
+            f"electra_fork_epoch={config.electra_fork_epoch}"
+        )
         return config
 
     def get_fork_version(self, epoch: int) -> bytes:

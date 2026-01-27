@@ -56,6 +56,7 @@ from .accessors import (
     get_pending_balance_to_withdraw,
     get_pending_balance_to_withdraw_for_builder,
     can_builder_cover_bid,
+    clear_accessors_caches,
 )
 from .mutators import (
     increase_balance,
@@ -89,6 +90,7 @@ from .attestation import (
     has_flag,
     get_committee_indices,
     is_attestation_same_slot,
+    clear_attestation_caches,
 )
 from .ptc import (
     get_ptc,
@@ -188,4 +190,16 @@ __all__ = [
     "get_ptc_slot",
     "is_ptc_member",
     "get_indexed_payload_attestation",
+    # Cache management
+    "clear_spec_caches",
 ]
+
+
+def clear_spec_caches() -> None:
+    """Clear all module-level caches in spec helpers.
+
+    This should be called between tests to prevent cache pollution
+    when different states may have the same slot but different data.
+    """
+    clear_accessors_caches()
+    clear_attestation_caches()
