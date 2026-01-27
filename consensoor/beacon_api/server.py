@@ -181,11 +181,17 @@ class BeaconAPI:
     async def get_state_root(self, request: web.Request) -> web.Response:
         """GET /eth/v1/beacon/states/{state_id}/root"""
         state_id = request.match_info["state_id"]
-        if state_id == "head" and self.node.head_root:
-            return web.json_response({
-                "data": {"root": "0x" + self.node.head_root.hex()}
-            })
-        return web.json_response({"message": "State not found"}, status=404)
+        state = self._resolve_state_id(state_id)
+        if state is None:
+            return web.json_response({"message": "State not found"}, status=404)
+
+        from ..crypto import hash_tree_root
+        state_root = hash_tree_root(state)
+        return web.json_response({
+            "execution_optimistic": False,
+            "finalized": False,
+            "data": {"root": "0x" + state_root.hex()}
+        })
 
     async def get_state_fork(self, request: web.Request) -> web.Response:
         """GET /eth/v1/beacon/states/{state_id}/fork"""
@@ -620,7 +626,7 @@ class BeaconAPI:
                 return "fulu"
             return "electra"
 
-        if hasattr(body, "signed_execution_payload_header"):
+        if hasattr(body, "signed_execution_payload_header") or hasattr(body, "signed_execution_payload_bid"):
             return "gloas"
         if hasattr(body, "blob_kzg_commitments"):
             return "deneb"
@@ -939,6 +945,9 @@ class BeaconAPI:
 
     def _get_state_version(self, state) -> str:
         """Determine the fork version string for a state."""
+        # Check GLOAS before fulu since GLOAS extends fulu
+        if hasattr(state, "builders"):
+            return "gloas"
         if hasattr(state, "proposer_lookahead"):
             return "fulu"
         if hasattr(state, "pending_deposits"):
@@ -1111,12 +1120,19 @@ class BeaconAPI:
 
                 if current_slot != self._last_head_slot or current_root != self._last_head_root:
                     if current_root:
+                        # Compute actual state_root (not block_root)
+                        state_root_hex = "0x" + current_root.hex()  # fallback
+                        if self.node.state:
+                            from ..crypto import hash_tree_root
+                            actual_state_root = hash_tree_root(self.node.state)
+                            state_root_hex = "0x" + actual_state_root.hex()
+
                         head_event = {
                             "event": "head",
                             "data": {
                                 "slot": str(current_slot),
                                 "block": "0x" + current_root.hex(),
-                                "state": "0x" + current_root.hex(),
+                                "state": state_root_hex,
                                 "epoch_transition": current_slot % 8 == 0,
                                 "execution_optimistic": False,
                             },

@@ -1558,16 +1558,7 @@ class BeaconNode:
                 self.store.save_blobs(block_root, slot, payload_response.blobs_bundle, kzg_commitments, signed_block)
                 logger.info(f"Saved {len(versioned_hashes)} blob sidecars for block at slot {slot}")
 
-            self.head_slot = slot
-            self.head_root = block_root
-            self.store.set_head(block_root)
-
-            # Update metrics
-            from .spec import constants
-            epoch = slot // constants.SLOTS_PER_EPOCH()
-            metrics.update_head(slot, epoch)
-            metrics.record_block_proposed(success=True)
-
+            # Apply state transition FIRST (before updating head, to avoid race with SSE events)
             await self._apply_block_to_state(block, block_root, signed_block)
 
             # Fill in state.latest_block_header.state_root with the actual post-state root.
@@ -1587,9 +1578,27 @@ class BeaconNode:
                 logger.info(f"GLOAS: Updated state.latest_block_hash to {new_block_hash.hex()[:16]}")
 
             # Save state for epoch queries (Dora needs historical states by state_root)
+            # This MUST happen before updating head_slot/head_root to avoid race condition
+            # where SSE event is emitted before state is saved
             state_root = hash_tree_root(self.state)
             self.store.save_state(state_root, self.state)
             self.store.save_state(block_root, self.state)  # Also by block_root for flexibility
+            # Also save by the block's state_root field, as that's what Dora looks for
+            # (may differ from computed hash if latest_block_header.state_root was filled in)
+            block_state_root = bytes(block.state_root)
+            if block_state_root != state_root:
+                self.store.save_state(block_state_root, self.state)
+
+            # NOW update head_slot/head_root (SSE event loop will see this change)
+            self.head_slot = slot
+            self.head_root = block_root
+            self.store.set_head(block_root)
+
+            # Update metrics
+            from .spec import constants
+            epoch = slot // constants.SLOTS_PER_EPOCH()
+            metrics.update_head(slot, epoch)
+            metrics.record_block_proposed(success=True)
 
             # Now update forkchoice with the new block
             forkchoice_state = ForkchoiceState(
@@ -1642,6 +1651,25 @@ class BeaconNode:
             self.store.save_block(block_root, signed_block)
 
             if int(block.slot) > self.head_slot:
+                # Apply state transition FIRST (before updating head, to avoid race with SSE events)
+                await self._apply_block_to_state(block, block_root, signed_block)
+
+                # Fill in state.latest_block_header.state_root with the actual post-state root
+                if bytes(self.state.latest_block_header.state_root) == b"\x00" * 32:
+                    self.state.latest_block_header.state_root = bytes(block.state_root)
+
+                # Save state for epoch queries (Dora needs historical states by state_root)
+                # This MUST happen before updating head_slot/head_root to avoid race condition
+                # where SSE event is emitted before state is saved
+                state_root = hash_tree_root(self.state)
+                self.store.save_state(state_root, self.state)
+                self.store.save_state(block_root, self.state)  # Also by block_root for flexibility
+                # Also save by the block's state_root field, as that's what Dora looks for
+                block_state_root = bytes(block.state_root)
+                if block_state_root != state_root:
+                    self.store.save_state(block_state_root, self.state)
+
+                # NOW update head_slot/head_root (SSE event loop will see this change)
                 self.head_slot = int(block.slot)
                 self.head_root = block_root
                 self.store.set_head(block_root)
@@ -1651,13 +1679,6 @@ class BeaconNode:
                 slot = int(block.slot)
                 epoch = slot // constants.SLOTS_PER_EPOCH()
                 metrics.update_head(slot, epoch)
-
-                # Apply full state transition
-                await self._apply_block_to_state(block, block_root, signed_block)
-
-                # Fill in state.latest_block_header.state_root with the actual post-state root
-                if bytes(self.state.latest_block_header.state_root) == b"\x00" * 32:
-                    self.state.latest_block_header.state_root = bytes(block.state_root)
 
                 await self._update_forkchoice()
 
@@ -1861,7 +1882,18 @@ class BeaconNode:
                     if bytes(self.state.latest_block_header.state_root) == b"\x00" * 32:
                         self.state.latest_block_header.state_root = bytes(block.state_root)
 
-                    # State transition succeeded, update head
+                    # Save state for epoch queries (Dora needs historical states by state_root)
+                    # This MUST happen before updating head_slot/head_root to avoid race condition
+                    # where SSE event is emitted before state is saved
+                    state_root = hash_tree_root(self.state)
+                    self.store.save_state(state_root, self.state)
+                    self.store.save_state(block_root, self.state)  # Also by block_root for flexibility
+                    # Also save by the block's state_root field, as that's what Dora looks for
+                    block_state_root = bytes(block.state_root)
+                    if block_state_root != state_root:
+                        self.store.save_state(block_state_root, self.state)
+
+                    # NOW update head_slot/head_root (SSE event loop will see this change)
                     self.head_slot = int(block.slot)
                     self.head_root = block_root
                     self.store.set_head(block_root)
@@ -1872,10 +1904,6 @@ class BeaconNode:
                     epoch = slot // constants.SLOTS_PER_EPOCH()
                     metrics.update_head(slot, epoch)
 
-                    # Save state for epoch queries (Dora needs historical states by state_root)
-                    state_root = hash_tree_root(self.state)
-                    self.store.save_state(state_root, self.state)
-                    self.store.save_state(block_root, self.state)  # Also by block_root for flexibility
                     logger.info(
                         f"P2P: Adopted block as new head: slot={block.slot}, "
                         f"root={block_root.hex()[:16]}"

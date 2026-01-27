@@ -90,11 +90,41 @@ class Store:
     def _detect_fork(self, obj: Any) -> str:
         """Detect the fork type of a state or block."""
         type_name = type(obj).__name__
+        module_name = type(obj).__module__
+
+        logger.info(f"Fork detection: type={type_name}, module={module_name}")
+
+        # Check module name for fork-specific modules
+        if "gloas" in module_name.lower():
+            return "gloas"
+        if "fulu" in module_name.lower():
+            return "fulu"
 
         if "Fulu" in type_name:
             return "fulu"
         if "Gloas" in type_name:
             return "gloas"
+
+        # For states/blocks where the class name doesn't include the fork name,
+        # check for fork-specific attributes
+        inner = obj.message if hasattr(obj, "message") else obj
+        body = inner.body if hasattr(inner, "body") else inner
+
+        # GLOAS has builders list and latest_block_hash in state, and
+        # signed_execution_payload_bid in block body
+        # Use try/except to handle SSZ containers which may not support hasattr properly
+        try:
+            if hasattr(body, "signed_execution_payload_bid") or hasattr(obj, "builders"):
+                return "gloas"
+        except Exception:
+            pass
+
+        # Fulu has proposer_lookahead in state
+        try:
+            if hasattr(obj, "proposer_lookahead") and not hasattr(obj, "builders"):
+                return "fulu"
+        except Exception:
+            pass
 
         if "Electra" in type_name:
             msg = obj.message if hasattr(obj, "message") else obj
@@ -124,6 +154,7 @@ class Store:
     def _get_state_types(self):
         """Get all beacon state types for deserialization."""
         from ..spec.types import BeaconState
+        from ..spec.types.gloas import BeaconState as GloasBeaconState
         from ..spec.types.electra import ElectraBeaconState
         from ..spec.types.deneb import DenebBeaconState
         from ..spec.types.capella import CapellaBeaconState
@@ -133,6 +164,7 @@ class Store:
 
         return {
             "fulu": BeaconState,
+            "gloas": GloasBeaconState,
             "electra": ElectraBeaconState,
             "deneb": DenebBeaconState,
             "capella": CapellaBeaconState,
@@ -144,6 +176,7 @@ class Store:
     def _get_block_types(self):
         """Get all signed beacon block types for deserialization."""
         from ..spec.types.fulu import FuluSignedBeaconBlock
+        from ..spec.types.gloas import SignedBeaconBlock as GloasSignedBeaconBlock
         from ..spec.types.electra import ElectraSignedBeaconBlock
         from ..spec.types.deneb import DenebSignedBeaconBlock
         from ..spec.types.capella import CapellaSignedBeaconBlock
@@ -153,6 +186,7 @@ class Store:
 
         return {
             "fulu": FuluSignedBeaconBlock,
+            "gloas": GloasSignedBeaconBlock,
             "electra": ElectraSignedBeaconBlock,
             "deneb": DenebSignedBeaconBlock,
             "capella": CapellaSignedBeaconBlock,
@@ -193,19 +227,28 @@ class Store:
 
     def get_state(self, root: bytes) -> Optional[object]:
         """Get a beacon state by root."""
+        logger.info(f"get_state called with root={root.hex()[:16]}, cache_size={len(self._state_cache)}")
         if root in self._state_cache:
+            logger.info(f"get_state: found in cache")
             return self._state_cache[root]
 
         try:
+            logger.info(f"get_state: checking LevelDB")
             value = self._db.get(PREFIX_STATE + root)
             if value:
+                logger.info(f"get_state: found in LevelDB, decoding...")
                 fork, data = self._decode_value(value)
                 state_types = self._get_state_types()
                 state_type = state_types.get(fork)
                 if state_type:
                     state = state_type.decode_bytes(data)
                     self._state_cache[root] = state
+                    logger.info(f"get_state: successfully decoded state for fork={fork}")
                     return state
+                else:
+                    logger.warning(f"get_state: no state type for fork={fork}")
+            else:
+                logger.info(f"get_state: not found in LevelDB")
         except Exception as e:
             logger.warning(f"Failed to load state from LevelDB: {e}")
 

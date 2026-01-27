@@ -171,7 +171,9 @@ Consensoor uses libp2p with gossipsub for P2P networking:
 - ENR includes `eth2` field for network identification
 - Supports bootnode discovery via ENR
 - Subscribes to beacon block and aggregate attestation topics
-- Message encoding uses snappy compression
+- Message encoding uses snappy framing format
+- Dynamic fork digest calculation with blob parameters
+- Req/resp protocol support (Status, Ping, Metadata)
 
 ## State Synchronization
 
@@ -240,15 +242,42 @@ Config is automatically fetched from upstream consensus-specs if `--network-conf
 
 Implements subset of standard Beacon API:
 
+**Node:**
 - `GET /eth/v1/node/health`
 - `GET /eth/v1/node/version`
 - `GET /eth/v1/node/syncing`
 - `GET /eth/v1/node/identity`
 - `GET /eth/v1/node/peers`
+
+**Beacon:**
 - `GET /eth/v1/beacon/genesis`
-- `GET /eth/v1/beacon/headers/head`
+- `GET /eth/v1/beacon/headers`
+- `GET /eth/v1/beacon/headers/{block_id}`
+- `GET /eth/v2/beacon/blocks/{block_id}`
+- `GET /eth/v1/beacon/blocks/{block_id}/root`
+- `GET /eth/v1/beacon/blob_sidecars/{block_id}`
 - `GET /eth/v1/beacon/states/{state_id}/root`
+- `GET /eth/v1/beacon/states/{state_id}/fork`
+- `GET /eth/v1/beacon/states/{state_id}/finality_checkpoints`
+- `GET /eth/v1/beacon/states/{state_id}/validators`
+- `GET /eth/v1/beacon/states/{state_id}/validators/{validator_id}`
+- `GET /eth/v1/beacon/states/{state_id}/validator_balances`
+- `GET /eth/v1/beacon/states/{state_id}/committees`
+- `GET /eth/v1/beacon/states/{state_id}/sync_committees`
+- `GET /eth/v1/beacon/states/{state_id}/randao`
+
+**Config:**
 - `GET /eth/v1/config/spec`
+- `GET /eth/v1/config/fork_schedule`
+- `GET /eth/v1/config/deposit_contract`
+
+**Debug:**
+- `GET /eth/v2/debug/beacon/states/{state_id}`
+
+**Events:**
+- `GET /eth/v1/events` (SSE: head, finalized_checkpoint)
+
+Supports `genesis`, `head`, `finalized`, `justified`, and slot/root identifiers for state_id and block_id parameters.
 
 ## Prometheus Metrics
 
@@ -282,7 +311,7 @@ Consensoor exposes Prometheus-compatible metrics on port 8008 (configurable via 
 
 ## Gloas ePBS Flow
 
-In Gloas, block production is separated from payload production:
+In Gloas (EIP-7732), block production is separated from payload production:
 
 ```
 1. Builder submits SignedExecutionPayloadBid
@@ -290,6 +319,11 @@ In Gloas, block production is separated from payload production:
 3. Builder reveals SignedExecutionPayloadEnvelope
 4. PTC (Payload Timeliness Committee) attests to payload availability
 ```
+
+Consensoor implements the builder role with:
+- Execution payload bid generation via `_build_execution_payload_bid`
+- Separate execution payload building path for GLOAS blocks
+- GLOAS-specific constants and domains exposed in `/eth/v1/config/spec`
 
 ## Limitations
 
