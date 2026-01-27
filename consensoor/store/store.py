@@ -153,7 +153,7 @@ class Store:
 
     def _get_state_types(self):
         """Get all beacon state types for deserialization."""
-        from ..spec.types import BeaconState
+        from ..spec.types.fulu import FuluBeaconState
         from ..spec.types.gloas import BeaconState as GloasBeaconState
         from ..spec.types.electra import ElectraBeaconState
         from ..spec.types.deneb import DenebBeaconState
@@ -163,7 +163,7 @@ class Store:
         from ..spec.types.phase0 import Phase0BeaconState
 
         return {
-            "fulu": BeaconState,
+            "fulu": FuluBeaconState,
             "gloas": GloasBeaconState,
             "electra": ElectraBeaconState,
             "deneb": DenebBeaconState,

@@ -24,6 +24,7 @@ from .encoding import (
     BLS_TO_EXECUTION_CHANGE_TOPIC,
     SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_TOPIC,
     BLOB_SIDECAR_TOPIC_PREFIX,
+    EXECUTION_PAYLOAD_TOPIC,
 )
 
 logger = logging.getLogger(__name__)
@@ -147,6 +148,10 @@ class BeaconGossip:
         """Subscribe to sync committee contribution and proof messages."""
         self._handlers[SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_TOPIC] = handler
 
+    def subscribe_execution_payloads(self, handler: MessageHandler) -> None:
+        """Subscribe to execution payload envelope messages (GLOAS/ePBS)."""
+        self._handlers[EXECUTION_PAYLOAD_TOPIC] = handler
+
     def subscribe_blob_sidecars(self, handler: MessageHandler) -> None:
         """Subscribe to blob sidecar messages on all subnets."""
         self._blob_sidecar_handler = handler
@@ -227,6 +232,13 @@ class BeaconGossip:
         encoded = encode_message(contribution_ssz)
         await self._host.publish(topic, encoded)
         logger.debug(f"Published sync committee contribution: {len(contribution_ssz)} bytes")
+
+    async def publish_execution_payload(self, payload_ssz: bytes) -> None:
+        """Publish a signed execution payload envelope (GLOAS/ePBS)."""
+        topic = get_topic_name(EXECUTION_PAYLOAD_TOPIC, self.fork_digest)
+        encoded = encode_message(payload_ssz)
+        await self._host.publish(topic, encoded)
+        logger.info(f"Published execution payload envelope: {len(payload_ssz)} bytes (topic={topic})")
 
     def set_status_provider(self, provider: Callable[[], dict]) -> None:
         """Set the status provider callback for P2P status messages.

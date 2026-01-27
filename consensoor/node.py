@@ -1361,6 +1361,99 @@ class BeaconNode:
         await self.beacon_gossip.publish_aggregate(ssz_bytes)
         logger.debug(f"Broadcast attestation as aggregate for slot {slot}, electra={is_electra}")
 
+    async def _broadcast_execution_payload_envelope(
+        self,
+        slot: int,
+        beacon_block_root: bytes,
+        execution_payload_dict: dict,
+        execution_requests: list,
+        blobs_bundle: dict | None,
+    ) -> None:
+        """Build and broadcast the SignedExecutionPayloadEnvelope for GLOAS self-build.
+
+        In GLOAS ePBS, the execution payload is delivered separately from the beacon block.
+        For self-build mode, the proposer acts as the builder and reveals the payload.
+
+        Args:
+            slot: Slot number
+            beacon_block_root: Root of the beacon block
+            execution_payload_dict: Execution payload from EL
+            execution_requests: List of execution requests
+            blobs_bundle: Optional blobs bundle from EL
+        """
+        from .spec.types.gloas import (
+            ExecutionPayloadEnvelope,
+            SignedExecutionPayloadEnvelope,
+        )
+        from .spec.types import BLSSignature, Root, Slot, KZGCommitment
+        from .spec.types.base import List
+        from .spec.constants import BUILDER_INDEX_SELF_BUILD
+        # MAX_BLOB_COMMITMENTS_PER_BLOCK is 4096
+        MAX_BLOB_COMMITMENTS = 4096
+
+        # Build the execution payload using the same logic as block builder
+        execution_payload = self.block_builder._build_execution_payload(
+            execution_payload_dict, "gloas"
+        )
+
+        # Build execution requests
+        from .spec.types.electra import ExecutionRequests
+        exec_requests_obj = ExecutionRequests()
+        # Parse execution_requests if provided as hex strings
+        if execution_requests:
+            from .spec.types.electra import DepositRequest, WithdrawalRequest, ConsolidationRequest
+            for req_hex in execution_requests:
+                if isinstance(req_hex, str):
+                    req_bytes = bytes.fromhex(req_hex.replace("0x", ""))
+                    if req_bytes and len(req_bytes) > 0:
+                        req_type = req_bytes[0]
+                        req_data = req_bytes[1:]
+                        if req_type == 0x00:
+                            exec_requests_obj.deposits.append(DepositRequest.decode_bytes(req_data))
+                        elif req_type == 0x01:
+                            exec_requests_obj.withdrawals.append(WithdrawalRequest.decode_bytes(req_data))
+                        elif req_type == 0x02:
+                            exec_requests_obj.consolidations.append(ConsolidationRequest.decode_bytes(req_data))
+
+        # Get KZG commitments from blobs bundle
+        kzg_commitments = List[KZGCommitment, MAX_BLOB_COMMITMENTS]()
+        if blobs_bundle:
+            commitments = blobs_bundle.get("commitments", [])
+            for commitment_hex in commitments:
+                commitment_bytes = bytes.fromhex(commitment_hex.replace("0x", ""))
+                kzg_commitments.append(KZGCommitment(commitment_bytes))
+
+        # Compute state root (use the current state's root)
+        state_root = hash_tree_root(self.state)
+
+        # Build the envelope
+        envelope = ExecutionPayloadEnvelope(
+            payload=execution_payload,
+            execution_requests=exec_requests_obj,
+            builder_index=BUILDER_INDEX_SELF_BUILD,
+            beacon_block_root=Root(beacon_block_root),
+            slot=Slot(slot),
+            blob_kzg_commitments=kzg_commitments,
+            state_root=Root(state_root),
+        )
+
+        # For self-build, use G2 point-at-infinity signature (no actual signing needed)
+        g2_point_at_infinity = b"\xc0" + b"\x00" * 95
+
+        signed_envelope = SignedExecutionPayloadEnvelope(
+            message=envelope,
+            signature=BLSSignature(g2_point_at_infinity),
+        )
+
+        # Broadcast
+        ssz_bytes = signed_envelope.encode_bytes()
+        await self.beacon_gossip.publish_execution_payload(ssz_bytes)
+        logger.info(
+            f"Broadcast execution payload envelope for slot {slot}: "
+            f"block_hash={bytes(execution_payload.block_hash).hex()[:16]}, "
+            f"commitments={len(kzg_commitments)}"
+        )
+
     async def _produce_and_broadcast_block(self, slot: int, proposer_key) -> None:
         """Produce and broadcast a block for the given slot."""
         if not self.engine:
@@ -1626,6 +1719,18 @@ class BeaconNode:
                     logger.info(f"Block published to P2P network: slot={slot}")
                 except Exception as e:
                     logger.error(f"Failed to publish block to P2P: {e}")
+
+                # For GLOAS self-build: also broadcast the execution payload envelope
+                if is_gloas:
+                    try:
+                        await self._broadcast_execution_payload_envelope(
+                            slot, block_root, execution_payload_dict, el_execution_requests,
+                            payload_response.blobs_bundle
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to broadcast execution payload envelope: {e}")
+                        import traceback
+                        traceback.print_exc()
 
         except Exception as e:
             logger.error(f"Block production failed: {e}")
