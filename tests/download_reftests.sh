@@ -29,7 +29,7 @@ confirm_replace() {
 
 mkdir -p "${spec_tests_dir}"
 
-if [[ "${spec_version}" == "nightly" ]]; then
+if [[ "${spec_version}" == nightly* ]]; then
   if [[ -z "${GITHUB_TOKEN:-}" ]]; then
     echo "Error: GITHUB_TOKEN is not set"
     exit 1
@@ -48,15 +48,24 @@ if [[ "${spec_version}" == "nightly" ]]; then
   api="https://api.github.com"
   auth_header="Authorization: token ${GITHUB_TOKEN}"
 
-  run_id="$(curl -s -H "${auth_header}" \
-    "${api}/repos/${repo}/actions/workflows/${workflow}/runs?branch=${branch}&status=success&per_page=1" | \
-    jq -r '.workflow_runs[0].id')"
+  if [[ "${spec_version}" == "nightly" ]]; then
+    run_id="$(curl -s -H "${auth_header}" \
+      "${api}/repos/${repo}/actions/workflows/${workflow}/runs?branch=${branch}&status=success&per_page=1" | \
+      jq -r '.workflow_runs[0].id')"
 
-  if [[ -z "${run_id}" || "${run_id}" == "null" ]]; then
-    echo "No successful nightly workflow run found for ${repo} (${workflow} on ${branch})"
-    exit 1
+    if [[ -z "${run_id}" || "${run_id}" == "null" ]]; then
+      echo "No successful nightly workflow run found for ${repo} (${workflow} on ${branch})"
+      exit 1
+    fi
+    expected_version="nightly-${run_id}"
+  else
+    run_id="${spec_version#nightly-}"
+    if [[ -z "${run_id}" || "${run_id}" == "${spec_version}" ]]; then
+      echo "Invalid nightly version: ${spec_version} (expected nightly-<run_id>)"
+      exit 1
+    fi
+    expected_version="${spec_version}"
   fi
-  expected_version="nightly-${run_id}"
 else
   expected_version="${spec_version}"
 fi

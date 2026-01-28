@@ -1,7 +1,7 @@
 # Consensoor Makefile
 # Spec test targets for running Ethereum consensus spec tests
 
-SPEC_VERSION ?= v1.7.0-alpha.1
+SPEC_VERSION ?= nightly-21382554457
 SPEC_TESTS_DIR := tests/spec-tests
 DOWNLOAD_REFTESTS := tests/download_reftests.sh
 DEFAULT_PRESET := mainnet

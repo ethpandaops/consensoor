@@ -101,10 +101,14 @@ def get_pending_partial_withdrawals(
     epoch = get_current_epoch(state)
     processed_count = 0
     withdrawals: List[Withdrawal] = []
+    withdrawals_limit = min(
+        len(prior_withdrawals) + MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP(),
+        MAX_WITHDRAWALS_PER_PAYLOAD() - 1,
+    )
 
     for partial in state.pending_partial_withdrawals:
         is_withdrawable = int(partial.withdrawable_epoch) <= epoch
-        has_reached_limit = len(withdrawals) == MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP()
+        has_reached_limit = len(prior_withdrawals) + len(withdrawals) >= withdrawals_limit
 
         if not is_withdrawable or has_reached_limit:
             break
@@ -292,7 +296,6 @@ def get_expected_withdrawals(state: "BeaconState") -> ExpectedWithdrawals:
     is_electra = hasattr(state, "pending_partial_withdrawals")
 
     if is_gloas:
-        withdrawal_index = 0
         builder_withdrawals, withdrawal_index, processed_builder_count = (
             get_builder_withdrawals(state, withdrawal_index, withdrawals)
         )
@@ -431,6 +434,10 @@ def process_withdrawals(state: "BeaconState", payload=None) -> None:
         if latest_bid_slot != 0 and state.execution_payload_availability[slot_index] == 0:
             return
 
+    if hasattr(state, "payload_expected_withdrawals"):
+        if bytes(state.latest_execution_payload_bid.block_hash) != bytes(state.latest_block_hash):
+            return
+
     expected = get_expected_withdrawals(state)
 
     is_gloas = hasattr(state, "payload_expected_withdrawals")
@@ -507,5 +514,3 @@ def process_withdrawals(state: "BeaconState", payload=None) -> None:
         update_payload_expected_withdrawals(state, expected.withdrawals)
         update_builder_pending_withdrawals(state, expected.processed_builder_withdrawals_count)
         update_next_withdrawal_builder_index(state, expected.processed_builders_sweep_count)
-
-
