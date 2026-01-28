@@ -205,12 +205,9 @@ make test all mainnet
 
 # Default preset is mainnet
 make test electra         # equivalent to: make test electra mainnet
-
-# Check downloaded test status
-make check-tests
 ```
 
-Tests download from consensus-specs releases (~470MB minimal, ~680MB mainnet) and cache locally.
+Tests download from consensus-specs releases and cache locally.
 
 ## Spec Forks
 
