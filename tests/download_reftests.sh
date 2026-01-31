@@ -82,7 +82,7 @@ else
   fi
 fi
 
-if [[ "${spec_version}" != "nightly" ]]; then
+if [[ "${spec_version}" != nightly* ]]; then
   for preset in ${presets}; do
     tar_path="${spec_tests_dir}/${preset}.tar.gz"
     if [[ ! -f "${tar_path}" ]]; then
