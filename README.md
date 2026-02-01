@@ -2,8 +2,6 @@
 
 Lightweight Python consensus layer client for local testing and prototyping.
 
-Built for the Gloas fork (ePBS - Enshrined Proposer-Builder Separation).
-
 ## Features
 
 - Implements Gloas consensus spec (EIP-7732 ePBS)
@@ -23,8 +21,10 @@ Built for the Gloas fork (ePBS - Enshrined Proposer-Builder Separation).
 
 ## Requirements
 
-- Python 3.11+
-- An execution layer client (geth, reth, etc.)
+- [uv](https://docs.astral.sh/uv/)
+- Platform-specific dependencies:
+  - **Linux**: `apt install libgmp-dev libleveldb-dev`
+  - **macOS**: `brew install gmp leveldb`
 
 ## Key Dependencies
 
@@ -39,7 +39,9 @@ Built for the Gloas fork (ePBS - Enshrined Proposer-Builder Separation).
 ## Installation
 
 ```bash
-pip install -e .
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install -e ".[dev]"
 ```
 
 ## Usage
