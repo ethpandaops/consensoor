@@ -14,11 +14,10 @@ from ...constants import (
     BUILDER_INDEX_SELF_BUILD,
     SLOTS_PER_EPOCH,
     SLOTS_PER_HISTORICAL_ROOT,
-    MAX_BLOBS_PER_BLOCK_ELECTRA,
 )
 from ..helpers.domain import get_domain, compute_signing_root
-from ..helpers.misc import compute_time_at_slot
-from ..helpers.accessors import get_current_epoch
+from ..helpers.misc import compute_time_at_slot, compute_epoch_at_slot
+from ..helpers.accessors import get_current_epoch, get_blob_parameters
 from ....crypto import bls_verify, hash_tree_root
 from ...network_config import get_config
 
@@ -75,7 +74,6 @@ def process_execution_payload_envelope(
 
     committed_bid = state.latest_execution_payload_bid
     assert int(envelope.builder_index) == int(committed_bid.builder_index)
-    assert committed_bid.blob_kzg_commitments_root == hash_tree_root(envelope.blob_kzg_commitments)
     assert committed_bid.prev_randao == payload.prev_randao
 
     assert hash_tree_root(payload.withdrawals) == hash_tree_root(state.payload_expected_withdrawals)
@@ -90,13 +88,14 @@ def process_execution_payload_envelope(
     )
     assert int(payload.timestamp) == expected_timestamp
 
-    max_blobs = MAX_BLOBS_PER_BLOCK_ELECTRA
-    assert len(envelope.blob_kzg_commitments) <= max_blobs
+    epoch = compute_epoch_at_slot(int(state.slot))
+    blob_params = get_blob_parameters(epoch)
+    assert len(committed_bid.blob_kzg_commitments) <= blob_params.max_blobs_per_block
 
     if execution_engine is not None:
         request = NewPayloadRequest(
             execution_payload=payload,
-            versioned_hashes=list(envelope.blob_kzg_commitments),
+            versioned_hashes=list(committed_bid.blob_kzg_commitments),
             parent_beacon_block_root=state.latest_block_header.parent_root,
             execution_requests=envelope.execution_requests,
         )

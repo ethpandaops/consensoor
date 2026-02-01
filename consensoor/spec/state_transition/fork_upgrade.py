@@ -318,7 +318,7 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
         slot=pre.slot,
         value=Gwei(0),
         execution_payment=Gwei(0),
-        blob_kzg_commitments_root=Root(b"\x00" * 32),
+        blob_kzg_commitments=[],
     )
 
     slots_per_hist = SLOTS_PER_HISTORICAL_ROOT()

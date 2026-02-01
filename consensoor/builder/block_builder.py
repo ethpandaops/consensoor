@@ -588,9 +588,6 @@ class BlockBuilder:
         parent_block_hash = bytes(state.latest_block_hash) if hasattr(state, "latest_block_hash") else b"\x00" * 32
         parent_block_root = hash_tree_root(state.latest_block_header)
 
-        # Extract blob commitments root (empty for now)
-        blob_kzg_commitments_root = b"\x00" * 32
-
         bid = ExecutionPayloadBid(
             parent_block_hash=Hash32(parent_block_hash),
             parent_block_root=Root(parent_block_root),
@@ -602,7 +599,7 @@ class BlockBuilder:
             slot=Slot(slot),
             value=Gwei(0),
             execution_payment=Gwei(0),
-            blob_kzg_commitments_root=Root(blob_kzg_commitments_root),
+            blob_kzg_commitments=[],
         )
 
         logger.debug(

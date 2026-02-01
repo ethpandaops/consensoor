@@ -6,6 +6,8 @@ Reference: https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/
 
 from typing import TYPE_CHECKING, Sequence, Set
 
+from dataclasses import dataclass
+
 from ...constants import (
     SLOTS_PER_EPOCH,
     SLOTS_PER_HISTORICAL_ROOT,
@@ -27,6 +29,7 @@ from ...constants import (
     WEIGHT_DENOMINATOR,
     BASE_REWARDS_PER_EPOCH,
     MIN_DEPOSIT_AMOUNT,
+    MAX_BLOBS_PER_BLOCK_ELECTRA,
 )
 from .math import integer_squareroot
 from .misc import compute_epoch_at_slot
@@ -455,3 +458,38 @@ def get_pending_balance_to_withdraw(state: "BeaconState", validator_index: int) 
         for w in state.pending_partial_withdrawals
         if int(w.validator_index) == validator_index
     )
+
+
+@dataclass
+class BlobParameters:
+    """Blob parameters for a given epoch."""
+    epoch: int
+    max_blobs_per_block: int
+
+
+def get_blob_parameters(epoch: int) -> BlobParameters:
+    """Return blob parameters for a given epoch.
+
+    Looks up the BLOB_SCHEDULE from network config and returns the
+    appropriate max_blobs_per_block for the epoch.
+
+    Args:
+        epoch: Epoch to get parameters for
+
+    Returns:
+        BlobParameters with max_blobs_per_block for the epoch
+    """
+    from ...network_config import get_config
+
+    config = get_config()
+    blob_schedule = getattr(config, "blob_schedule", None) or []
+
+    for entry in sorted(blob_schedule, key=lambda e: e["epoch"], reverse=True):
+        entry_epoch = entry["epoch"]
+        if epoch >= entry_epoch:
+            return BlobParameters(
+                epoch=entry_epoch,
+                max_blobs_per_block=entry["max_blobs_per_block"],
+            )
+
+    return BlobParameters(epoch=0, max_blobs_per_block=MAX_BLOBS_PER_BLOCK_ELECTRA)

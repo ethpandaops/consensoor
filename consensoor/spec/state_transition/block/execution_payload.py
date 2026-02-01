@@ -94,11 +94,17 @@ def process_execution_payload(
 
     # Verify blob commitments limit
     if hasattr(body, "blob_kzg_commitments"):
-        from ...constants import MAX_BLOBS_PER_BLOCK, MAX_BLOBS_PER_BLOCK_ELECTRA
+        # Fulu+ uses dynamic blob schedule
+        is_fulu = hasattr(state, "proposer_lookahead")
+        if is_fulu:
+            from ..helpers.accessors import get_blob_parameters
+            blob_params = get_blob_parameters(get_current_epoch(state))
+            max_blobs = blob_params.max_blobs_per_block
+        else:
+            from ...constants import MAX_BLOBS_PER_BLOCK, MAX_BLOBS_PER_BLOCK_ELECTRA
+            is_electra = hasattr(state, "pending_deposits")
+            max_blobs = MAX_BLOBS_PER_BLOCK_ELECTRA if is_electra else MAX_BLOBS_PER_BLOCK
 
-        # Electra+ allows more blobs per block
-        is_electra = hasattr(state, "pending_deposits")
-        max_blobs = MAX_BLOBS_PER_BLOCK_ELECTRA if is_electra else MAX_BLOBS_PER_BLOCK
         assert len(body.blob_kzg_commitments) <= max_blobs, (
             f"Too many blob commitments: {len(body.blob_kzg_commitments)} > {max_blobs}"
         )

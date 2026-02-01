@@ -13,7 +13,9 @@ from ...helpers.accessors import (
     get_current_epoch,
     get_randao_mix,
     can_builder_cover_bid,
+    get_blob_parameters,
 )
+from ...helpers.misc import compute_epoch_at_slot
 from ...helpers.predicates import is_active_builder, is_valid_indexed_payload_attestation
 from ...helpers.domain import compute_signing_root, compute_domain
 from ...helpers.ptc import get_indexed_payload_attestation
@@ -74,6 +76,12 @@ def process_execution_payload_bid(state: "BeaconState", bid_source) -> None:
     assert bytes(bid.parent_block_root) == expected_parent_root, "Parent block root mismatch"
     assert bytes(bid.prev_randao) == bytes(get_randao_mix(state, get_current_epoch(state))), (
         "Prev randao mismatch"
+    )
+
+    epoch = compute_epoch_at_slot(int(bid.slot))
+    blob_params = get_blob_parameters(epoch)
+    assert len(bid.blob_kzg_commitments) <= blob_params.max_blobs_per_block, (
+        f"Too many blob commitments: {len(bid.blob_kzg_commitments)} > {blob_params.max_blobs_per_block}"
     )
 
     if amount > 0:

@@ -1468,7 +1468,6 @@ class BeaconNode:
             builder_index=BUILDER_INDEX_SELF_BUILD,
             beacon_block_root=Root(beacon_block_root),
             slot=Slot(slot),
-            blob_kzg_commitments=kzg_commitments,
             state_root=Root(state_root),
         )
 

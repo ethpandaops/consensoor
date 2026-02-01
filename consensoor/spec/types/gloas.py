@@ -78,7 +78,6 @@ class DataColumnSidecar(Container):
     """Gloas DataColumnSidecar - simplified compared to Fulu."""
     index: uint64
     column: List[Cell, MAX_BLOB_COMMITMENTS_PER_BLOCK]
-    kzg_commitments: List[KZGCommitment, MAX_BLOB_COMMITMENTS_PER_BLOCK]
     kzg_proofs: List[KZGProof, MAX_BLOB_COMMITMENTS_PER_BLOCK]
     slot: Slot
     beacon_block_root: Root
@@ -141,7 +140,7 @@ class ExecutionPayloadBid(Container):
     slot: Slot
     value: Gwei
     execution_payment: Gwei
-    blob_kzg_commitments_root: Root
+    blob_kzg_commitments: List[KZGCommitment, MAX_BLOB_COMMITMENTS_PER_BLOCK]
 
 
 class SignedExecutionPayloadBid(Container):
@@ -155,7 +154,6 @@ class ExecutionPayloadEnvelope(Container):
     builder_index: BuilderIndex
     beacon_block_root: Root
     slot: Slot
-    blob_kzg_commitments: List[KZGCommitment, MAX_BLOB_COMMITMENTS_PER_BLOCK]
     state_root: Root
 
 
