@@ -191,22 +191,10 @@ When `--checkpoint-sync-url` is provided, consensoor syncs state from an upstrea
 Run consensus spec tests against consensoor:
 
 ```bash
-# Download spec tests and run a specific fork
-make test phase0 minimal
-make test altair minimal
-make test bellatrix minimal
-make test capella minimal
-make test deneb minimal
-make test electra minimal
-make test fulu minimal
-make test gloas minimal
-
-# Run all forks
-make test all minimal
-make test all mainnet
-
-# Default preset is mainnet
-make test electra         # equivalent to: make test electra mainnet
+make test                              # Run all tests (minimal preset)
+make test preset=mainnet               # Run all tests (mainnet preset)
+make test fork=electra                 # Run electra tests (minimal)
+make test fork=electra preset=mainnet  # Run electra tests (mainnet)
 ```
 
 Tests download from consensus-specs releases and cache locally.
