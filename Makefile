@@ -1,6 +1,6 @@
 # Consensoor Makefile
 
-SPEC_VERSION ?= nightly-21555521715
+SPEC_VERSION ?= nightly
 SPEC_TESTS_DIR := tests/spec-tests
 DOWNLOAD_REFTESTS := tests/download_reftests.sh
 

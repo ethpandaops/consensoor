@@ -31,8 +31,14 @@ mkdir -p "${spec_tests_dir}"
 
 if [[ "${spec_version}" == nightly* ]]; then
   if [[ -z "${GITHUB_TOKEN:-}" ]]; then
-    echo "Error: GITHUB_TOKEN is not set"
-    exit 1
+    if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+      GITHUB_TOKEN="$(gh auth token)"
+      export GITHUB_TOKEN
+    else
+      echo "Error: GITHUB_TOKEN is not set and gh CLI is not authenticated"
+      echo "Either set GITHUB_TOKEN or run: gh auth login"
+      exit 1
+    fi
   fi
 
   for cmd in curl jq unzip; do
