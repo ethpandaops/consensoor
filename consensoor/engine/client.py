@@ -186,7 +186,7 @@ class EngineAPIClient:
     ) -> PayloadStatus:
         """Send a new payload to the execution layer using raw dict (no SSZ round-trip).
 
-        This is used for GLOAS/ePBS where the payload comes directly from getPayloadV6
+        This is used for GLOAS/ePBS where the payload comes directly from getPayloadV5
         and should be passed through without modification to avoid blockhash mismatch.
         """
         params = [
@@ -360,10 +360,7 @@ class EngineAPIClient:
         fork = self._get_fork_for_timestamp(timestamp)
         logger.info(f"get_payload: timestamp={timestamp}, fork={fork}, payload_id={payload_id.hex()}")
 
-        if fork == "gloas":
-            # GLOAS/Amsterdam uses V6 (distinct from Osaka/Fulu which uses V5)
-            return await self.get_payload_v6(payload_id)
-        elif fork == "fulu":
+        if fork in ("gloas", "fulu"):
             # Fulu/Osaka uses V5
             return await self.get_payload_v5(payload_id)
         elif fork == "electra":
@@ -433,10 +430,8 @@ class EngineAPIClient:
         logger.debug(f"new_payload: timestamp={timestamp}, fork={fork}")
 
         if fork == "gloas":
-            # GLOAS/ePBS uses V5 ("Amsterdam" in Geth)
             return await self.new_payload_v5(execution_payload, versioned_hashes or [], parent_beacon_block_root or b"\x00" * 32, execution_requests or [])
         elif fork in ("fulu", "electra"):
-            # Fulu/Osaka and Electra/Prague use V4
             return await self.new_payload_v4(execution_payload, versioned_hashes or [], parent_beacon_block_root or b"\x00" * 32, execution_requests or [])
         elif fork == "deneb":
             return await self.new_payload_v3(execution_payload, versioned_hashes or [], parent_beacon_block_root or b"\x00" * 32)
@@ -456,7 +451,6 @@ class EngineAPIClient:
             "engine_forkchoiceUpdatedV3",
             "engine_forkchoiceUpdatedV2",
             "engine_forkchoiceUpdatedV1",
-            "engine_getPayloadV6",
             "engine_getPayloadV5",
             "engine_getPayloadV4",
             "engine_getPayloadV3",

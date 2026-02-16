@@ -140,7 +140,7 @@ class ExecutionPayloadBid(Container):
     slot: Slot
     value: Gwei
     execution_payment: Gwei
-    blob_kzg_commitments: List[KZGCommitment, MAX_BLOB_COMMITMENTS_PER_BLOCK]
+    blob_kzg_commitments_root: Root
 
 
 class SignedExecutionPayloadBid(Container):
@@ -154,6 +154,7 @@ class ExecutionPayloadEnvelope(Container):
     builder_index: BuilderIndex
     beacon_block_root: Root
     slot: Slot
+    blob_kzg_commitments: List[KZGCommitment, MAX_BLOB_COMMITMENTS_PER_BLOCK]
     state_root: Root
 
 
@@ -253,7 +254,7 @@ class BeaconState(Container):
     builder_pending_payments: Vector[BuilderPendingPayment, 2 * SLOTS_PER_EPOCH()]
     builder_pending_withdrawals: List[BuilderPendingWithdrawal, BUILDER_PENDING_WITHDRAWALS_LIMIT]
     latest_block_hash: Hash32
-    payload_expected_withdrawals: List[Withdrawal, MAX_WITHDRAWALS_PER_PAYLOAD()]
+    payload_expected_withdrawals: Vector[Withdrawal, MAX_WITHDRAWALS_PER_PAYLOAD()]
 
 
 __all__ = [

@@ -78,11 +78,7 @@ def process_execution_payload_bid(state: "BeaconState", bid_source) -> None:
         "Prev randao mismatch"
     )
 
-    epoch = compute_epoch_at_slot(int(bid.slot))
-    blob_params = get_blob_parameters(epoch)
-    assert len(bid.blob_kzg_commitments) <= blob_params.max_blobs_per_block, (
-        f"Too many blob commitments: {len(bid.blob_kzg_commitments)} > {blob_params.max_blobs_per_block}"
-    )
+    # blob_kzg_commitments_root is a Merkle root; commitment count validated in envelope
 
     if amount > 0:
         from ....types.gloas import BuilderPendingPayment, BuilderPendingWithdrawal

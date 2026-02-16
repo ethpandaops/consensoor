@@ -599,7 +599,7 @@ class BlockBuilder:
             slot=Slot(slot),
             value=Gwei(0),
             execution_payment=Gwei(0),
-            blob_kzg_commitments=[],
+            blob_kzg_commitments_root=Root(b"\x00" * 32),
         )
 
         logger.debug(

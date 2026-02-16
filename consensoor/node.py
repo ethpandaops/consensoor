@@ -1468,6 +1468,7 @@ class BeaconNode:
             builder_index=BUILDER_INDEX_SELF_BUILD,
             beacon_block_root=Root(beacon_block_root),
             slot=Slot(slot),
+            blob_kzg_commitments=kzg_commitments,
             state_root=Root(state_root),
         )
 
@@ -1727,6 +1728,9 @@ class BeaconNode:
             metrics.update_head(slot, epoch)
             metrics.record_block_proposed(success=True)
 
+            # Remove included attestations from pool to avoid re-inclusion
+            self.attestation_pool.remove_included(list(block.body.attestations))
+
             # Now update forkchoice with the new block
             forkchoice_state = ForkchoiceState(
                 head_block_hash=new_block_hash,
@@ -1818,6 +1822,9 @@ class BeaconNode:
                 slot = int(block.slot)
                 epoch = slot // constants.SLOTS_PER_EPOCH()
                 metrics.update_head(slot, epoch)
+
+                # Remove included attestations from pool to avoid re-inclusion
+                self.attestation_pool.remove_included(list(block.body.attestations))
 
                 await self._update_forkchoice()
 

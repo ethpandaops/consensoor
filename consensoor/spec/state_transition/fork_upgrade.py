@@ -18,6 +18,7 @@ from ..types.capella import (
     CapellaBeaconState,
     ExecutionPayloadHeaderCapella,
     HistoricalSummary,
+    Withdrawal,
 )
 from ..types.deneb import DenebBeaconState, ExecutionPayloadHeader
 from ..types.electra import ElectraBeaconState
@@ -28,7 +29,7 @@ from ..types.gloas import (
     BuilderPendingPayment,
     BuilderPendingWithdrawal,
 )
-from ..constants import SLOTS_PER_EPOCH, SLOTS_PER_HISTORICAL_ROOT, FAR_FUTURE_EPOCH, MIN_SEED_LOOKAHEAD
+from ..constants import SLOTS_PER_EPOCH, SLOTS_PER_HISTORICAL_ROOT, FAR_FUTURE_EPOCH, MIN_SEED_LOOKAHEAD, MAX_WITHDRAWALS_PER_PAYLOAD
 from ..network_config import get_config
 from .helpers.accessors import get_activation_exit_churn_limit, get_current_epoch
 from .helpers.beacon_committee import get_beacon_proposer_indices
@@ -318,7 +319,7 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
         slot=pre.slot,
         value=Gwei(0),
         execution_payment=Gwei(0),
-        blob_kzg_commitments=[],
+        blob_kzg_commitments_root=Root(b"\x00" * 32),
     )
 
     slots_per_hist = SLOTS_PER_HISTORICAL_ROOT()
@@ -382,7 +383,7 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
         builder_pending_payments=[empty_pending_payment] * slots_2x_epoch,
         builder_pending_withdrawals=[],
         latest_block_hash=Hash32(pre_header.block_hash),
-        payload_expected_withdrawals=[],
+        payload_expected_withdrawals=[Withdrawal()] * MAX_WITHDRAWALS_PER_PAYLOAD(),
     )
 
     logger.info(f"Upgraded state to Gloas at epoch {epoch}")

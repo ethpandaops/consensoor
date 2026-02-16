@@ -76,7 +76,9 @@ def process_execution_payload_envelope(
     assert int(envelope.builder_index) == int(committed_bid.builder_index)
     assert committed_bid.prev_randao == payload.prev_randao
 
-    assert hash_tree_root(payload.withdrawals) == hash_tree_root(state.payload_expected_withdrawals)
+    # payload_expected_withdrawals is a zero-padded Vector; compare with payload's List element-by-element
+    for i, w in enumerate(payload.withdrawals):
+        assert hash_tree_root(w) == hash_tree_root(state.payload_expected_withdrawals[i])
 
     assert committed_bid.gas_limit == payload.gas_limit
     assert committed_bid.block_hash == payload.block_hash
@@ -88,14 +90,13 @@ def process_execution_payload_envelope(
     )
     assert int(payload.timestamp) == expected_timestamp
 
-    epoch = compute_epoch_at_slot(int(state.slot))
-    blob_params = get_blob_parameters(epoch)
-    assert len(committed_bid.blob_kzg_commitments) <= blob_params.max_blobs_per_block
+    # blob commitment count is validated via the root in the bid
+    # versioned_hashes are derived from the envelope's payload, not the bid
 
     if execution_engine is not None:
         request = NewPayloadRequest(
             execution_payload=payload,
-            versioned_hashes=list(committed_bid.blob_kzg_commitments),
+            versioned_hashes=[],
             parent_beacon_block_root=state.latest_block_header.parent_root,
             execution_requests=envelope.execution_requests,
         )

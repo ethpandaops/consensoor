@@ -393,8 +393,10 @@ def update_payload_expected_withdrawals(
     state: "BeaconState", withdrawals: Sequence["Withdrawal"]
 ) -> None:
     """Update payload_expected_withdrawals (Gloas)."""
+    from ...types.capella import Withdrawal as WithdrawalType
+    padded = list(withdrawals) + [WithdrawalType()] * (MAX_WITHDRAWALS_PER_PAYLOAD() - len(withdrawals))
     state.payload_expected_withdrawals = state.payload_expected_withdrawals.__class__(
-        withdrawals
+        padded
     )
 
 

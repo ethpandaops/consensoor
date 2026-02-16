@@ -118,17 +118,23 @@ class AttestationPool:
                     key = pooled.data_root
                 by_key[key].append(pooled)
 
-        # Aggregate attestations within each group
-        result = []
+        # Phase 1: Within-committee aggregation (same data_root + same committee_bits)
+        within_committee = []
         for key, pooled_list in by_key.items():
             try:
                 aggregated = self._aggregate_attestations(pooled_list, is_electra_block)
-                result.append(aggregated)
+                within_committee.append(aggregated)
             except Exception as e:
                 logger.warning(f"Failed to aggregate attestations for key {key[:16].hex()}: {e}")
-                # Fall back to first attestation in the group
                 if pooled_list:
-                    result.append(pooled_list[0].attestation)
+                    within_committee.append(pooled_list[0].attestation)
+
+        # Phase 2: Cross-committee aggregation for Electra
+        # Merge single-committee attestations with same data into one multi-committee attestation
+        if is_electra_block:
+            result = self._merge_across_committees(within_committee)
+        else:
+            result = within_committee
 
         # Sort by slot (newest first) and limit
         result.sort(key=lambda a: int(a.data.slot), reverse=True)
@@ -260,6 +266,94 @@ class AttestationPool:
                 signature=BLSSignature(aggregated_sig),
             )
 
+    def _merge_across_committees(self, attestations: list[AnyAttestation]) -> list[AnyAttestation]:
+        """Merge Electra attestations from different committees with same AttestationData.
+
+        In Electra, each validator produces a single-committee attestation. After
+        within-committee aggregation, we have one attestation per (data, committee).
+        This merges those into one attestation per data by concatenating
+        aggregation_bits in committee index order per the spec.
+        """
+        by_data: dict[bytes, list[AnyAttestation]] = defaultdict(list)
+        for att in attestations:
+            data_root = hash_tree_root(att.data)
+            by_data[data_root].append(att)
+
+        result = []
+        for data_root, atts in by_data.items():
+            if len(atts) == 1:
+                result.append(atts[0])
+                continue
+
+            # Collect per-committee data from single-committee attestations
+            # committee_index -> (aggregation_bits, signature)
+            committee_map: dict[int, tuple] = {}
+            multi_committee = []
+
+            for att in atts:
+                if not hasattr(att, 'committee_bits'):
+                    result.append(att)
+                    continue
+                committees = [i for i, b in enumerate(att.committee_bits) if b]
+                if len(committees) == 1:
+                    ci = committees[0]
+                    if ci not in committee_map:
+                        committee_map[ci] = (att.aggregation_bits, att.signature)
+                    else:
+                        existing_count = sum(1 for b in committee_map[ci][0] if b)
+                        new_count = sum(1 for b in att.aggregation_bits if b)
+                        if new_count > existing_count:
+                            committee_map[ci] = (att.aggregation_bits, att.signature)
+                else:
+                    multi_committee.append(att)
+
+            if not committee_map:
+                result.extend(atts)
+                continue
+
+            # Build merged attestation: concatenate aggregation_bits in committee order
+            from .spec.types.base import Bitlist, Bitvector
+            from .spec.types import BLSSignature
+
+            sorted_committees = sorted(committee_map.keys())
+
+            CommitteeBitsType = Bitvector[MAX_COMMITTEES_PER_SLOT()]
+            merged_committee_bits = CommitteeBitsType()
+            for ci in sorted_committees:
+                merged_committee_bits[ci] = True
+
+            AggBitsType = Bitlist[MAX_VALIDATORS_PER_COMMITTEE() * MAX_COMMITTEES_PER_SLOT()]
+            merged_agg_bits = AggBitsType()
+            for ci in sorted_committees:
+                bits = committee_map[ci][0]
+                for b in bits:
+                    merged_agg_bits.append(bool(b))
+
+            sigs = [bytes(committee_map[ci][1]) for ci in sorted_committees]
+            try:
+                aggregated_sig = aggregate_signatures(sigs)
+            except Exception as e:
+                logger.warning(f"Cross-committee signature aggregation failed: {e}")
+                result.extend(atts)
+                continue
+
+            merged = ElectraAttestation(
+                aggregation_bits=merged_agg_bits,
+                data=atts[0].data,
+                signature=BLSSignature(aggregated_sig),
+                committee_bits=merged_committee_bits,
+            )
+            result.append(merged)
+            result.extend(multi_committee)
+
+            logger.debug(
+                f"Cross-committee merge: {len(committee_map)} committees -> 1 attestation, "
+                f"slot={atts[0].data.slot}, committees={sorted_committees}, "
+                f"total_bits={len(merged_agg_bits)}"
+            )
+
+        return result
+
     def _merge_phase0_aggregation_bits(self, pooled_list: list[PooledAttestation]):
         """Merge aggregation bits for Phase0 attestations (OR operation)."""
         if not pooled_list:
@@ -327,6 +421,42 @@ class AttestationPool:
                         merged[i] = True
 
         return merged
+
+    def remove_included(self, attestations: list) -> int:
+        """Remove attestations that have been included in a block.
+
+        Matches by (slot, committee_index) and data_root to remove
+        attestations already on-chain, preventing re-inclusion in future blocks.
+
+        Args:
+            attestations: List of attestations that were included in a block
+
+        Returns:
+            Number of attestations removed
+        """
+        removed = 0
+        for att in attestations:
+            slot = int(att.data.slot)
+            committee_index = int(att.data.index)
+            key = (slot, committee_index)
+
+            if key not in self._attestations:
+                continue
+
+            data_root = hash_tree_root(att.data)
+            before = len(self._attestations[key])
+            self._attestations[key] = [
+                p for p in self._attestations[key] if p.data_root != data_root
+            ]
+            after = len(self._attestations[key])
+            removed += before - after
+
+            if not self._attestations[key]:
+                del self._attestations[key]
+
+        if removed > 0:
+            logger.debug(f"Removed {removed} included attestations from pool")
+        return removed
 
     def prune(self, current_slot: int) -> int:
         """Remove old attestations from the pool.
