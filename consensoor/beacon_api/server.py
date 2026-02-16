@@ -56,6 +56,7 @@ class BeaconAPI:
         self.app.router.add_get("/eth/v1/config/spec", self.get_spec)
         self.app.router.add_get("/eth/v1/config/fork_schedule", self.get_fork_schedule)
         self.app.router.add_get("/eth/v1/config/deposit_contract", self.get_deposit_contract)
+        self.app.router.add_get("/eth/v1/beacon/execution_payload_envelope/{block_id}", self.get_execution_payload_envelope)
         self.app.router.add_get("/eth/v1/events", self.get_events)
 
     async def start(self):
@@ -752,6 +753,92 @@ class BeaconAPI:
             }
         })
 
+    async def get_execution_payload_envelope(self, request: web.Request) -> web.Response:
+        """GET /eth/v1/beacon/execution_payload_envelope/{block_id}"""
+        block_id = request.match_info["block_id"]
+        logger.info(f"get_execution_payload_envelope request: block_id={block_id}")
+
+        # Resolve block_id to root
+        if block_id.startswith("0x"):
+            try:
+                root = bytes.fromhex(block_id[2:])
+            except ValueError:
+                return web.json_response({"message": "Invalid block root"}, status=400)
+        elif block_id == "head":
+            root = self.node.head_root
+        else:
+            try:
+                slot = int(block_id)
+                block = self.node.store.get_block_by_slot(slot)
+                if block:
+                    from ..crypto import hash_tree_root
+                    msg = block.message if hasattr(block, "message") else block
+                    root = hash_tree_root(msg)
+                else:
+                    return web.json_response({"message": "Block not found"}, status=404)
+            except ValueError:
+                return web.json_response({"message": "Invalid block id"}, status=400)
+
+        if root is None:
+            return web.json_response({"message": "Block not found"}, status=404)
+
+        signed_envelope = self.node.store.get_payload(root)
+        if signed_envelope is None:
+            return web.json_response({"message": "Execution payload envelope not found"}, status=404)
+
+        accept = request.headers.get("Accept", "application/json")
+
+        if "application/octet-stream" in accept:
+            ssz_bytes = signed_envelope.encode_bytes()
+            logger.info(f"Returning envelope SSZ: block_id={block_id}, size={len(ssz_bytes)}")
+            return web.Response(
+                body=ssz_bytes,
+                content_type="application/octet-stream",
+                headers={"Eth-Consensus-Version": "gloas"},
+            )
+
+        # JSON response
+        envelope = signed_envelope.message
+        payload = envelope.payload
+        data = {
+            "message": {
+                "payload": {
+                    "parent_hash": "0x" + bytes(payload.parent_hash).hex(),
+                    "fee_recipient": "0x" + bytes(payload.fee_recipient).hex(),
+                    "state_root": "0x" + bytes(payload.state_root).hex(),
+                    "receipts_root": "0x" + bytes(payload.receipts_root).hex(),
+                    "logs_bloom": "0x" + bytes(payload.logs_bloom).hex(),
+                    "prev_randao": "0x" + bytes(payload.prev_randao).hex(),
+                    "block_number": str(int(payload.block_number)),
+                    "gas_limit": str(int(payload.gas_limit)),
+                    "gas_used": str(int(payload.gas_used)),
+                    "timestamp": str(int(payload.timestamp)),
+                    "extra_data": "0x" + bytes(payload.extra_data).hex(),
+                    "base_fee_per_gas": str(int(payload.base_fee_per_gas)),
+                    "block_hash": "0x" + bytes(payload.block_hash).hex(),
+                    "transactions": ["0x" + bytes(tx).hex() for tx in payload.transactions],
+                },
+                "execution_requests": {
+                    "deposits": [],
+                    "withdrawals": [],
+                    "consolidations": [],
+                },
+                "builder_index": str(int(envelope.builder_index)),
+                "beacon_block_root": "0x" + bytes(envelope.beacon_block_root).hex(),
+                "slot": str(int(envelope.slot)),
+                "blob_kzg_commitments": ["0x" + bytes(c).hex() for c in envelope.blob_kzg_commitments],
+                "state_root": "0x" + bytes(envelope.state_root).hex(),
+            },
+            "signature": "0x" + bytes(signed_envelope.signature).hex(),
+        }
+        logger.info(f"Returning envelope JSON: block_id={block_id}")
+        return web.json_response({
+            "version": "gloas",
+            "execution_optimistic": False,
+            "finalized": False,
+            "data": data,
+        })
+
     async def get_blob_sidecars(self, request: web.Request) -> web.Response:
         """GET /eth/v1/beacon/blob_sidecars/{block_id}"""
         block_id = request.match_info["block_id"]
@@ -1074,7 +1161,8 @@ class BeaconAPI:
         topics_param = request.query.get("topics", "")
         topics = set(t.strip() for t in topics_param.split(",") if t.strip())
 
-        valid_topics = {"head", "block", "finalized_checkpoint", "chain_reorg"}
+        valid_topics = {"head", "block", "finalized_checkpoint", "chain_reorg",
+                        "execution_payload_available", "execution_payload_bid"}
         requested_topics = topics & valid_topics if topics else valid_topics
 
         if not requested_topics:
@@ -1197,3 +1285,38 @@ class BeaconAPI:
                 subscriber_queue.put_nowait(event)
             except asyncio.QueueFull:
                 logger.warning("Event queue full for subscriber, dropping event")
+
+    async def emit_execution_payload_available(self, slot: int, block_root: bytes) -> None:
+        """Emit execution_payload_available SSE event (ePBS)."""
+        event = {
+            "event": "execution_payload_available",
+            "data": {
+                "slot": str(slot),
+                "block_root": "0x" + block_root.hex(),
+            },
+        }
+        await self._broadcast_event(event)
+
+    async def emit_execution_payload_bid(self, signed_bid) -> None:
+        """Emit execution_payload_bid SSE event (ePBS)."""
+        bid = signed_bid.message
+        event = {
+            "event": "execution_payload_bid",
+            "data": {
+                "message": {
+                    "parent_block_hash": "0x" + bytes(bid.parent_block_hash).hex(),
+                    "parent_block_root": "0x" + bytes(bid.parent_block_root).hex(),
+                    "block_hash": "0x" + bytes(bid.block_hash).hex(),
+                    "prev_randao": "0x" + bytes(bid.prev_randao).hex(),
+                    "fee_recipient": "0x" + bytes(bid.fee_recipient).hex(),
+                    "gas_limit": str(int(bid.gas_limit)),
+                    "builder_index": str(int(bid.builder_index)),
+                    "slot": str(int(bid.slot)),
+                    "value": str(int(bid.value)),
+                    "execution_payment": str(int(bid.execution_payment)),
+                    "blob_kzg_commitments_root": "0x" + bytes(bid.blob_kzg_commitments_root).hex(),
+                },
+                "signature": "0x" + bytes(signed_bid.signature).hex(),
+            },
+        }
+        await self._broadcast_event(event)

@@ -1480,6 +1480,11 @@ class BeaconNode:
             signature=BLSSignature(g2_point_at_infinity),
         )
 
+        # Save by both envelope root and block root for API lookups
+        payload_root = hash_tree_root(envelope)
+        self.store.save_payload(payload_root, signed_envelope)
+        self.store.save_payload(beacon_block_root, signed_envelope)
+
         # Broadcast
         ssz_bytes = signed_envelope.encode_bytes()
         await self.beacon_gossip.publish_execution_payload(ssz_bytes)
@@ -1765,10 +1770,21 @@ class BeaconNode:
                             slot, block_root, execution_payload_dict, el_execution_requests,
                             payload_response.blobs_bundle
                         )
+                        if self.beacon_api:
+                            await self.beacon_api.emit_execution_payload_available(slot, block_root)
                     except Exception as e:
                         logger.error(f"Failed to broadcast execution payload envelope: {e}")
                         import traceback
                         traceback.print_exc()
+
+                    # Emit execution_payload_bid SSE event
+                    if self.beacon_api and hasattr(block.body, 'signed_execution_payload_bid'):
+                        try:
+                            await self.beacon_api.emit_execution_payload_bid(
+                                block.body.signed_execution_payload_bid
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to emit execution_payload_bid event: {e}")
 
         except Exception as e:
             logger.error(f"Block production failed: {e}")
@@ -1828,6 +1844,15 @@ class BeaconNode:
 
                 await self._update_forkchoice()
 
+                # Emit ePBS SSE events for received blocks
+                if self.beacon_api and hasattr(block.body, 'signed_execution_payload_bid'):
+                    try:
+                        await self.beacon_api.emit_execution_payload_bid(
+                            block.body.signed_execution_payload_bid
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to emit execution_payload_bid event: {e}")
+
         except Exception as e:
             logger.error(f"Error processing block: {e}")
 
@@ -1842,6 +1867,12 @@ class BeaconNode:
             )
 
             self.store.save_bid(int(bid.slot), signed_bid)
+
+            if self.beacon_api:
+                try:
+                    await self.beacon_api.emit_execution_payload_bid(signed_bid)
+                except Exception as e:
+                    logger.error(f"Failed to emit execution_payload_bid event: {e}")
 
         except Exception as e:
             logger.error(f"Error processing bid: {e}")
@@ -1859,9 +1890,18 @@ class BeaconNode:
 
             payload_root = hash_tree_root(envelope)
             self.store.save_payload(payload_root, signed_envelope)
+            self.store.save_payload(bytes(envelope.beacon_block_root), signed_envelope)
 
             if self.engine:
                 await self._validate_execution_payload(envelope)
+
+            if self.beacon_api:
+                try:
+                    await self.beacon_api.emit_execution_payload_available(
+                        int(envelope.slot), bytes(envelope.beacon_block_root)
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to emit execution_payload_available event: {e}")
 
         except Exception as e:
             logger.error(f"Error processing payload: {e}")
