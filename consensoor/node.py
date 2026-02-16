@@ -514,6 +514,7 @@ class BeaconNode:
             self.beacon_gossip.subscribe_aggregates(self._on_p2p_aggregate)
             self.beacon_gossip.subscribe_sync_committee_contributions(self._on_p2p_sync_committee_contribution)
             self.beacon_gossip.subscribe_blob_sidecars(self._on_p2p_blob_sidecar)
+            self.beacon_gossip.subscribe_execution_payloads(self._on_p2p_execution_payload)
             self.beacon_gossip.set_status_provider(self._get_chain_status)
 
             await self.beacon_gossip.start()
@@ -613,6 +614,7 @@ class BeaconNode:
             (net_config.deneb_fork_version, "deneb"),
             (net_config.electra_fork_version, "electra"),
             (net_config.fulu_fork_version, "fulu"),
+            (net_config.gloas_fork_version, "gloas"),
         ]
 
         fork_epochs = [
@@ -623,6 +625,7 @@ class BeaconNode:
             net_config.deneb_fork_epoch,
             net_config.electra_fork_epoch,
             net_config.fulu_fork_epoch,
+            net_config.gloas_fork_epoch,
         ]
 
         for i, (fork_version, fork_name) in enumerate(forks):
@@ -664,11 +667,17 @@ class BeaconNode:
         return digests
 
     def _get_blob_params_for_epoch(self, net_config, epoch: int) -> tuple[int, int] | None:
-        """Get blob params (epoch, max_blobs) for fork digest modification."""
+        """Get blob params (epoch, max_blobs) for fork digest modification.
+
+        BPO (blob parameter override) XOR is Fulu-specific. Gloas and later
+        forks use their own fork_version without blob_params modification.
+        """
         from .spec import constants
 
         FAR_FUTURE_EPOCH = 2**64 - 1
         if epoch < net_config.fulu_fork_epoch or net_config.fulu_fork_epoch >= FAR_FUTURE_EPOCH:
+            return None
+        if net_config.gloas_fork_epoch < FAR_FUTURE_EPOCH and epoch >= net_config.gloas_fork_epoch:
             return None
 
         if getattr(net_config, "blob_schedule", None):
@@ -697,12 +706,6 @@ class BeaconNode:
         to the correct gossipsub topic.
         """
         if not self.beacon_gossip or not self.state:
-            return
-
-        # If we have a fork_digest_override (from devnet ENR), always use that
-        # Devnets use custom fork digests that don't match computed values
-        if self._fork_digest_override:
-            self.beacon_gossip.update_fork_digest(self._fork_digest_override)
             return
 
         try:
@@ -2160,6 +2163,39 @@ class BeaconNode:
             )
         except Exception as e:
             logger.error(f"Error processing P2P sync committee contribution: {e}")
+
+    async def _on_p2p_execution_payload(self, data: bytes, from_peer: str) -> None:
+        """Handle an execution payload envelope received via libp2p gossipsub."""
+        try:
+            from .spec.types.gloas import SignedExecutionPayloadEnvelope
+
+            signed_envelope = SignedExecutionPayloadEnvelope.decode_bytes(data)
+            envelope = signed_envelope.message
+
+            logger.info(
+                f"P2P: Received execution payload envelope slot={envelope.slot}, "
+                f"block_hash={bytes(envelope.payload.block_hash).hex()[:16]}, "
+                f"from={from_peer[:16]}"
+            )
+
+            payload_root = hash_tree_root(envelope)
+            beacon_block_root = bytes(envelope.beacon_block_root)
+            self.store.save_payload(payload_root, signed_envelope)
+            self.store.save_payload(beacon_block_root, signed_envelope)
+
+            if self.engine:
+                await self._validate_execution_payload(envelope)
+
+            if self.beacon_api:
+                try:
+                    await self.beacon_api.emit_execution_payload_available(
+                        int(envelope.slot), beacon_block_root
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to emit execution_payload_available event: {e}")
+
+        except Exception as e:
+            logger.error(f"Error processing P2P execution payload envelope: {e}")
 
     async def _on_p2p_blob_sidecar(self, data: bytes, from_peer: str) -> None:
         """Handle a blob sidecar received via libp2p gossipsub."""
