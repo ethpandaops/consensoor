@@ -169,7 +169,9 @@ class NetworkConfig:
                 elif attr_name in fork_version_fields and isinstance(value, int):
                     value = value.to_bytes(4, "big")
                 elif attr_name == "blob_schedule" and isinstance(value, list):
-                    pass
+                    value = [
+                        {k.lower(): v for k, v in entry.items()} for entry in value
+                    ]
                 setattr(config, attr_name, value)
 
         # Log fork epochs for debugging
