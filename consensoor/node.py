@@ -188,6 +188,7 @@ class BeaconNode:
         self._current_payload_id: Optional[bytes] = None
         self._current_payload_beacon_root: Optional[bytes] = None  # Store head_root used in forkchoiceUpdated
         self._fork_digest_override: Optional[bytes] = None  # For devnets with custom fork digests
+        self._pending_envelopes: dict[bytes, Any] = {}  # beacon_block_root -> signed_envelope
 
     async def start(self) -> None:
         """Start the beacon node."""
@@ -1461,10 +1462,34 @@ class BeaconNode:
                 commitment_bytes = bytes.fromhex(commitment_hex.replace("0x", ""))
                 kzg_commitments.append(KZGCommitment(commitment_bytes))
 
-        # Compute state root (use the current state's root)
+        # Build envelope with placeholder state_root (will be computed after phase 2)
+        envelope = ExecutionPayloadEnvelope(
+            payload=execution_payload,
+            execution_requests=exec_requests_obj,
+            builder_index=BUILDER_INDEX_SELF_BUILD,
+            beacon_block_root=Root(beacon_block_root),
+            slot=Slot(slot),
+            blob_kzg_commitments=kzg_commitments,
+            state_root=Root(b"\x00" * 32),
+        )
+
+        g2_point_at_infinity = b"\xc0" + b"\x00" * 95
+        signed_envelope = SignedExecutionPayloadEnvelope(
+            message=envelope,
+            signature=BLSSignature(g2_point_at_infinity),
+        )
+
+        # Apply phase 2 (envelope processing) to state - updates latest_block_hash,
+        # execution_payload_availability, processes execution requests, etc.
+        from .spec.state_transition.block.execution_payload_envelope import (
+            process_execution_payload_envelope,
+        )
+        process_execution_payload_envelope(self.state, signed_envelope, verify=False)
+
+        # Now compute the correct post-phase-2 state root
         state_root = hash_tree_root(self.state)
 
-        # Build the envelope
+        # Rebuild envelope with correct state_root
         envelope = ExecutionPayloadEnvelope(
             payload=execution_payload,
             execution_requests=exec_requests_obj,
@@ -1474,10 +1499,6 @@ class BeaconNode:
             blob_kzg_commitments=kzg_commitments,
             state_root=Root(state_root),
         )
-
-        # For self-build, use G2 point-at-infinity signature (no actual signing needed)
-        g2_point_at_infinity = b"\xc0" + b"\x00" * 95
-
         signed_envelope = SignedExecutionPayloadEnvelope(
             message=envelope,
             signature=BLSSignature(g2_point_at_infinity),
@@ -1494,6 +1515,7 @@ class BeaconNode:
         logger.info(
             f"Broadcast execution payload envelope for slot {slot}: "
             f"block_hash={bytes(execution_payload.block_hash).hex()[:16]}, "
+            f"latest_block_hash={bytes(self.state.latest_block_hash).hex()[:16]}, "
             f"commitments={len(kzg_commitments)}"
         )
 
@@ -1705,13 +1727,19 @@ class BeaconNode:
                 self.state.latest_block_header.state_root = bytes(block.state_root)
                 logger.debug(f"Filled in latest_block_header.state_root: {bytes(block.state_root).hex()[:16]}")
 
-            # For GLOAS self-build: update state.latest_block_hash after state transition
-            # This is needed because process_execution_payload_bid only stores the bid,
-            # but doesn't update latest_block_hash (which happens in payload reveal normally)
-            if is_gloas and hasattr(self.state, 'latest_block_hash'):
-                from .spec.types import Hash32
-                self.state.latest_block_hash = Hash32(new_block_hash)
-                logger.info(f"GLOAS: Updated state.latest_block_hash to {new_block_hash.hex()[:16]}")
+            # For GLOAS: apply phase 2 (envelope processing) to state BEFORE saving.
+            # This updates latest_block_hash, execution_payload_availability, etc.
+            # Must happen before state save so the saved state includes phase 2 changes.
+            if is_gloas:
+                try:
+                    await self._broadcast_execution_payload_envelope(
+                        slot, block_root, execution_payload_dict, el_execution_requests,
+                        payload_response.blobs_bundle
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to build/apply execution payload envelope: {e}")
+                    import traceback
+                    traceback.print_exc()
 
             # Save state for epoch queries (Dora needs historical states by state_root)
             # This MUST happen before updating head_slot/head_root to avoid race condition
@@ -1720,7 +1748,6 @@ class BeaconNode:
             self.store.save_state(state_root, self.state)
             self.store.save_state(block_root, self.state)  # Also by block_root for flexibility
             # Also save by the block's state_root field, as that's what Dora looks for
-            # (may differ from computed hash if latest_block_header.state_root was filled in)
             block_state_root = bytes(block.state_root)
             if block_state_root != state_root:
                 self.store.save_state(block_state_root, self.state)
@@ -1766,19 +1793,12 @@ class BeaconNode:
                 except Exception as e:
                     logger.error(f"Failed to publish block to P2P: {e}")
 
-                # For GLOAS self-build: also broadcast the execution payload envelope
                 if is_gloas:
-                    try:
-                        await self._broadcast_execution_payload_envelope(
-                            slot, block_root, execution_payload_dict, el_execution_requests,
-                            payload_response.blobs_bundle
-                        )
-                        if self.beacon_api:
+                    if self.beacon_api:
+                        try:
                             await self.beacon_api.emit_execution_payload_available(slot, block_root)
-                    except Exception as e:
-                        logger.error(f"Failed to broadcast execution payload envelope: {e}")
-                        import traceback
-                        traceback.print_exc()
+                        except Exception as e:
+                            logger.error(f"Failed to emit execution_payload_available: {e}")
 
                     # Emit execution_payload_bid SSE event
                     if self.beacon_api and hasattr(block.body, 'signed_execution_payload_bid'):
@@ -2097,12 +2117,22 @@ class BeaconNode:
                         f"P2P: Adopted block as new head: slot={block.slot}, "
                         f"root={block_root.hex()[:16]}"
                     )
+
+                    # For Gloas blocks: check if we have a pending envelope for phase 2
+                    is_gloas_block = hasattr(block.body, "signed_execution_payload_bid")
+                    if is_gloas_block and block_root in self._pending_envelopes:
+                        pending_envelope = self._pending_envelopes.pop(block_root)
+                        logger.info(f"P2P: Found pending envelope for block {block_root.hex()[:16]}, applying phase 2")
+                        await self._apply_execution_payload_envelope(pending_envelope)
+
                     await self._update_forkchoice()
                 except Exception as e:
                     logger.warning(
                         f"P2P: Failed to apply block slot={block.slot}: {e}. "
                         f"Keeping head at {old_head.hex()[:16] if old_head else 'None'}"
                     )
+                    import traceback
+                    traceback.print_exc()
             else:
                 logger.debug(f"P2P: Block slot={block.slot} not newer than head_slot={self.head_slot}")
 
@@ -2185,6 +2215,9 @@ class BeaconNode:
 
             if self.engine:
                 await self._validate_execution_payload(envelope)
+
+            # Apply phase 2 (envelope processing) to state if the block has been processed
+            await self._apply_execution_payload_envelope(signed_envelope)
 
             if self.beacon_api:
                 try:
@@ -2318,6 +2351,75 @@ class BeaconNode:
             f"block_hash={bytes(block.body.execution_payload.block_hash).hex()[:16] if hasattr(block.body, 'execution_payload') else 'N/A'}, "
             f"latest_header_slot={self.state.latest_block_header.slot}"
         )
+
+    async def _apply_execution_payload_envelope(self, signed_envelope) -> None:
+        """Apply execution payload envelope (phase 2) to state.
+
+        In Gloas ePBS, the state transition has two phases:
+        - Phase 1: block processing (proposer's block with bid)
+        - Phase 2: envelope processing (builder's payload reveal)
+
+        This method applies phase 2. It checks that the block for this
+        envelope has already been processed (matching slot and beacon_block_root).
+        If the block hasn't been processed yet, saves the envelope as pending.
+        """
+        if not self.state:
+            return
+
+        envelope = signed_envelope.message
+        envelope_slot = int(envelope.slot)
+        beacon_block_root = bytes(envelope.beacon_block_root)
+
+        # Check if the block has been processed (state is at the right slot)
+        if int(self.state.slot) != envelope_slot:
+            logger.info(
+                f"Envelope for slot {envelope_slot} but state at slot {self.state.slot}, "
+                f"saving as pending"
+            )
+            self._pending_envelopes[beacon_block_root] = signed_envelope
+            return
+
+        # Verify beacon_block_root matches current state's latest block header
+        current_header_root = hash_tree_root(self.state.latest_block_header)
+        if beacon_block_root != current_header_root:
+            # state.latest_block_header.state_root may be 0x00 still - fill it in
+            # and re-check (process_execution_payload_envelope does this too)
+            if bytes(self.state.latest_block_header.state_root) == b"\x00" * 32:
+                self.state.latest_block_header.state_root = hash_tree_root(self.state)
+                current_header_root = hash_tree_root(self.state.latest_block_header)
+
+            if beacon_block_root != current_header_root:
+                logger.warning(
+                    f"Envelope beacon_block_root {beacon_block_root.hex()[:16]} doesn't match "
+                    f"state header root {current_header_root.hex()[:16]}, saving as pending"
+                )
+                self._pending_envelopes[beacon_block_root] = signed_envelope
+                return
+
+        try:
+            from .spec.state_transition.block.execution_payload_envelope import (
+                process_execution_payload_envelope,
+            )
+
+            process_execution_payload_envelope(
+                self.state, signed_envelope, verify=False
+            )
+
+            # Re-save state after phase 2
+            state_root = hash_tree_root(self.state)
+            self.store.save_state(state_root, self.state)
+            if self.head_root:
+                self.store.save_state(self.head_root, self.state)
+
+            logger.info(
+                f"Phase 2 applied: slot={envelope_slot}, "
+                f"latest_block_hash={bytes(self.state.latest_block_hash).hex()[:16]}, "
+                f"state_root={state_root.hex()[:16]}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to apply envelope (phase 2) for slot {envelope_slot}: {e}")
+            import traceback
+            traceback.print_exc()
 
     async def _apply_minimal_block_update(self, block) -> None:
         """Apply minimal block updates when full state transition fails.
