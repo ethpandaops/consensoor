@@ -885,7 +885,13 @@ class BeaconNode:
                 # Phase 1: Slot start - propose blocks and update forkchoice
                 if current_slot > last_slot_processed:
                     last_slot_processed = current_slot
-                    await self._on_slot_start(current_slot)
+                    epoch = current_slot // slots_per_epoch
+                    # Ensure attester duties are cached inline so attestations
+                    # can fire on time even while slot work runs in background
+                    await self._ensure_attester_duties(epoch)
+                    # Launch heavy slot work as background task so the event loop
+                    # stays responsive for gossipsub block processing
+                    asyncio.create_task(self._on_slot_start_safe(current_slot))
 
                 # Phase 2: Attestation due time - produce attestations
                 if current_slot > last_attestation_slot and time_into_slot >= attestation_offset:
@@ -910,6 +916,17 @@ class BeaconNode:
                 logger.error(f"Slot ticker error: {e}", exc_info=True)
                 await asyncio.sleep(1)  # Prevent tight loop on errors
 
+    async def _on_slot_start_safe(self, slot: int) -> None:
+        """Wrapper around _on_slot_start that catches exceptions.
+
+        Used when _on_slot_start is launched as a background task via
+        asyncio.create_task, which would otherwise silently swallow errors.
+        """
+        try:
+            await self._on_slot_start(slot)
+        except Exception as e:
+            logger.error(f"Slot start error for slot {slot}: {e}", exc_info=True)
+
     async def _on_slot_start(self, slot: int) -> None:
         """Handle the start of a new slot (0/3 mark).
 
@@ -920,12 +937,23 @@ class BeaconNode:
         epoch = slot // slots_per_epoch
         logger.info(f"Slot {slot} (epoch {epoch})")
 
-        # Check if we need to sync blocks via req/resp (fallback for gossipsub issues)
-        await self._sync_missing_blocks(slot)
+        # Produce sync committee messages — block builder needs them in pool
+        await self._produce_sync_committee_messages(slot)
 
-        # NOTE: Don't update head_slot here - it should only be updated when we
-        # actually have a block for a slot (either produced locally or received via P2P)
-        # The head_slot tracks the slot of the actual chain head, not the current clock
+        # Yield to event loop so gossipsub blocks can be processed
+        await asyncio.sleep(0)
+
+        # Propose block — payload is already prepared from previous slot's forkchoice
+        await self._maybe_propose_block(slot)
+
+        # Yield to event loop so gossipsub blocks can be processed
+        await asyncio.sleep(0)
+
+        # Broadcast sync committee contributions (BLS-heavy, deferred until after block proposal)
+        await self._broadcast_sync_committee_contributions(slot, self.state)
+
+        # Yield to event loop so gossipsub blocks can be processed
+        await asyncio.sleep(0)
 
         if slot % slots_per_epoch == 0:
             logger.info(f"New epoch: {epoch}")
@@ -941,11 +969,14 @@ class BeaconNode:
         # Compute attester duties for current epoch if not cached
         await self._ensure_attester_duties(epoch)
 
-        # Produce sync committee messages at slot start (Altair+)
-        await self._produce_sync_committee_messages(slot)
+        # Yield to event loop so gossipsub blocks can be processed
+        await asyncio.sleep(0)
 
-        # Check if we should propose a block FIRST (uses payload_id from previous slot's forkchoice)
-        await self._maybe_propose_block(slot)
+        # Check if we need to sync blocks via req/resp (fallback for gossipsub issues)
+        await self._sync_missing_blocks(slot)
+
+        # Yield to event loop so gossipsub blocks can be processed
+        await asyncio.sleep(0)
 
         # Update forkchoice to keep EL in sync and prepare payload for NEXT slot
         await self._update_forkchoice_for_slot(slot)
@@ -1049,16 +1080,10 @@ class BeaconNode:
         if not self.state:
             return
 
-        # Use a temp copy for proposer duty calculation to avoid mutating self.state
-        # This is necessary because state_transition needs to advance state from pre-slot
-        temp_state = self.state
-        if slot > int(temp_state.slot):
-            temp_state = process_slots(
-                temp_state.__class__.decode_bytes(bytes(temp_state.encode_bytes())),
-                slot
-            )
-
-        proposer_key = self.validator_client.is_our_proposer_slot(temp_state, slot)
+        # Check proposer duty using current state — proposer_lookahead allows O(1)
+        # lookup without needing state advanced to the exact slot. Only fall back to
+        # expensive deep copy + process_slots if lookahead is unavailable.
+        proposer_key = self.validator_client.is_our_proposer_slot(self.state, slot)
         if not proposer_key:
             return
 
@@ -1211,12 +1236,10 @@ class BeaconNode:
         if not self._sync_committee_duties:
             return
 
+        # Use current state directly — produce_sync_committee_message only needs
+        # block_roots and fork version, both of which are already correct.
+        # Avoids expensive deep copy + process_slots that blocks the event loop.
         state_for_signing = self.state
-        if int(self.state.slot) < slot:
-            state_for_signing = process_slots(
-                self.state.__class__.decode_bytes(bytes(self.state.encode_bytes())),
-                slot
-            )
 
         for validator_index, positions in self._sync_committee_duties.items():
             for pubkey, key in self.validator_client.keys.items():
@@ -1233,8 +1256,6 @@ class BeaconNode:
             f"Produced sync committee messages: slot={slot}, "
             f"pool_size={self.sync_committee_pool.size}"
         )
-
-        await self._broadcast_sync_committee_contributions(slot, state_for_signing)
 
     async def _broadcast_sync_committee_contributions(self, slot: int, state) -> None:
         """Broadcast sync committee contributions for each subcommittee."""
@@ -1533,10 +1554,11 @@ class BeaconNode:
             network_config = get_config()
             timestamp = self._genesis_time + slot * (network_config.slot_duration_ms // 1000)
 
-            # Always request a fresh payload for this slot to ensure correct timestamp
-            # This is safer than relying on a previously prepared payload which might be stale
-            logger.info(f"Requesting fresh payload for slot {slot}")
-            await self._request_payload_for_slot(slot)
+            # Use payload prepared by previous slot's forkchoice update if available.
+            # Only request fresh payload if we don't have one (avoids redundant EL roundtrip).
+            if not self._current_payload_id:
+                logger.info(f"No prepared payload, requesting fresh for slot {slot}")
+                await self._request_payload_for_slot(slot)
             if not self._current_payload_id:
                 logger.warning("Cannot produce block: failed to get payload_id")
                 return
