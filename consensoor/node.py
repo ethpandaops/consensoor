@@ -517,6 +517,7 @@ class BeaconNode:
             self.beacon_gossip.subscribe_blob_sidecars(self._on_p2p_blob_sidecar)
             self.beacon_gossip.subscribe_execution_payloads(self._on_p2p_execution_payload)
             self.beacon_gossip.set_status_provider(self._get_chain_status)
+            self.beacon_gossip.set_block_provider(self._get_block_for_slot)
 
             await self.beacon_gossip.start()
             await self.beacon_gossip.activate_subscriptions()
@@ -568,6 +569,38 @@ class BeaconNode:
             "finalized_root": finalized_root,
             "earliest_available_slot": 0,
         }
+
+    def _get_block_for_slot(self, slot: int) -> Optional[tuple[bytes, bytes]]:
+        """Get a block for a given slot for serving via req/resp.
+
+        Returns (ssz_encoded_signed_block, fork_digest_context) or None.
+        Called from the P2P host's Trio thread — must be thread-safe and
+        avoid async operations.
+        """
+        try:
+            block = self.store.get_block_by_slot(slot)
+            if block is None:
+                return None
+
+            block_ssz = block.encode_bytes()
+
+            # Compute fork digest context for this block's slot
+            from .p2p.encoding import compute_fork_digest
+            from .spec.network_config import get_config as get_network_config
+            from .spec.constants import SLOTS_PER_EPOCH
+
+            net_config = get_network_config()
+            epoch = slot // SLOTS_PER_EPOCH()
+            fork_version = net_config.get_fork_version(epoch)
+            genesis_validators_root = bytes(self.state.genesis_validators_root) if self.state else b"\x00" * 32
+
+            fork_digest = compute_fork_digest(fork_version, genesis_validators_root)
+
+            return (block_ssz, fork_digest)
+
+        except Exception as e:
+            logger.warning(f"Failed to get block for slot {slot}: {e}")
+            return None
 
     def _get_next_fork_info(self, net_config, current_epoch: int) -> tuple[bytes, int]:
         """Get the next scheduled fork version and epoch.
@@ -1490,7 +1523,6 @@ class BeaconNode:
             builder_index=BUILDER_INDEX_SELF_BUILD,
             beacon_block_root=Root(beacon_block_root),
             slot=Slot(slot),
-            blob_kzg_commitments=kzg_commitments,
             state_root=Root(b"\x00" * 32),
         )
 
@@ -1517,7 +1549,6 @@ class BeaconNode:
             builder_index=BUILDER_INDEX_SELF_BUILD,
             beacon_block_root=Root(beacon_block_root),
             slot=Slot(slot),
-            blob_kzg_commitments=kzg_commitments,
             state_root=Root(state_root),
         )
         signed_envelope = SignedExecutionPayloadEnvelope(
@@ -1578,7 +1609,8 @@ class BeaconNode:
             el_execution_requests = payload_response.execution_requests or []
 
             signed_block = await self.block_builder.build_block(
-                slot, proposer_key, execution_payload_dict
+                slot, proposer_key, execution_payload_dict,
+                blobs_bundle=payload_response.blobs_bundle,
             )
             if signed_block is None:
                 logger.error("Failed to build block")

@@ -78,8 +78,6 @@ def process_execution_payload_bid(state: "BeaconState", bid_source) -> None:
         "Prev randao mismatch"
     )
 
-    # blob_kzg_commitments_root is a Merkle root; commitment count validated in envelope
-
     if amount > 0:
         from ....types.gloas import BuilderPendingPayment, BuilderPendingWithdrawal
         from ....constants import SLOTS_PER_EPOCH

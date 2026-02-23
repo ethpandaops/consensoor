@@ -124,6 +124,16 @@ class P2PHost:
         self._listen_ip: Optional[str] = None
         self._private_key_bytes: Optional[bytes] = None
         self._status_provider: Optional[Callable[[], dict]] = None
+        self._block_provider: Optional[Callable[[int], Optional[tuple[bytes, bytes]]]] = None
+
+    def set_block_provider(self, provider: Callable[[int], Optional[tuple[bytes, bytes]]]) -> None:
+        """Set the block provider callback for serving blocks by slot.
+
+        The provider takes a slot number and returns a tuple of
+        (ssz_encoded_signed_block, fork_digest_context) or None if
+        no block is available for that slot.
+        """
+        self._block_provider = provider
 
     def set_status_provider(self, provider: Callable[[], dict]) -> None:
         """Set the status provider callback.
@@ -389,6 +399,12 @@ class P2PHost:
         ping_protocol = TProtocol("/eth2/beacon_chain/req/ping/1/ssz_snappy")
         self._host.set_stream_handler(ping_protocol, self._handle_ping_request)
 
+        # BeaconBlocksByRange v2 (Altair+) and v1
+        blocks_by_range_v2 = TProtocol("/eth2/beacon_chain/req/beacon_blocks_by_range/2/ssz_snappy")
+        self._host.set_stream_handler(blocks_by_range_v2, self._handle_blocks_by_range_request)
+        blocks_by_range_v1 = TProtocol("/eth2/beacon_chain/req/beacon_blocks_by_range/1/ssz_snappy")
+        self._host.set_stream_handler(blocks_by_range_v1, self._handle_blocks_by_range_request)
+
         logger.info(
             f"Registered Ethereum P2P protocol handlers "
             f"(custody_group_count={self.config.custody_group_count})"
@@ -606,6 +622,82 @@ class P2PHost:
 
         except Exception as e:
             logger.warning(f"Error handling ping request: {e}")
+            try:
+                await stream.close()
+            except Exception:
+                pass
+
+    async def _handle_blocks_by_range_request(self, stream) -> None:
+        """Handle incoming beacon_blocks_by_range request (v1 and v2).
+
+        Request format: varint(uncompressed_len) + snappy_framed(start_slot:8 + count:8 + step:8)
+        Response format per block: response_code:1 + context:4 + varint(uncompressed_len) + snappy_framed(block_ssz)
+        """
+        import varint
+
+        try:
+            peer_id = stream.muxed_conn.peer_id.to_base58()
+
+            # Read request (varint length + snappy framed request body)
+            raw = await stream.read(4096)
+            if not raw:
+                await stream.close()
+                return
+
+            # Decode varint length prefix
+            uncompressed_len, consumed = self._decode_varint(raw)
+            compressed_data = raw[consumed:]
+
+            # Decompress request
+            import snappy
+            decompressor = snappy.StreamDecompressor()
+            request_ssz = decompressor.decompress(compressed_data)
+
+            if len(request_ssz) < 24:
+                logger.warning(f"blocks_by_range request too short: {len(request_ssz)} bytes")
+                await stream.write(b"\x01")
+                await stream.close()
+                return
+
+            start_slot = int.from_bytes(request_ssz[0:8], "little")
+            count = int.from_bytes(request_ssz[8:16], "little")
+            # step is always 1 post-Altair, ignore bytes 16:24
+
+            # Cap count to prevent abuse
+            max_count = 128
+            count = min(count, max_count)
+
+            logger.info(
+                f"Serving blocks_by_range: start={start_slot}, count={count}, "
+                f"peer={peer_id[:16]}"
+            )
+
+            if not self._block_provider:
+                logger.warning("No block provider set, cannot serve blocks")
+                await stream.close()
+                return
+
+            blocks_sent = 0
+            for slot in range(start_slot, start_slot + count):
+                result = self._block_provider(slot)
+                if result is None:
+                    continue
+
+                block_ssz, fork_digest = result
+                compressed = self._snappy_frame_compress(block_ssz)
+                response_code = b"\x00"
+                length_prefix = varint.encode(len(block_ssz))
+                chunk = response_code + fork_digest + length_prefix + compressed
+                await stream.write(chunk)
+                blocks_sent += 1
+
+            await stream.close()
+            logger.info(f"Served {blocks_sent} blocks to {peer_id[:16]}")
+
+        except Exception as e:
+            logger.warning(f"Error handling blocks_by_range request: {e}")
+            import traceback
+            traceback.print_exc()
             try:
                 await stream.close()
             except Exception:

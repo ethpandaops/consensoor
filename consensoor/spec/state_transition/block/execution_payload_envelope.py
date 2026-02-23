@@ -76,7 +76,7 @@ def process_execution_payload_envelope(
     assert int(envelope.builder_index) == int(committed_bid.builder_index)
     assert committed_bid.prev_randao == payload.prev_randao
 
-    # payload_expected_withdrawals is a zero-padded Vector; compare with payload's List element-by-element
+    assert len(payload.withdrawals) == len(state.payload_expected_withdrawals)
     for i, w in enumerate(payload.withdrawals):
         assert hash_tree_root(w) == hash_tree_root(state.payload_expected_withdrawals[i])
 
@@ -89,9 +89,6 @@ def process_execution_payload_envelope(
         int(state.genesis_time), int(state.slot), network_config.slot_duration_ms
     )
     assert int(payload.timestamp) == expected_timestamp
-
-    # blob commitment count is validated via the root in the bid
-    # versioned_hashes are derived from the envelope's payload, not the bid
 
     if execution_engine is not None:
         request = NewPayloadRequest(

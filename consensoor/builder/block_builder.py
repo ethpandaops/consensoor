@@ -128,6 +128,7 @@ class BlockBuilder:
         slot: int,
         proposer_key: "ValidatorKey",
         execution_payload_dict: dict,
+        blobs_bundle: dict | None = None,
     ) -> Optional[AnySignedBeaconBlock]:
         """Build a complete signed beacon block."""
         import time as time_mod
@@ -219,7 +220,7 @@ class BlockBuilder:
         if fork == "gloas":
             # GLOAS (ePBS): Build execution payload bid for self-build mode
             execution_payload_bid = self._build_execution_payload_bid(
-                temp_state, slot, execution_payload_dict
+                temp_state, slot, execution_payload_dict, blobs_bundle
             )
             # Self-build uses G2 point-at-infinity signature (no actual signing needed)
             g2_point_at_infinity = b"\xc0" + b"\x00" * 95
@@ -566,6 +567,7 @@ class BlockBuilder:
         state,
         slot: int,
         execution_payload_dict: dict,
+        blobs_bundle: dict | None = None,
     ) -> ExecutionPayloadBid:
         """Build an ExecutionPayloadBid for self-build mode (ePBS).
 
@@ -588,6 +590,12 @@ class BlockBuilder:
         parent_block_hash = bytes(state.latest_block_hash) if hasattr(state, "latest_block_hash") else b"\x00" * 32
         parent_block_root = hash_tree_root(state.latest_block_header)
 
+        from ..spec.types import KZGCommitment
+        kzg_commitments = []
+        if blobs_bundle:
+            for c in blobs_bundle.get("commitments", []):
+                kzg_commitments.append(KZGCommitment(hex_to_bytes(c)))
+
         bid = ExecutionPayloadBid(
             parent_block_hash=Hash32(parent_block_hash),
             parent_block_root=Root(parent_block_root),
@@ -599,7 +607,7 @@ class BlockBuilder:
             slot=Slot(slot),
             value=Gwei(0),
             execution_payment=Gwei(0),
-            blob_kzg_commitments_root=Root(b"\x00" * 32),
+            blob_kzg_commitments=kzg_commitments,
         )
 
         logger.debug(

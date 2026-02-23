@@ -252,6 +252,14 @@ class BeaconGossip:
         """
         self._host.set_status_provider(provider)
 
+    def set_block_provider(self, provider: Callable[[int], Optional[tuple[bytes, bytes]]]) -> None:
+        """Set the block provider callback for serving blocks via req/resp.
+
+        The provider takes a slot number and returns (ssz_bytes, fork_digest)
+        or None if no block is available for that slot.
+        """
+        self._host.set_block_provider(provider)
+
     @property
     def peer_id(self) -> Optional[str]:
         """Get the local peer ID."""
