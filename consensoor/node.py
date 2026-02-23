@@ -976,7 +976,13 @@ class BeaconNode:
         # Yield to event loop so gossipsub blocks can be processed
         await asyncio.sleep(0)
 
-        # Propose block — payload is already prepared from previous slot's forkchoice
+        # Sync missing blocks FIRST so state is up-to-date before proposing
+        await self._sync_missing_blocks(slot)
+
+        # Yield to event loop so gossipsub blocks can be processed
+        await asyncio.sleep(0)
+
+        # Propose block — now has up-to-date state with correct RANDAO
         await self._maybe_propose_block(slot)
 
         # Yield to event loop so gossipsub blocks can be processed
@@ -1001,12 +1007,6 @@ class BeaconNode:
 
         # Compute attester duties for current epoch if not cached
         await self._ensure_attester_duties(epoch)
-
-        # Yield to event loop so gossipsub blocks can be processed
-        await asyncio.sleep(0)
-
-        # Check if we need to sync blocks via req/resp (fallback for gossipsub issues)
-        await self._sync_missing_blocks(slot)
 
         # Yield to event loop so gossipsub blocks can be processed
         await asyncio.sleep(0)
@@ -1585,11 +1585,10 @@ class BeaconNode:
             network_config = get_config()
             timestamp = self._genesis_time + slot * (network_config.slot_duration_ms // 1000)
 
-            # Use payload prepared by previous slot's forkchoice update if available.
-            # Only request fresh payload if we don't have one (avoids redundant EL roundtrip).
-            if not self._current_payload_id:
-                logger.info(f"No prepared payload, requesting fresh for slot {slot}")
-                await self._request_payload_for_slot(slot)
+            # Always request a fresh payload to ensure RANDAO matches current state.
+            # The previous slot's forkchoice may have prepared a payload with stale state.
+            logger.info(f"Requesting fresh payload for slot {slot}")
+            await self._request_payload_for_slot(slot)
             if not self._current_payload_id:
                 logger.warning("Cannot produce block: failed to get payload_id")
                 return
