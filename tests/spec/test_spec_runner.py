@@ -82,6 +82,7 @@ def get_execution_payload_type_for_fork(fork: str) -> Type:
     from consensoor.spec.types.bellatrix import ExecutionPayloadBellatrix
     from consensoor.spec.types.capella import ExecutionPayloadCapella
     from consensoor.spec.types import ExecutionPayload
+    from consensoor.spec.types.gloas import ExecutionPayload as GloasExecutionPayload
 
     payload_types = {
         "bellatrix": ExecutionPayloadBellatrix,
@@ -89,7 +90,7 @@ def get_execution_payload_type_for_fork(fork: str) -> Type:
         "deneb": ExecutionPayload,
         "electra": ExecutionPayload,
         "fulu": ExecutionPayload,
-        "gloas": ExecutionPayload,
+        "gloas": GloasExecutionPayload,
     }
     return payload_types.get(fork)
 
@@ -166,7 +167,11 @@ def get_ssz_type_by_name(fork: str, type_name: str) -> Optional[Type]:
         "LightClientFinalityUpdate", "LightClientOptimisticUpdate",
     }
     if type_name in light_client_types:
-        if fork in {"electra", "fulu", "gloas"}:
+        if fork == "gloas":
+            from consensoor.spec.types import gloas as gloas_mod
+            if hasattr(gloas_mod, type_name):
+                return getattr(gloas_mod, type_name)
+        if fork in {"electra", "fulu"}:
             electra_name = f"Electra{type_name}"
             if hasattr(types, electra_name):
                 return getattr(types, electra_name)
@@ -216,6 +221,15 @@ def get_ssz_type_by_name(fork: str, type_name: str) -> Optional[Type]:
     if fork == "gloas" and type_name == "DataColumnSidecar":
         from consensoor.spec.types.gloas import DataColumnSidecar as GloasDataColumnSidecar
         return GloasDataColumnSidecar
+
+    # Gloas-specific overrides for types that exist in multiple forks
+    if fork == "gloas":
+        gloas_only_types = {
+            "ExecutionPayload": "ExecutionPayload",
+        }
+        if type_name in gloas_only_types:
+            from consensoor.spec.types import gloas as gloas_mod
+            return getattr(gloas_mod, gloas_only_types[type_name], None)
 
     if hasattr(types, type_name):
         t = getattr(types, type_name)
@@ -319,6 +333,8 @@ def get_epoch_processor(function_name: str) -> Optional[Callable]:
         process_builder_pending_payments,
     )
 
+    from consensoor.spec.state_transition.epoch.ptc_window import process_ptc_window
+
     processors = {
         "justification_and_finalization": process_justification_and_finalization,
         "inactivity_updates": process_inactivity_updates,
@@ -335,9 +351,11 @@ def get_epoch_processor(function_name: str) -> Optional[Callable]:
         "historical_roots_update": process_historical_summaries_update,
         "historical_summaries_update": process_historical_summaries_update,
         "pending_deposits": process_pending_deposits,
+        "pending_deposits_churn": process_pending_deposits,
         "pending_consolidations": process_pending_consolidations,
         "proposer_lookahead": process_proposer_lookahead,
         "builder_pending_payments": process_builder_pending_payments,
+        "ptc_window": process_ptc_window,
     }
     return processors.get(function_name)
 

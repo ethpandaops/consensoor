@@ -17,6 +17,7 @@ from ...constants import (
 from ..helpers.accessors import (
     get_current_epoch,
     get_activation_exit_churn_limit,
+    get_activation_churn_limit_gloas,
 )
 from ..helpers.mutators import increase_balance
 from ..helpers.predicates import (
@@ -42,9 +43,12 @@ def process_pending_deposits(state: "BeaconState") -> None:
         return
 
     next_epoch = get_current_epoch(state) + 1
-    available_for_processing = (
-        int(state.deposit_balance_to_consume) + get_activation_exit_churn_limit(state)
+    # Gloas (EIP-8061): use activation churn limit; pre-Gloas use activation_exit churn limit.
+    is_gloas = hasattr(state, "builders")
+    churn = (
+        get_activation_churn_limit_gloas(state) if is_gloas else get_activation_exit_churn_limit(state)
     )
+    available_for_processing = int(state.deposit_balance_to_consume) + churn
     processed_amount = 0
     next_deposit_index = 0
     deposits_to_postpone = []

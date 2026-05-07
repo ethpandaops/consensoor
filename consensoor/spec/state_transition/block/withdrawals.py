@@ -426,14 +426,9 @@ def process_withdrawals(state: "BeaconState", payload=None) -> None:
     Raises:
         AssertionError: If withdrawals don't match expected
     """
-    if hasattr(state, "execution_payload_availability"):
-        latest_bid_slot = int(state.latest_execution_payload_bid.slot)
-        slot_index = latest_bid_slot % SLOTS_PER_HISTORICAL_ROOT()
-        if latest_bid_slot != 0 and state.execution_payload_availability[slot_index] == 0:
-            return
-
+    # Gloas: return early if parent block is empty
     if hasattr(state, "payload_expected_withdrawals"):
-        if bytes(state.latest_execution_payload_bid.block_hash) != bytes(state.latest_block_hash):
+        if bytes(state.latest_block_hash) != bytes(state.latest_execution_payload_bid.block_hash):
             return
 
     expected = get_expected_withdrawals(state)

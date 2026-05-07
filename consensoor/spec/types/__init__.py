@@ -168,6 +168,8 @@ from .gloas import (
     PayloadAttestation,
     PayloadAttestationMessage,
     IndexedPayloadAttestation,
+    BlockAccessList,
+    ExecutionPayload as GloasExecutionPayload,
     ExecutionPayloadBid,
     SignedExecutionPayloadBid,
     ExecutionPayloadEnvelope,

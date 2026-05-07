@@ -23,21 +23,13 @@ if TYPE_CHECKING:
     from ...types import BeaconState
 
 
-def get_ptc(state: "BeaconState", slot: int) -> Sequence[int]:
-    """Get the Payload Timeliness Committee for a given slot.
+def compute_ptc(state: "BeaconState", slot: int) -> Sequence[int]:
+    """Compute the Payload Timeliness Committee for a given slot from scratch.
 
-    The PTC is responsible for attesting to timely payload revelation.
-    Members are selected from active validators using shuffling.
-
-    Args:
-        state: Beacon state
-        slot: Target slot
-
-    Returns:
-        Sequence of validator indices in the PTC
+    Used to fill the ptc_window cache.
     """
     epoch = compute_epoch_at_slot(slot)
-    seed = sha256(get_seed(state, epoch, DOMAIN_PTC_ATTESTER) + slot.to_bytes(8, "little"))
+    seed = sha256(get_seed(state, epoch, DOMAIN_PTC_ATTESTER) + int(slot).to_bytes(8, "little"))
 
     indices = []
     committees_per_slot = get_committee_count_per_slot(state, epoch)
@@ -48,6 +40,29 @@ def get_ptc(state: "BeaconState", slot: int) -> Sequence[int]:
     return compute_balance_weighted_selection(
         state, indices, seed, size=PTC_SIZE(), shuffle_indices=False
     )
+
+
+def get_ptc(state: "BeaconState", slot: int) -> Sequence[int]:
+    """Get the Payload Timeliness Committee for a given slot.
+
+    For Gloas+, reads from state.ptc_window cache. Falls back to compute_ptc
+    for older states or when the slot falls outside the window.
+    """
+    if hasattr(state, "ptc_window"):
+        from ...constants import MIN_SEED_LOOKAHEAD
+
+        epoch = compute_epoch_at_slot(slot)
+        state_epoch = get_current_epoch(state)
+        spe = SLOTS_PER_EPOCH()
+
+        if epoch < state_epoch:
+            if epoch + 1 == state_epoch:
+                return list(state.ptc_window[int(slot) % spe])
+        elif epoch <= state_epoch + MIN_SEED_LOOKAHEAD:
+            offset = (epoch - state_epoch + 1) * spe
+            return list(state.ptc_window[offset + int(slot) % spe])
+
+    return compute_ptc(state, slot)
 
 
 def get_ptc_slot(state: "BeaconState", validator_index: int) -> int:

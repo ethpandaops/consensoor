@@ -310,6 +310,9 @@ FINALIZED_ROOT_DEPTH_ELECTRA: Final[int] = 7
 CURRENT_SYNC_COMMITTEE_DEPTH_ELECTRA: Final[int] = 6
 NEXT_SYNC_COMMITTEE_DEPTH_ELECTRA: Final[int] = 6
 
+# Gloas LightClient (uses execution_block_hash and gloas execution branch depth = floor(log2(832)) = 9)
+EXECUTION_BLOCK_HASH_DEPTH_GLOAS: Final[int] = 9
+
 def MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA() -> int:
     return 128 * 10**9 if _config.preset == "mainnet" else 64 * 10**9
 
@@ -350,7 +353,7 @@ MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS: Final[int] = 4096
 
 
 def PTC_SIZE() -> int:
-    return 512 if _config.preset == "mainnet" else 2
+    return 512 if _config.preset == "mainnet" else 16
 
 
 MAX_PAYLOAD_ATTESTATIONS: Final[int] = 4
@@ -367,6 +370,23 @@ DOMAIN_PTC_ATTESTER: Final[bytes] = b"\x0c\x00\x00\x00"
 DOMAIN_PROPOSER_PREFERENCES: Final[bytes] = b"\x0d\x00\x00\x00"
 
 BUILDER_WITHDRAWAL_PREFIX: Final[bytes] = b"\x03"
+
+
+# Gloas churn limits (EIP-8061): split exit and activation churn limits
+def CHURN_LIMIT_QUOTIENT_GLOAS() -> int:
+    return 32768 if _config.preset == "mainnet" else 16
+
+
+def MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS() -> int:
+    return 256 * 10**9 if _config.preset == "mainnet" else 128 * 10**9
+
+
+def CONSOLIDATION_CHURN_LIMIT_QUOTIENT() -> int:
+    return 65536 if _config.preset == "mainnet" else 32
+
+
+def MIN_BUILDER_WITHDRAWABILITY_DELAY() -> int:
+    return 64 if _config.preset == "mainnet" else 2
 
 # =============================================================================
 # Networking Constants

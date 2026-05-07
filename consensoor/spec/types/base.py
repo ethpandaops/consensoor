@@ -1,7 +1,7 @@
 """Base SSZ types and primitives used across all forks."""
 
 from remerkleable.basic import uint8, uint64, uint256, boolean
-from remerkleable.byte_arrays import Bytes4, Bytes32, Bytes48, Bytes96, ByteVector
+from remerkleable.byte_arrays import Bytes4, Bytes32, Bytes48, Bytes96, ByteVector, ByteList
 from remerkleable.complex import Container, Vector, List
 from remerkleable.bitfields import Bitvector, Bitlist
 

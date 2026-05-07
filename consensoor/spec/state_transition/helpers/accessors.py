@@ -23,6 +23,9 @@ from ...constants import (
     MAX_EFFECTIVE_BALANCE,
     MAX_EFFECTIVE_BALANCE_ELECTRA,
     MAX_PER_EPOCH_ACTIVATION_EXIT_CHURN_LIMIT,
+    CHURN_LIMIT_QUOTIENT_GLOAS,
+    MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS,
+    CONSOLIDATION_CHURN_LIMIT_QUOTIENT,
     TIMELY_SOURCE_FLAG_INDEX,
     TIMELY_TARGET_FLAG_INDEX,
     TIMELY_HEAD_FLAG_INDEX,
@@ -173,8 +176,13 @@ def get_validator_churn_limit(state: "BeaconState") -> int:
     )
 
 
+def _is_gloas_state(state: "BeaconState") -> bool:
+    """Check if state is Gloas (ePBS) by presence of the builders field."""
+    return hasattr(state, "builders")
+
+
 def get_balance_churn_limit(state: "BeaconState") -> int:
-    """Return the balance churn limit for the current epoch (Electra).
+    """Return the balance churn limit for the current epoch (Electra/Gloas).
 
     Args:
         state: Beacon state
@@ -182,11 +190,23 @@ def get_balance_churn_limit(state: "BeaconState") -> int:
     Returns:
         Maximum balance that can churn per epoch in Gwei
     """
+    quotient = CHURN_LIMIT_QUOTIENT_GLOAS() if _is_gloas_state(state) else CHURN_LIMIT_QUOTIENT()
     churn = max(
         MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA(),
-        get_total_active_balance(state) // CHURN_LIMIT_QUOTIENT(),
+        get_total_active_balance(state) // quotient,
     )
     return churn - (churn % EFFECTIVE_BALANCE_INCREMENT)
+
+
+def get_exit_churn_limit(state: "BeaconState") -> int:
+    """Return the exit churn limit for the current epoch (Gloas EIP-8061)."""
+    return get_balance_churn_limit(state)
+
+
+def get_activation_churn_limit_gloas(state: "BeaconState") -> int:
+    """Return the activation churn limit for the current epoch (Gloas EIP-8061)."""
+    churn = get_balance_churn_limit(state)
+    return min(MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS(), churn)
 
 
 def get_pending_balance_to_withdraw_for_builder(
@@ -221,28 +241,25 @@ def can_builder_cover_bid(
 
 
 def get_activation_exit_churn_limit(state: "BeaconState") -> int:
-    """Return the activation/exit churn limit for the current epoch (Electra).
+    """Return the activation/exit churn limit for the current epoch.
 
-    This is the minimum of the per-epoch activation exit churn limit and the balance churn limit.
-
-    Args:
-        state: Beacon state
-
-    Returns:
-        Churn limit in Gwei
+    Pre-Gloas (Electra/Fulu): min(MAX_PER_EPOCH_ACTIVATION_EXIT_CHURN_LIMIT, balance_churn_limit)
+    Gloas: split into get_exit_churn_limit and get_activation_churn_limit_gloas; this returns exit.
     """
+    if _is_gloas_state(state):
+        return get_exit_churn_limit(state)
     return min(MAX_PER_EPOCH_ACTIVATION_EXIT_CHURN_LIMIT(), get_balance_churn_limit(state))
 
 
 def get_consolidation_churn_limit(state: "BeaconState") -> int:
-    """Return the consolidation churn limit for the current epoch (Electra).
+    """Return the consolidation churn limit for the current epoch.
 
-    Args:
-        state: Beacon state
-
-    Returns:
-        Churn limit in Gwei
+    Pre-Gloas: balance_churn_limit - activation_exit_churn_limit
+    Gloas: total_active_balance // CONSOLIDATION_CHURN_LIMIT_QUOTIENT
     """
+    if _is_gloas_state(state):
+        churn = get_total_active_balance(state) // CONSOLIDATION_CHURN_LIMIT_QUOTIENT()
+        return churn - (churn % EFFECTIVE_BALANCE_INCREMENT)
     return get_balance_churn_limit(state) - get_activation_exit_churn_limit(state)
 
 

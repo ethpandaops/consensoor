@@ -321,6 +321,13 @@ def process_epoch(state: "BeaconState") -> None:
         process_proposer_lookahead(state)
         timings['proposer_lookahead'] = time.time() - t0
 
+    # Gloas+ epoch processing: ptc_window
+    if hasattr(state, "ptc_window"):
+        from .epoch.ptc_window import process_ptc_window
+        t0 = time.time()
+        process_ptc_window(state)
+        timings['ptc_window'] = time.time() - t0
+
     # Log slow operations (>10ms)
     slow_ops = {k: v*1000 for k, v in timings.items() if v > 0.01}
     if slow_ops:
@@ -355,46 +362,41 @@ def process_block(state: "BeaconState", block: "BeaconBlock") -> None:
         process_withdrawals,
         process_sync_aggregate,
         process_execution_payload_bid,
-        process_payload_attestations,
     )
+    from .block.operations import process_parent_execution_payload
     from .helpers.predicates import is_execution_enabled
-
-    # Process block header
-    process_block_header(state, block)
 
     # Check if this is a Gloas block (ePBS)
     is_gloas_block = hasattr(block.body, "signed_execution_payload_bid")
 
     if is_gloas_block:
-        # Gloas (ePBS): process withdrawals and execution payload bid
+        # Gloas (ePBS) flow per alpha 7 spec:
+        # process_parent_execution_payload -> process_block_header -> process_withdrawals
+        # -> process_execution_payload_bid -> process_randao -> process_eth1_data
+        # -> process_operations -> process_sync_aggregate
+        process_parent_execution_payload(state, block)
+        process_block_header(state, block)
         process_withdrawals(state)
         process_execution_payload_bid(state, block)
-    else:
-        # Pre-Gloas: process execution payload (Bellatrix+)
-        # Only process if execution is enabled (merge complete or merge transition block)
-        if hasattr(block.body, "execution_payload") and is_execution_enabled(state, block.body):
-            # Process withdrawals first (Capella+)
-            if hasattr(block.body.execution_payload, "withdrawals"):
-                process_withdrawals(state, block.body.execution_payload)
+        process_randao(state, block.body)
+        process_eth1_data(state, block.body)
+        process_operations(state, block.body, is_gloas=True)
+        if hasattr(block.body, "sync_aggregate"):
+            process_sync_aggregate(state, block.body.sync_aggregate)
+        return
 
-            process_execution_payload(state, block.body)
+    # Pre-Gloas
+    process_block_header(state, block)
+    if hasattr(block.body, "execution_payload") and is_execution_enabled(state, block.body):
+        if hasattr(block.body.execution_payload, "withdrawals"):
+            process_withdrawals(state, block.body.execution_payload)
+        process_execution_payload(state, block.body)
 
-    # Process randao
     process_randao(state, block.body)
-
-    # Process eth1 data
     process_eth1_data(state, block.body)
-
-    # Process operations
-    process_operations(state, block.body, is_gloas=is_gloas_block)
-
-    # Process sync aggregate (Altair+)
+    process_operations(state, block.body, is_gloas=False)
     if hasattr(block.body, "sync_aggregate"):
         process_sync_aggregate(state, block.body.sync_aggregate)
-
-    # Process payload attestations (Gloas)
-    if is_gloas_block and hasattr(block.body, "payload_attestations"):
-        process_payload_attestations(state, list(block.body.payload_attestations))
 
 
 def process_operations(state: "BeaconState", body, is_gloas: bool = False) -> None:
@@ -519,23 +521,21 @@ def process_operations(state: "BeaconState", body, is_gloas: bool = False) -> No
         for signed_change in body.bls_to_execution_changes:
             process_bls_to_execution_change(state, signed_change)
 
-    # Process execution requests (Electra+)
-    # In Gloas (ePBS), execution requests are processed via the payload envelope,
-    # not during block processing
+    # Process execution requests (Electra/Fulu only - Gloas processes via parent_execution_payload)
     if not is_gloas and hasattr(body, "execution_requests"):
         requests = body.execution_requests
-
-        # Process deposit requests
         if hasattr(requests, "deposits"):
             for deposit_request in requests.deposits:
                 process_deposit_request(state, deposit_request)
-
-        # Process withdrawal requests
         if hasattr(requests, "withdrawals"):
             for withdrawal_request in requests.withdrawals:
                 process_withdrawal_request(state, withdrawal_request)
-
-        # Process consolidation requests
         if hasattr(requests, "consolidations"):
             for consolidation_request in requests.consolidations:
                 process_consolidation_request(state, consolidation_request)
+
+    # Process payload attestations (Gloas only - moved into process_operations in alpha 7)
+    if is_gloas and hasattr(body, "payload_attestations"):
+        from .block.operations import process_payload_attestation
+        for payload_attestation in body.payload_attestations:
+            process_payload_attestation(state, payload_attestation)

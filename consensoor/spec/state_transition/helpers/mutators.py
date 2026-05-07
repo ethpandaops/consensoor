@@ -22,6 +22,7 @@ from ...constants import (
     MAX_EFFECTIVE_BALANCE_ELECTRA,
     MIN_VALIDATOR_WITHDRAWABILITY_DELAY,
     EPOCHS_PER_SLASHINGS_VECTOR,
+    MIN_BUILDER_WITHDRAWABILITY_DELAY,
 )
 from .misc import compute_activation_exit_epoch, compute_epoch_at_slot
 from .accessors import (
@@ -104,6 +105,19 @@ def initiate_validator_exit(state: "BeaconState", index: int) -> None:
     validator.withdrawable_epoch = (
         exit_queue_epoch + MIN_VALIDATOR_WITHDRAWABILITY_DELAY
     )
+
+
+def initiate_builder_exit(state: "BeaconState", builder_index: int) -> None:
+    """Initiate the exit of a builder (Gloas EIP-7732).
+
+    Sets the builder's withdrawable_epoch.
+
+    Args:
+        state: Beacon state (modified in place)
+        builder_index: Builder index
+    """
+    builder = state.builders[builder_index]
+    builder.withdrawable_epoch = get_current_epoch(state) + MIN_BUILDER_WITHDRAWABILITY_DELAY()
 
 
 def get_min_slashing_penalty_quotient(state: "BeaconState") -> int:

@@ -300,30 +300,35 @@ def upgrade_to_fulu(pre: ElectraBeaconState, fork_version: bytes, epoch: int) ->
 def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> GloasBeaconState:
     """Upgrade a Fulu state to Gloas.
 
-    Adds ePBS (enshrined Proposer-Builder Separation) fields:
-    - latest_execution_payload_bid (replaces latest_execution_payload_header)
-    - builders registry
-    - builder pending payments and withdrawals
-    - execution payload availability tracking
+    Adds ePBS (enshrined Proposer-Builder Separation) fields per alpha 7 spec.
     """
+    from ..types.electra import ExecutionRequests
+    from ...crypto import hash_tree_root
+    from .helpers.ptc import compute_ptc
+    from .helpers.misc import compute_start_slot_at_epoch
+
     pre_header = pre.latest_execution_payload_header
 
+    # Spec: latest_execution_payload_bid only sets block_hash and execution_requests_root
+    empty_requests_root = hash_tree_root(ExecutionRequests())
     empty_bid = ExecutionPayloadBid(
-        parent_block_hash=pre_header.parent_hash,
+        parent_block_hash=Hash32(),
         parent_block_root=Root(b"\x00" * 32),
         block_hash=pre_header.block_hash,
-        prev_randao=pre_header.prev_randao,
-        fee_recipient=pre_header.fee_recipient,
-        gas_limit=pre_header.gas_limit,
+        prev_randao=Bytes32(),
+        fee_recipient=b"\x00" * 20,
+        gas_limit=uint64(0),
         builder_index=uint64(0),
-        slot=pre.slot,
+        slot=uint64(0),
         value=Gwei(0),
         execution_payment=Gwei(0),
         blob_kzg_commitments=[],
+        execution_requests_root=empty_requests_root,
     )
 
     slots_per_hist = SLOTS_PER_HISTORICAL_ROOT()
     slots_2x_epoch = 2 * SLOTS_PER_EPOCH()
+    spe = SLOTS_PER_EPOCH()
 
     empty_pending_payment = BuilderPendingPayment(
         weight=Gwei(0),
@@ -333,6 +338,31 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
             builder_index=uint64(0),
         ),
     )
+
+    # Initialize execution_payload_availability to all 1s
+    availability = Bitvector[slots_per_hist]()
+    for i in range(slots_per_hist):
+        availability[i] = True
+
+    # Initialize ptc_window
+    # Compute PTC for current_epoch through current_epoch + MIN_SEED_LOOKAHEAD
+    # Previous epoch slot is empty (zeros)
+    current_epoch = int(pre.slot) // spe
+    ptc_size_val = None
+    from ..constants import PTC_SIZE
+    ptc_size_val = PTC_SIZE()
+    empty_ptc = [ValidatorIndex(0)] * ptc_size_val
+
+    ptc_window = []
+    # Empty for previous epoch
+    for _ in range(spe):
+        ptc_window.append(list(empty_ptc))
+    # Compute for current epoch through current + MIN_SEED_LOOKAHEAD
+    for e in range(MIN_SEED_LOOKAHEAD + 1):
+        target_epoch = current_epoch + e
+        start_slot = compute_start_slot_at_epoch(target_epoch)
+        for i in range(spe):
+            ptc_window.append(list(compute_ptc(pre, start_slot + i)))
 
     post = GloasBeaconState(
         genesis_time=pre.genesis_time,
@@ -379,11 +409,12 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
         proposer_lookahead=pre.proposer_lookahead,
         builders=[],
         next_withdrawal_builder_index=uint64(0),
-        execution_payload_availability=Bitvector[slots_per_hist](),
+        execution_payload_availability=availability,
         builder_pending_payments=[empty_pending_payment] * slots_2x_epoch,
         builder_pending_withdrawals=[],
         latest_block_hash=Hash32(pre_header.block_hash),
         payload_expected_withdrawals=[],
+        ptc_window=ptc_window,
     )
 
     logger.info(f"Upgraded state to Gloas at epoch {epoch}")
