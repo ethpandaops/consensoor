@@ -467,6 +467,7 @@ class EngineAPIClient:
             "engine_newPayloadV3",
             "engine_newPayloadV2",
             "engine_newPayloadV1",
+            "engine_forkchoiceUpdatedV4",
             "engine_forkchoiceUpdatedV3",
             "engine_forkchoiceUpdatedV2",
             "engine_forkchoiceUpdatedV1",
