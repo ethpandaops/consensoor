@@ -851,6 +851,8 @@ class BeaconNode:
                 "withdrawals": [],
                 "parentBeaconBlockRoot": "0x" + (self.head_root or b"\x00" * 32).hex(),
             }
+            if hasattr(self.state, "ptc_window"):
+                payload_attributes["slotNumber"] = hex(int(slot))
 
             # Debug: compare head_root with hash of latest_block_header
             latest_header_hash = hash_tree_root(self.state.latest_block_header)
@@ -1082,6 +1084,8 @@ class BeaconNode:
                 "withdrawals": [],
                 "parentBeaconBlockRoot": "0x" + (self.head_root or b"\x00" * 32).hex(),
             }
+            if hasattr(self.state, "ptc_window"):
+                payload_attributes["slotNumber"] = hex(int(next_slot))
 
             response = await self.engine.forkchoice_updated(
                 forkchoice_state, payload_attributes, timestamp=timestamp

@@ -240,12 +240,29 @@ class EngineAPIClient:
         payload_attributes: Optional[dict] = None,
     ) -> ForkchoiceUpdateResponse:
         """Update the forkchoice state (Deneb/Cancun - requires parentBeaconBlockRoot)."""
+        attrs = None
+        if payload_attributes:
+            attrs = {k: v for k, v in payload_attributes.items() if k != "slotNumber"}
+        params = [
+            forkchoice_state.to_dict(),
+            attrs,
+        ]
+
+        result = await self._call("engine_forkchoiceUpdatedV3", params)
+        return ForkchoiceUpdateResponse.from_dict(result)
+
+    async def forkchoice_updated_v4(
+        self,
+        forkchoice_state: ForkchoiceState,
+        payload_attributes: Optional[dict] = None,
+    ) -> ForkchoiceUpdateResponse:
+        """Update the forkchoice state (Amsterdam/Gloas - adds slotNumber)."""
         params = [
             forkchoice_state.to_dict(),
             payload_attributes,
         ]
 
-        result = await self._call("engine_forkchoiceUpdatedV3", params)
+        result = await self._call("engine_forkchoiceUpdatedV4", params)
         return ForkchoiceUpdateResponse.from_dict(result)
 
     async def forkchoice_updated_v2(
@@ -295,7 +312,9 @@ class EngineAPIClient:
         fork = self._get_fork_for_timestamp(timestamp)
         logger.debug(f"forkchoice_updated: timestamp={timestamp}, fork={fork}")
 
-        if fork in ("gloas", "fulu", "electra", "deneb"):
+        if fork == "gloas":
+            return await self.forkchoice_updated_v4(forkchoice_state, payload_attributes)
+        if fork in ("fulu", "electra", "deneb"):
             return await self.forkchoice_updated_v3(forkchoice_state, payload_attributes)
         elif fork == "capella":
             return await self.forkchoice_updated_v2(forkchoice_state, payload_attributes)
