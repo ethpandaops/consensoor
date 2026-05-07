@@ -1,0 +1,31 @@
+participants:
+  - el_type: geth
+    el_image: ethpandaops/geth:bal-devnet-6
+    cl_type: lighthouse
+    cl_image: ethpandaops/lighthouse:glamsterdam-devnet-3
+    supernode: true
+  - el_type: geth
+    el_image: ethpandaops/geth:bal-devnet-6
+    cl_type: consensoor
+    cl_image: ethpandaops/consensoor:main
+network_params:
+  altair_fork_epoch: 0
+  bellatrix_fork_epoch: 0
+  capella_fork_epoch: 0
+  deneb_fork_epoch: 0
+  electra_fork_epoch: 0
+  fulu_fork_epoch: 0
+  gloas_fork_epoch: 0
+  preset: minimal
+  genesis_delay: 60
+
+additional_services:
+  - dora
+snooper_enabled: true
+global_log_level: debug
+
+port_publisher:
+  cl:
+    enabled: true
+  additional_services:
+    enabled: true
