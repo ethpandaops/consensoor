@@ -215,7 +215,10 @@ class P2PHost:
             from libp2p.custom_types import TProtocol
             from libp2p.pubsub.gossipsub import GossipSub
             from libp2p.pubsub.pubsub import Pubsub
-            from libp2p.tools.async_service.trio_service import background_trio_service
+            try:
+                from libp2p.tools.async_service.trio_service import background_trio_service
+            except ImportError:
+                from libp2p.tools.anyio_service import background_trio_service
             from multiaddr import Multiaddr
             import secrets
 
