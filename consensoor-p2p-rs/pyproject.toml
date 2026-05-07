@@ -1,0 +1,15 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "consensoor-p2p"
+version = "0.1.0"
+description = "Native Rust libp2p stack for consensoor (replaces py-libp2p)."
+requires-python = ">=3.11,<3.13"
+readme = "README.md"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+python-source = "python"
+module-name = "consensoor_p2p._native"
