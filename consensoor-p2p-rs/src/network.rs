@@ -11,7 +11,7 @@ use futures::StreamExt;
 use libp2p::{
     core::{upgrade, ConnectedPoint},
     gossipsub::{self, IdentTopic, ValidationMode},
-    identify, identity, noise, ping,
+    identify, identity, noise,
     request_response,
     swarm::{NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, Swarm, Transport,
@@ -33,11 +33,22 @@ use crate::rpc::{
 
 const ETH2_AGENT_VERSION: &str = "consensoor/0.1.0";
 
+// Eth2 P2P spec (consensus-specs phase0/p2p-interface.md) + lighthouse
+// reference impl (`lighthouse_network::service::Behaviour`):
+//   gossipsub  — REQUIRED
+//   identify   — REQUIRED (used to advertise our agent + supported protocols)
+//   eth2 Status / Goodbye / Ping / MetaData RPCs  — REQUIRED
+//   beacon_blocks_by_range  — REQUIRED
+// Notable absence vs. our previous setup: libp2p::ping (`/ipfs/ping/1.0.0`).
+// Lighthouse does NOT enable it. The eth2 spec uses the RPC ping at
+// /eth2/beacon_chain/req/ping/1/ssz_snappy, which is `eth2_ping` below.
+// Keeping libp2p::ping around opens an extra substream every 15s and
+// triggers connection close on the first transient failure — that's
+// what was killing peers ~60-90s after connect.
 #[derive(NetworkBehaviour)]
 struct Eth2Behaviour {
     gossipsub: gossipsub::Behaviour,
     identify: identify::Behaviour,
-    ping_libp2p: ping::Behaviour,
     status: rpc::StatusBehaviour,
     eth2_ping: rpc::PingBehaviour,
     goodbye: rpc::GoodbyeBehaviour,
@@ -778,20 +789,11 @@ async fn run_swarm(
             .with_agent_version(agent_version),
     );
 
-    // Bump ping interval/timeout vs. libp2p defaults — the default 15s
-    // interval + 20s timeout means a single dropped ping silently kills
-    // the connection ~30s in. Use 30s/30s to give peers more slack while
-    // we hold the GIL during heavy SSZ work on the asyncio side.
-    let ping_libp2p = ping::Behaviour::new(
-        ping::Config::new()
-            .with_interval(Duration::from_secs(30))
-            .with_timeout(Duration::from_secs(30)),
-    );
+    // libp2p::ping is intentionally NOT included — see Eth2Behaviour comment.
 
     let behaviour = Eth2Behaviour {
         gossipsub,
         identify,
-        ping_libp2p,
         status: rpc::new_status_behaviour(),
         eth2_ping: rpc::new_ping_behaviour(),
         goodbye: rpc::new_goodbye_behaviour(),
@@ -799,18 +801,25 @@ async fn run_swarm(
         blocks_by_range: blocks_by_range::new_blocks_by_range_behaviour(),
     };
 
+    // Swarm config matches lighthouse_network::service `with_executor` block
+    // (lighthouse/beacon_node/lighthouse_network/src/service/mod.rs:484-489).
+    // 10s idle is fine because the active behaviours (gossipsub heartbeats,
+    // identify, eth2 RPC status/ping/metadata, blocks_by_range) generate
+    // continuous substream activity. The previous 86400s value was a bandaid
+    // for the libp2p::ping bug we just removed.
     let mut swarm = Swarm::new(
         transport,
         behaviour,
         local_peer_id,
         libp2p::swarm::Config::with_tokio_executor()
-            // Lighthouse uses 1 day; we go with the same. libp2p's idle
-            // timeout counts substream activity only — gossipsub heartbeat
-            // control messages don't always count, so a ~60s idle timer
-            // causes peers to drop ~1 min after connect even though both
-            // sides are healthy. Effectively disable it; prysm/teku/lh
-            // do the same.
-            .with_idle_connection_timeout(Duration::from_secs(86_400)),
+            .with_notify_handler_buffer_size(
+                std::num::NonZeroUsize::new(7).expect("non-zero"),
+            )
+            .with_per_connection_event_buffer_size(4)
+            .with_idle_connection_timeout(Duration::from_secs(10))
+            .with_dial_concurrency_factor(
+                std::num::NonZeroU8::new(1).expect("non-zero"),
+            ),
     );
 
     swarm.listen_on(listen_addr)?;
