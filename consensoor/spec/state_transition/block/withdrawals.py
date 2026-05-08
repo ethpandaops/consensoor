@@ -186,7 +186,7 @@ def get_builders_sweep_withdrawals(
     from ..helpers.misc import convert_builder_index_to_validator_index
 
     epoch = get_current_epoch(state)
-    builders_limit = min(len(state.builders), MAX_BUILDERS_PER_WITHDRAWALS_SWEEP)
+    builders_limit = min(len(state.builders), MAX_BUILDERS_PER_WITHDRAWALS_SWEEP())
     withdrawals_limit = MAX_WITHDRAWALS_PER_PAYLOAD() - 1
     processed_count = 0
     withdrawals: List[Withdrawal] = []

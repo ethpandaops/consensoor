@@ -82,6 +82,18 @@ class NetworkConfig:
     min_per_epoch_churn_limit: int = 4
     churn_limit_quotient: int = 65536
 
+    # Deneb churn (deprecated, still in spec config)
+    max_per_epoch_activation_churn_limit: int = 8
+
+    # Electra churn
+    min_per_epoch_churn_limit_electra: int = 128 * 10**9
+    max_per_epoch_activation_exit_churn_limit: int = 256 * 10**9
+
+    # Gloas churn (EIP-8061)
+    churn_limit_quotient_gloas: int = 32768
+    consolidation_churn_limit_quotient: int = 65536
+    max_per_epoch_activation_churn_limit_gloas: int = 256 * 10**9
+
     proposer_score_boost: int = 40
     reorg_head_weight_threshold: int = 20
     reorg_parent_weight_threshold: int = 160
@@ -92,6 +104,40 @@ class NetworkConfig:
     deposit_contract_address: bytes = field(
         default_factory=lambda: bytes.fromhex("00000000219ab540356cBB839Cbe05303d7705Fa")
     )
+
+    # Networking config
+    max_payload_size: int = 10 * 2**20
+    max_request_blocks: int = 1024
+    epochs_per_subnet_subscription: int = 256
+    attestation_propagation_slot_range: int = 32
+    maximum_gossip_clock_disparity: int = 500
+    message_domain_invalid_snappy: bytes = field(default_factory=lambda: b"\x00\x00\x00\x00")
+    message_domain_valid_snappy: bytes = field(default_factory=lambda: b"\x01\x00\x00\x00")
+    subnets_per_node: int = 2
+    attestation_subnet_count: int = 64
+    attestation_subnet_extra_bits: int = 0
+
+    # Deneb networking
+    max_request_blocks_deneb: int = 128
+    min_epochs_for_blob_sidecars_requests: int = 4096
+    blob_sidecar_subnet_count: int = 6
+    max_blobs_per_block: int = 6
+
+    # Electra networking
+    blob_sidecar_subnet_count_electra: int = 9
+    max_blobs_per_block_electra: int = 9
+
+    # Fulu (PeerDAS) networking
+    number_of_custody_groups: int = 128
+    data_column_sidecar_subnet_count: int = 128
+    samples_per_slot: int = 8
+    custody_requirement: int = 4
+    validator_custody_requirement: int = 8
+    balance_per_additional_custody_group: int = 32 * 10**9
+    min_epochs_for_data_column_sidecars_requests: int = 4096
+
+    # Gloas networking
+    max_request_payloads: int = 128
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "NetworkConfig":
@@ -145,6 +191,21 @@ class NetworkConfig:
         config.attestation_due_bps_gloas = 2500
         config.aggregate_due_bps_gloas = 5000
         config.payload_attestation_due_bps = 7500
+        # Validator cycle (per minimal.yaml)
+        config.min_per_epoch_churn_limit = 2
+        config.churn_limit_quotient = 32
+        config.max_per_epoch_activation_churn_limit = 4
+        config.min_per_epoch_churn_limit_electra = 64 * 10**9
+        config.max_per_epoch_activation_exit_churn_limit = 128 * 10**9
+        # Gloas churn quotients are the same as mainnet in minimal.yaml
+        # Gloas
+        config.min_builder_withdrawability_delay = 2
+        # Deposit contract (per minimal.yaml)
+        config.deposit_chain_id = 5
+        config.deposit_network_id = 5
+        config.deposit_contract_address = bytes.fromhex(
+            "1234567890123456789012345678901234567890"
+        )
         return config
 
     @classmethod

@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_channel::{bounded, Receiver, Sender};
 use futures::StreamExt;
 use libp2p::{
-    core::upgrade,
+    core::{upgrade, ConnectedPoint},
     gossipsub::{self, IdentTopic, ValidationMode},
     identify, identity, noise, ping,
     request_response,
@@ -22,6 +22,7 @@ use tokio::runtime::Runtime;
 use crate::blocks_by_range::{
     self, BlocksByRangeBehaviour, BlocksByRangeEvent, BlocksByRangeRequest, BlocksByRangeResponse,
 };
+use crate::bootnode;
 use crate::gossip;
 use crate::rpc::{
     self, GoodbyeEvent, GoodbyeMessage, MetaDataMessage, MetaDataRequest, MetadataEvent,
@@ -138,6 +139,7 @@ pub struct Network {
     by_range_rx: Mutex<Receiver<BlocksByRangeEvent>>,
     local_peer_id: String,
     listen_addrs: Arc<Mutex<Vec<String>>>,
+    connected_peers: Arc<Mutex<HashMap<String, &'static str>>>,
 }
 
 #[pymethods]
@@ -165,7 +167,7 @@ impl Network {
             .bootnodes
             .iter()
             .map(|b| {
-                b.parse::<Multiaddr>()
+                bootnode::parse_dial_target(b)
                     .map_err(|e| PyValueError::new_err(format!("bootnode {b}: {e}")))
             })
             .collect::<Result<_, _>>()?;
@@ -181,6 +183,8 @@ impl Network {
         let (by_range_tx, by_range_rx) = bounded::<BlocksByRangeEvent>(64);
         let listen_addrs = Arc::new(Mutex::new(Vec::<String>::new()));
         let listen_addrs_clone = listen_addrs.clone();
+        let connected_peers = Arc::new(Mutex::new(HashMap::<String, &'static str>::new()));
+        let connected_peers_clone = connected_peers.clone();
 
         let runtime_clone = runtime.clone();
         runtime_clone.spawn(async move {
@@ -197,6 +201,7 @@ impl Network {
                 metadata_tx,
                 by_range_tx,
                 listen_addrs_clone,
+                connected_peers_clone,
             )
             .await
             {
@@ -215,7 +220,25 @@ impl Network {
             by_range_rx: Mutex::new(by_range_rx),
             local_peer_id: local_peer_id_str,
             listen_addrs,
+            connected_peers,
         })
+    }
+
+    /// Snapshot of currently-connected peer IDs (as base58 strings).
+    pub fn connected_peers(&self) -> Vec<String> {
+        self.connected_peers.lock().keys().cloned().collect()
+    }
+
+    /// Snapshot of currently-connected peers as `(peer_id, direction)` pairs,
+    /// where direction is `"inbound"` or `"outbound"` per the libp2p
+    /// `ConnectedPoint` for the established connection. Surfaced via the
+    /// beacon API `/eth/v1/node/peers` endpoint.
+    pub fn connected_peers_with_direction(&self) -> Vec<(String, String)> {
+        self.connected_peers
+            .lock()
+            .iter()
+            .map(|(peer_id, direction)| (peer_id.clone(), (*direction).to_string()))
+            .collect()
     }
 
     pub fn peer_id(&self) -> String {
@@ -241,8 +264,7 @@ impl Network {
     }
 
     pub fn dial(&self, addr: String) -> PyResult<()> {
-        let addr: Multiaddr = addr
-            .parse()
+        let addr = bootnode::parse_dial_target(&addr)
             .map_err(|e| PyValueError::new_err(format!("dial addr: {e}")))?;
         self.cmd_tx
             .send_blocking(Command::Dial(addr))
@@ -330,109 +352,146 @@ impl Network {
             .map_err(|e| PyRuntimeError::new_err(format!("answer_blocks_by_range: {e}")))
     }
 
-    pub fn next_blocks_by_range(
+    #[pyo3(signature = (timeout_ms=None))]
+    pub fn next_blocks_by_range<'py>(
         &self,
+        py: Python<'py>,
         timeout_ms: Option<u64>,
     ) -> PyResult<Option<Py<BlocksByRangeEvent>>> {
         let rx = self.by_range_rx.lock().clone();
-        let result = match timeout_ms {
-            Some(ms) => self.runtime.block_on(async move {
+        let runtime = self.runtime.clone();
+        let result = py.allow_threads(|| match timeout_ms {
+            Some(ms) => runtime.block_on(async move {
                 tokio::time::timeout(Duration::from_millis(ms), rx.recv())
                     .await
                     .ok()
                     .and_then(|r| r.ok())
             }),
-            None => self.runtime.block_on(async move { rx.recv().await.ok() }),
-        };
+            None => runtime.block_on(async move { rx.recv().await.ok() }),
+        });
         match result {
-            Some(ev) => Python::with_gil(|py| Ok(Some(Py::new(py, ev)?))),
+            Some(ev) => Ok(Some(Py::new(py, ev)?)),
             None => Ok(None),
         }
     }
 
     /// Block until a gossipsub message arrives or `timeout_ms` elapses.
-    pub fn next_message(&self, timeout_ms: Option<u64>) -> PyResult<Option<Py<GossipMessage>>> {
+    #[pyo3(signature = (timeout_ms=None))]
+    pub fn next_message<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Option<Py<GossipMessage>>> {
         let rx = self.msg_rx.lock().clone();
-        let result = match timeout_ms {
-            Some(ms) => self.runtime.block_on(async move {
+        let runtime = self.runtime.clone();
+        // Release the GIL while we sit on the rust channel — otherwise a
+        // 1-second poll across four daemon threads serialises every other
+        // python thread (incl. the asyncio loop and beacon API thread) for
+        // up to 4 seconds at a time.
+        let result = py.allow_threads(|| match timeout_ms {
+            Some(ms) => runtime.block_on(async move {
                 tokio::time::timeout(Duration::from_millis(ms), rx.recv())
                     .await
                     .ok()
                     .and_then(|r| r.ok())
             }),
-            None => self.runtime.block_on(async move { rx.recv().await.ok() }),
-        };
+            None => runtime.block_on(async move { rx.recv().await.ok() }),
+        });
         match result {
-            Some(msg) => Python::with_gil(|py| Ok(Some(Py::new(py, msg)?))),
+            Some(msg) => Ok(Some(Py::new(py, msg)?)),
             None => Ok(None),
         }
     }
 
     /// Block until a Status RPC event arrives.
-    pub fn next_status(&self, timeout_ms: Option<u64>) -> PyResult<Option<Py<StatusEvent>>> {
+    #[pyo3(signature = (timeout_ms=None))]
+    pub fn next_status<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Option<Py<StatusEvent>>> {
         let rx = self.status_rx.lock().clone();
-        let result = match timeout_ms {
-            Some(ms) => self.runtime.block_on(async move {
+        let runtime = self.runtime.clone();
+        let result = py.allow_threads(|| match timeout_ms {
+            Some(ms) => runtime.block_on(async move {
                 tokio::time::timeout(Duration::from_millis(ms), rx.recv())
                     .await
                     .ok()
                     .and_then(|r| r.ok())
             }),
-            None => self.runtime.block_on(async move { rx.recv().await.ok() }),
-        };
+            None => runtime.block_on(async move { rx.recv().await.ok() }),
+        });
         match result {
-            Some(ev) => Python::with_gil(|py| Ok(Some(Py::new(py, ev)?))),
+            Some(ev) => Ok(Some(Py::new(py, ev)?)),
             None => Ok(None),
         }
     }
 
-    pub fn next_ping(&self, timeout_ms: Option<u64>) -> PyResult<Option<Py<PingEvent>>> {
+    #[pyo3(signature = (timeout_ms=None))]
+    pub fn next_ping<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Option<Py<PingEvent>>> {
         let rx = self.ping_rx.lock().clone();
-        let result = match timeout_ms {
-            Some(ms) => self.runtime.block_on(async move {
+        let runtime = self.runtime.clone();
+        let result = py.allow_threads(|| match timeout_ms {
+            Some(ms) => runtime.block_on(async move {
                 tokio::time::timeout(Duration::from_millis(ms), rx.recv())
                     .await
                     .ok()
                     .and_then(|r| r.ok())
             }),
-            None => self.runtime.block_on(async move { rx.recv().await.ok() }),
-        };
+            None => runtime.block_on(async move { rx.recv().await.ok() }),
+        });
         match result {
-            Some(ev) => Python::with_gil(|py| Ok(Some(Py::new(py, ev)?))),
+            Some(ev) => Ok(Some(Py::new(py, ev)?)),
             None => Ok(None),
         }
     }
 
-    pub fn next_goodbye(&self, timeout_ms: Option<u64>) -> PyResult<Option<Py<GoodbyeEvent>>> {
+    #[pyo3(signature = (timeout_ms=None))]
+    pub fn next_goodbye<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Option<Py<GoodbyeEvent>>> {
         let rx = self.goodbye_rx.lock().clone();
-        let result = match timeout_ms {
-            Some(ms) => self.runtime.block_on(async move {
+        let runtime = self.runtime.clone();
+        let result = py.allow_threads(|| match timeout_ms {
+            Some(ms) => runtime.block_on(async move {
                 tokio::time::timeout(Duration::from_millis(ms), rx.recv())
                     .await
                     .ok()
                     .and_then(|r| r.ok())
             }),
-            None => self.runtime.block_on(async move { rx.recv().await.ok() }),
-        };
+            None => runtime.block_on(async move { rx.recv().await.ok() }),
+        });
         match result {
-            Some(ev) => Python::with_gil(|py| Ok(Some(Py::new(py, ev)?))),
+            Some(ev) => Ok(Some(Py::new(py, ev)?)),
             None => Ok(None),
         }
     }
 
-    pub fn next_metadata(&self, timeout_ms: Option<u64>) -> PyResult<Option<Py<MetadataEvent>>> {
+    #[pyo3(signature = (timeout_ms=None))]
+    pub fn next_metadata<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Option<Py<MetadataEvent>>> {
         let rx = self.metadata_rx.lock().clone();
-        let result = match timeout_ms {
-            Some(ms) => self.runtime.block_on(async move {
+        let runtime = self.runtime.clone();
+        let result = py.allow_threads(|| match timeout_ms {
+            Some(ms) => runtime.block_on(async move {
                 tokio::time::timeout(Duration::from_millis(ms), rx.recv())
                     .await
                     .ok()
                     .and_then(|r| r.ok())
             }),
-            None => self.runtime.block_on(async move { rx.recv().await.ok() }),
-        };
+            None => runtime.block_on(async move { rx.recv().await.ok() }),
+        });
         match result {
-            Some(ev) => Python::with_gil(|py| Ok(Some(Py::new(py, ev)?))),
+            Some(ev) => Ok(Some(Py::new(py, ev)?)),
             None => Ok(None),
         }
     }
@@ -456,6 +515,7 @@ async fn run_swarm(
     metadata_tx: Sender<MetadataEvent>,
     by_range_tx: Sender<BlocksByRangeEvent>,
     listen_addrs: Arc<Mutex<Vec<String>>>,
+    connected_peers: Arc<Mutex<HashMap<String, &'static str>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let local_peer_id = key.public().to_peer_id();
 
@@ -465,8 +525,26 @@ async fn run_swarm(
         .multiplex(yamux::Config::default())
         .boxed();
 
+    // Eth2 gossipsub configuration per consensus-specs phase0/p2p-interface.md
+    // (D=8, D_low=6, D_high=12, D_lazy=6, heartbeat 700ms, mcache 6/3, history
+    // 12/3, fanout_ttl 60s, seen_ttl 550 heartbeats ≈ 385s, GOSSIP_MAX_SIZE
+    // 10 MiB). Without these, libp2p-gossipsub uses its own defaults
+    // (D=6, mesh_outbound_min=4, etc.) and prysm/lighthouse/teku score-prune
+    // us out of their mesh, so messages never propagate even though the TCP
+    // connection and Status RPC handshake succeed.
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_millis(700))
+        .heartbeat_initial_delay(Duration::from_millis(500))
+        .mesh_n(8)
+        .mesh_n_low(6)
+        .mesh_n_high(12)
+        .mesh_outbound_min(2)
+        .gossip_lazy(6)
+        .history_length(12)
+        .history_gossip(3)
+        .fanout_ttl(Duration::from_secs(60))
+        // 550 heartbeats × 700ms = 385s
+        .duplicate_cache_time(Duration::from_secs(385))
         .validation_mode(ValidationMode::Anonymous)
         .max_transmit_size(10 * 1024 * 1024)
         .message_id_fn(gossip::message_id_eth2)
@@ -535,8 +613,19 @@ async fn run_swarm(
                     tracing::info!("listening on {address}");
                     listen_addrs.lock().push(address.to_string());
                 }
-                SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                    tracing::info!("connection established with {peer_id}");
+                SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                    let direction = match endpoint {
+                        ConnectedPoint::Dialer { .. } => "outbound",
+                        ConnectedPoint::Listener { .. } => "inbound",
+                    };
+                    tracing::info!("connection established with {peer_id} ({direction})");
+                    connected_peers.lock().insert(peer_id.to_string(), direction);
+                }
+                SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                    if num_established == 0 {
+                        tracing::info!("connection closed with {peer_id}");
+                        connected_peers.lock().remove(&peer_id.to_string());
+                    }
                 }
                 SwarmEvent::Behaviour(Eth2BehaviourEvent::Gossipsub(gossipsub::Event::Message {
                     propagation_source,

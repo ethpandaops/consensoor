@@ -83,6 +83,11 @@ class P2PHost:
         self._status_thread: Optional[threading.Thread] = None
         self._ping_thread: Optional[threading.Thread] = None
         self._meta_thread: Optional[threading.Thread] = None
+        self._status_sender_thread: Optional[threading.Thread] = None
+        # Peers we've already sent an outbound Status RPC to. Eth2 spec says
+        # the dialer is expected to send Status first; if we don't, peers
+        # like prysm disconnect us with "no chain status for peer".
+        self._status_sent_to: set[str] = set()
 
         self._block_provider: Optional[Callable[[int], Optional[tuple[bytes, bytes]]]] = None
         self._status_provider: Optional[Callable[[], dict]] = None
@@ -128,18 +133,13 @@ class P2PHost:
         )
         self._network = cp.Network.start(net_cfg)
         self._peer_id = self._network.peer_id()
-        # Give the listener a moment to bind, then snapshot addresses.
-        await asyncio.sleep(0.1)
-        self._listen_addrs = list(self._network.listen_addresses())
 
-        # Dial each configured static peer (multiaddr including /p2p/<peer_id>).
-        for addr in self.config.static_peers:
-            try:
-                self._network.dial(addr)
-            except Exception as e:
-                logger.warning(f"dial failed for {addr}: {e}")
-
-        # Background dispatchers
+        # Spawn the rust→python dispatcher threads BEFORE anything that yields
+        # to the asyncio loop. Inbound peers (prysm, lighthouse) hit us with a
+        # Status RPC immediately on connect and disconnect us with "no chain
+        # status for peer" if we don't reply within ~20s. If we delay these
+        # threads until after `await asyncio.sleep` / dial / etc., the rust
+        # side queues the Status request but no python consumer is reading.
         self._gossip_thread = threading.Thread(
             target=self._gossip_loop, name="p2p-gossip-dispatch", daemon=True
         )
@@ -159,6 +159,22 @@ class P2PHost:
             target=self._meta_loop, name="p2p-meta-dispatch", daemon=True
         )
         self._meta_thread.start()
+
+        self._status_sender_thread = threading.Thread(
+            target=self._status_sender_loop, name="p2p-status-send", daemon=True
+        )
+        self._status_sender_thread.start()
+
+        # Give the listener a moment to bind, then snapshot addresses.
+        await asyncio.sleep(0.1)
+        self._listen_addrs = list(self._network.listen_addresses())
+
+        # Dial each configured static peer (multiaddr including /p2p/<peer_id>).
+        for addr in self.config.static_peers:
+            try:
+                self._network.dial(addr)
+            except Exception as e:
+                logger.warning(f"dial failed for {addr}: {e}")
 
         logger.info(
             f"P2P host started: peer_id={self._peer_id}, "
@@ -215,6 +231,52 @@ class P2PHost:
                 asyncio.run_coroutine_threadsafe(handler(data, from_peer), self._loop)
             except Exception as e:
                 logger.warning(f"dispatch failed for topic {msg.topic}: {e}")
+
+    def _status_sender_loop(self) -> None:
+        """Proactively send Status RPC to every newly-connected peer.
+
+        Eth2 spec: the dialer is expected to send Status first after connect.
+        Prysm/lighthouse/teku disconnect peers that don't initiate Status
+        within ~20s with the error "no chain status for peer". The rust
+        binding only forwards INBOUND Status requests via the status channel,
+        so we have to poll connected_peers() and send our Status to anyone
+        we haven't sent it to yet.
+        """
+        import consensoor_p2p as cp
+        import time as _time
+        while not self._stop.is_set():
+            _time.sleep(0.5)
+            if self._network is None:
+                continue
+            if self._status_provider is None:
+                continue
+            try:
+                connected = set(self._network.connected_peers())
+            except Exception as e:
+                logger.warning(f"connected_peers poll failed: {e}")
+                continue
+            # Drop tracking entries for peers that have since disconnected so
+            # we re-send Status if we ever reconnect.
+            stale = self._status_sent_to - connected
+            if stale:
+                self._status_sent_to -= stale
+            for peer_id in connected - self._status_sent_to:
+                try:
+                    s = self._status_provider() or {}
+                    fork_digest = bytes(s.get("fork_digest", self.config.fork_digest))
+                    msg = cp.StatusMessage(
+                        fork_digest=list(fork_digest),
+                        finalized_root=list(bytes(s.get("finalized_root", b"\x00" * 32))),
+                        finalized_epoch=int(s.get("finalized_epoch", 0)),
+                        head_root=list(bytes(s.get("head_root", b"\x00" * 32))),
+                        head_slot=int(s.get("head_slot", 0)),
+                        earliest_available_slot=int(s.get("earliest_available_slot", 0)),
+                    )
+                    self._network.send_status(peer_id, msg)
+                    self._status_sent_to.add(peer_id)
+                    logger.info(f"Sent outbound Status to {peer_id[:24]}...")
+                except Exception as e:
+                    logger.warning(f"send_status to {peer_id[:24]}... failed: {e}")
 
     def _status_loop(self) -> None:
         import consensoor_p2p as cp
@@ -295,12 +357,24 @@ class P2PHost:
 
     @property
     def peer_count(self) -> int:
-        # The rust binding does not yet expose a connected-peer count.
-        # Return 0 conservatively; gossipsub mesh-empty warnings will guide.
-        return 0
+        if self._network is None:
+            return 0
+        try:
+            return len(self._network.connected_peers())
+        except Exception:
+            return 0
 
     def connected_peers(self) -> list[dict]:
-        return []
+        """Return currently-connected peers as Beacon-API-shaped dicts."""
+        if self._network is None:
+            return []
+        try:
+            return [
+                {"peer_id": pid, "addrs": [], "direction": direction}
+                for pid, direction in self._network.connected_peers_with_direction()
+            ]
+        except Exception:
+            return []
 
     @property
     def enr(self) -> Optional[str]:
@@ -333,13 +407,22 @@ class P2PHost:
         """
         if self._network is None:
             return []
-        # Use any connected peer — the rust binding's send_request uses libp2p
-        # peer-routing under the hood. We just dial each known bootnode.
+        # Prefer a peer the rust libp2p stack reports as currently connected.
+        # Fall back to anything embedded in static_peers (multiaddr with
+        # /p2p/<peer_id>) so configurations without runtime peer-tracking
+        # still work.
         target_peer = None
-        for addr in self.config.static_peers:
-            if "/p2p/" in addr:
-                target_peer = addr.rsplit("/p2p/", 1)[1]
-                break
+        try:
+            connected = self._network.connected_peers()
+        except Exception:
+            connected = []
+        if connected:
+            target_peer = connected[0]
+        else:
+            for addr in self.config.static_peers:
+                if "/p2p/" in addr:
+                    target_peer = addr.rsplit("/p2p/", 1)[1]
+                    break
         if target_peer is None:
             logger.debug("request_blocks_by_range: no known peer to dial")
             return []

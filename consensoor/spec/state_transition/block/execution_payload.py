@@ -103,7 +103,7 @@ def process_execution_payload(
         else:
             from ...constants import MAX_BLOBS_PER_BLOCK, MAX_BLOBS_PER_BLOCK_ELECTRA
             is_electra = hasattr(state, "pending_deposits")
-            max_blobs = MAX_BLOBS_PER_BLOCK_ELECTRA if is_electra else MAX_BLOBS_PER_BLOCK
+            max_blobs = MAX_BLOBS_PER_BLOCK_ELECTRA() if is_electra else MAX_BLOBS_PER_BLOCK()
 
         assert len(body.blob_kzg_commitments) <= max_blobs, (
             f"Too many blob commitments: {len(body.blob_kzg_commitments)} > {max_blobs}"

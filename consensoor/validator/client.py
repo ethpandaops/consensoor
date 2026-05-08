@@ -24,7 +24,7 @@ from ..spec.constants import MAX_VALIDATORS_PER_COMMITTEE, MAX_COMMITTEES_PER_SL
 Phase0AggregationBits = Bitlist[MAX_VALIDATORS_PER_COMMITTEE()]
 ElectraAggregationBits = Bitlist[MAX_VALIDATORS_PER_COMMITTEE() * MAX_COMMITTEES_PER_SLOT()]
 ElectraCommitteeBits = Bitvector[MAX_COMMITTEES_PER_SLOT()]
-from ..crypto import sign as bls_sign, hash_tree_root
+from ..crypto import sign_async as bls_sign_async, hash_tree_root
 from .types import ValidatorKey, ProposerDuty, AttesterDuty
 from .shuffling import get_beacon_proposer_index
 from .. import metrics
@@ -171,7 +171,7 @@ class ValidatorClient:
         # Electra states have pending_deposits field
         return hasattr(state, "pending_deposits")
 
-    def produce_attestation(
+    async def produce_attestation(
         self, state, duty: AttesterDuty, head_root: bytes
     ):
         """Produce an attestation for the given duty.
@@ -240,7 +240,7 @@ class ValidatorClient:
                 committee_bits[committee_index] = True
 
                 signing_root = compute_signing_root(attestation_data, domain)
-                signature = bls_sign(key.privkey, signing_root)
+                signature = await bls_sign_async(key.privkey, signing_root)
 
                 attestation = ElectraAttestation(
                     aggregation_bits=aggregation_bits,
@@ -263,7 +263,7 @@ class ValidatorClient:
                     aggregation_bits.append(i == duty.validator_committee_index)
 
                 signing_root = compute_signing_root(attestation_data, domain)
-                signature = bls_sign(key.privkey, signing_root)
+                signature = await bls_sign_async(key.privkey, signing_root)
 
                 attestation = Phase0Attestation(
                     aggregation_bits=aggregation_bits,
@@ -326,7 +326,7 @@ class ValidatorClient:
             epoch = compute_epoch_at_slot(previous_slot)
             domain = get_domain(state, DOMAIN_SYNC_COMMITTEE, epoch)
             signing_root = compute_signing_root(beacon_block_root, domain)
-            signature = bls_sign(validator_key.privkey, signing_root)
+            signature = await bls_sign_async(validator_key.privkey, signing_root)
 
             message = SyncCommitteeMessage(
                 slot=slot,

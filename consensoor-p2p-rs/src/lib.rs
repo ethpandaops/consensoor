@@ -10,6 +10,7 @@
 //! Status protocol.
 
 mod blocks_by_range;
+mod bootnode;
 mod gossip;
 mod network;
 mod rpc;

@@ -16,6 +16,14 @@ from .crypto import (
     bls_aggregate_pubkeys,
     pubkey_from_privkey,
     aggregate_pubkeys,
+    sign_async,
+    verify_async,
+    aggregate_signatures_async,
+    verify_aggregate_async,
+    fast_aggregate_verify_async,
+    aggregate_pubkeys_async,
+    bls_verify_async,
+    bls_aggregate_pubkeys_async,
 )
 
 __all__ = [
@@ -31,4 +39,12 @@ __all__ = [
     "bls_aggregate_pubkeys",
     "pubkey_from_privkey",
     "aggregate_pubkeys",
+    "sign_async",
+    "verify_async",
+    "aggregate_signatures_async",
+    "verify_aggregate_async",
+    "fast_aggregate_verify_async",
+    "aggregate_pubkeys_async",
+    "bls_verify_async",
+    "bls_aggregate_pubkeys_async",
 ]

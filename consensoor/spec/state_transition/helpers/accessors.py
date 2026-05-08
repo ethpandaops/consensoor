@@ -509,4 +509,4 @@ def get_blob_parameters(epoch: int) -> BlobParameters:
                 max_blobs_per_block=entry["max_blobs_per_block"],
             )
 
-    return BlobParameters(epoch=0, max_blobs_per_block=MAX_BLOBS_PER_BLOCK_ELECTRA)
+    return BlobParameters(epoch=0, max_blobs_per_block=MAX_BLOBS_PER_BLOCK_ELECTRA())

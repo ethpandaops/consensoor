@@ -3,6 +3,9 @@
 import hashlib
 import json
 import logging
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Union
 
@@ -94,10 +97,15 @@ def load_keystores_from_dir(
     2. Teku: keystores_dir/<pubkey>/keystore.json or keystores_dir/<pubkey>/keystore-*.json
 
     Secrets directory contains files named by pubkey (0x...) containing the password.
+
+    EIP-2335 keystores typically use scrypt with N=262144, which is intentionally
+    slow (~1–3s per key). With 128 keystores that's minutes of serial work. We
+    fan out across all CPU cores via a ThreadPoolExecutor — pycryptodome's
+    scrypt releases the GIL during the inner loop so threads scale.
     """
     keystores_path = Path(keystores_dir)
     secrets_path = Path(secrets_dir)
-    keys = []
+    keys: list[ValidatorKey] = []
 
     logger.debug(f"Looking for keystores in: {keystores_path}")
     logger.debug(f"Secrets directory: {secrets_path}")
@@ -110,15 +118,18 @@ def load_keystores_from_dir(
         logger.error(f"Secrets directory does not exist: {secrets_path}")
         return keys
 
-    keystore_files = []
+    keystore_files: list[Path] = []
     for pattern in ["keystore*.json", "*/keystore*.json", "*/keystore.json", "0x*.json"]:
         found = list(keystores_path.glob(pattern))
-        logger.debug(f"Pattern '{pattern}' found {len(found)} files: {[str(f) for f in found]}")
+        logger.debug(f"Pattern '{pattern}' found {len(found)} files")
         keystore_files.extend(found)
 
     keystore_files = sorted(set(keystore_files))
     logger.info(f"Found {len(keystore_files)} keystore files")
 
+    # First pass: read JSON, locate password, build (path, password) tuples.
+    # We do this serially since it's cheap (a few JSON parses + path lookups).
+    work_items: list[tuple[Path, str]] = []
     for keystore_file in keystore_files:
         try:
             with open(keystore_file, "r") as f:
@@ -147,18 +158,38 @@ def load_keystores_from_dir(
                 break
 
         if password_file is None:
-            logger.debug(f"Listing secrets directory contents: {list(secrets_path.iterdir())[:5] if secrets_path.exists() else 'N/A'}")
             logger.warning(f"No password found for {pubkey_hex[:18]}..., skipping")
             continue
 
         password = password_file.read_text().strip()
+        work_items.append((keystore_file, password))
 
-        try:
-            key = load_keystore(keystore_file, password)
-            keys.append(key)
-        except Exception as e:
-            logger.error(f"Failed to load {keystore_file}: {e}")
+    if not work_items:
+        return keys
 
+    # Second pass: parallel decrypt. Cap the worker count so we don't allocate
+    # a giant scrypt RAM footprint × cpu_count (each scrypt invocation is
+    # ~128 MiB at N=262144).
+    cpu = os.cpu_count() or 4
+    max_workers = max(2, min(cpu, len(work_items)))
+    logger.info(
+        f"Decrypting {len(work_items)} keystores in parallel with {max_workers} workers"
+    )
+
+    t0 = time.monotonic()
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="keystore") as pool:
+        futures = {
+            pool.submit(load_keystore, path, pw): path for path, pw in work_items
+        }
+        for fut in as_completed(futures):
+            path = futures[fut]
+            try:
+                keys.append(fut.result())
+            except Exception as e:
+                logger.error(f"Failed to load {path}: {e}")
+
+    elapsed = time.monotonic() - t0
+    logger.info(f"Decrypted {len(keys)} keystores in {elapsed:.1f}s")
     return keys
 
 
