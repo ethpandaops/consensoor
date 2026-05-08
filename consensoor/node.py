@@ -461,9 +461,49 @@ class BeaconNode:
 
             if self.state:
                 self.validator_client.update_validator_indices(self.state)
+                self._update_custody_group_count_from_state()
         except Exception as e:
             logger.error(f"Failed to load validator keys: {e}")
             self.validator_client = ValidatorClient([])
+
+    def _update_custody_group_count_from_state(self) -> None:
+        """Apply `get_validators_custody_requirement` from
+        `consensus-specs/specs/fulu/validator.md`.
+
+        Sums effective_balance of attached validators, divides by
+        BALANCE_PER_ADDITIONAL_CUSTODY_GROUP, clamps to
+        [VALIDATOR_CUSTODY_REQUIREMENT, NUMBER_OF_CUSTODY_GROUPS]. Pushes the
+        result into the libp2p host so MetaData v3 advertises it on the next
+        request (seq_number is bumped).
+        """
+        if self.config.supernode:
+            return  # supernode pinned at NUMBER_OF_CUSTODY_GROUPS in BeaconGossip
+        if not self.beacon_gossip or not self.validator_client or not self.state:
+            return
+        indices = [
+            idx for idx in self.validator_client._validator_indices.values()
+            if idx is not None
+        ]
+        if not indices:
+            return
+        net_config = get_config()
+        total_balance = sum(
+            int(self.state.validators[i].effective_balance) for i in indices
+        )
+        per_group = net_config.balance_per_additional_custody_group
+        count = total_balance // per_group if per_group else 0
+        cgc = min(
+            max(count, net_config.validator_custody_requirement),
+            net_config.number_of_custody_groups,
+        )
+        logger.info(
+            f"Computed custody_group_count={cgc} "
+            f"(validators={len(indices)}, total_effective_balance={total_balance} gwei, "
+            f"per_group={per_group} gwei, "
+            f"floor=VALIDATOR_CUSTODY_REQUIREMENT={net_config.validator_custody_requirement}, "
+            f"ceil=NUMBER_OF_CUSTODY_GROUPS={net_config.number_of_custody_groups})"
+        )
+        self.beacon_gossip.update_custody_group_count(cgc)
 
     async def _init_engine_client(self) -> None:
         """Initialize the Engine API client."""
@@ -2292,13 +2332,27 @@ class BeaconNode:
                         self.store.save_block(block_root, signed_block)
                         return
                 else:
-                    logger.warning(
-                        f"P2P: Block slot={block.slot} builds on different chain "
-                        f"(parent={parent_root.hex()[:16]}, our head={self.head_root.hex()[:16]}). "
-                        f"Would need state regeneration to apply."
-                    )
+                    # Different chain — but parent is in our store and the
+                    # new block is at a slot ≥ head. Treat as reorg candidate.
                     self.store.save_block(block_root, signed_block)
-                    return
+                    if int(block.slot) > self.head_slot:
+                        logger.info(
+                            f"P2P: Reorg candidate slot={block.slot} root={block_root.hex()[:16]} "
+                            f"(our head slot={self.head_slot} root={self.head_root.hex()[:16]})"
+                        )
+                        try:
+                            await self._reorg_to(block_root, signed_block)
+                        except Exception as e:
+                            logger.warning(f"P2P: Reorg to slot={block.slot} failed: {e}")
+                            import traceback
+                            traceback.print_exc()
+                        return
+                    else:
+                        logger.debug(
+                            f"P2P: Block slot={block.slot} on different chain but not "
+                            f"newer than head_slot={self.head_slot} — saved, no reorg"
+                        )
+                        return
 
             self.store.save_block(block_root, signed_block)
 
@@ -2533,6 +2587,120 @@ class BeaconNode:
             logger.info(f"Stored blob sidecar: slot={slot}, index={index}, block_root={block_root.hex()[:16]}")
         except Exception as e:
             logger.warning(f"Failed to persist blob sidecar to LevelDB: {e}")
+
+    async def _reorg_to(self, target_root: bytes, target_signed_block) -> None:
+        """Switch chain head to a new block by walking back to a common
+        ancestor and re-applying state transitions.
+
+        This is the simple-LMD-GHOST reorg path: when a peer's block at
+        slot > our head slot points to a different parent than our head,
+        we want to adopt the peer's chain (it has more proposers / more
+        attestations behind it). We:
+
+          1. Walk back from target_block up parent_root pointers, building
+             the chain back to either our current state's slot or genesis.
+          2. Snapshot the state at the common ancestor, or recompute from
+             genesis if no closer ancestor is reachable.
+          3. Replay the chain from that ancestor through to target_root
+             via process_slots / process_block.
+          4. Atomically swap (self.state, self.head_root, self.head_slot)
+             on success, or leave them unchanged on failure.
+
+        Bigger optimisation later: cache state at each finalised checkpoint
+        and only walk back to the most recent finalised one. For now we
+        replay from genesis if needed — a few hundred ms per reorg.
+        """
+        target_block = target_signed_block.message
+        target_slot = int(target_block.slot)
+
+        # Walk back collecting (root, signed_block) from target → genesis.
+        # Stop early if we hit a block whose hash matches a stored state we
+        # already know (cheap-ish via store.get_state if it's there) — but
+        # for the MVP we go all the way back to genesis to be safe.
+        chain: list[tuple[bytes, object]] = [(target_root, target_signed_block)]
+        cursor = bytes(target_block.parent_root)
+        max_walk = max(target_slot + 8, 64)
+        for _ in range(max_walk):
+            if self._genesis_block_root and cursor == self._genesis_block_root:
+                break
+            ancestor_signed = self.store.get_block(cursor)
+            if ancestor_signed is None:
+                raise ValueError(
+                    f"reorg: missing ancestor {cursor.hex()[:16]} while walking "
+                    f"back from {target_root.hex()[:16]}"
+                )
+            chain.append((cursor, ancestor_signed))
+            anc_block = ancestor_signed.message if hasattr(ancestor_signed, "message") else ancestor_signed
+            cursor = bytes(anc_block.parent_root)
+        else:
+            raise ValueError(
+                f"reorg: walked back {max_walk} steps without hitting genesis"
+            )
+
+        # Reverse so we apply oldest → newest.
+        chain.reverse()
+
+        logger.info(
+            f"Reorg: replaying {len(chain)} blocks from genesis to slot {target_slot}"
+        )
+
+        # Fresh deep-copy of genesis state.
+        new_state = self._genesis_state.__class__.decode_bytes(
+            bytes(self._genesis_state.encode_bytes())
+        )
+
+        from .spec.state_transition import state_transition
+
+        def _replay(state, signed_blocks):
+            for signed in signed_blocks:
+                state = state_transition(state, signed, False)
+            return state
+
+        # Push the (potentially expensive) replay onto a worker thread.
+        new_state = await asyncio.to_thread(
+            _replay, new_state, [sb for _, sb in chain]
+        )
+
+        # Fill in latest_block_header.state_root if zero, just like the
+        # normal apply path does.
+        if bytes(new_state.latest_block_header.state_root) == b"\x00" * 32:
+            new_state.latest_block_header.state_root = bytes(target_block.state_root)
+
+        # Persist the new state under several keys so the API + dora can
+        # find it back.
+        state_root = await asyncio.to_thread(hash_tree_root, new_state)
+        self.store.save_state(state_root, new_state)
+        self.store.save_state(target_root, new_state)
+        block_state_root = bytes(target_block.state_root)
+        if block_state_root != state_root:
+            self.store.save_state(block_state_root, new_state)
+
+        old_head = self.head_root.hex()[:16] if self.head_root else "None"
+
+        # Atomic swap.
+        self.state = new_state
+        self.head_slot = target_slot
+        self.head_root = target_root
+        self.store.set_head(target_root)
+
+        from .spec import constants
+        epoch = target_slot // constants.SLOTS_PER_EPOCH()
+        metrics.update_head(target_slot, epoch)
+        metrics.update_checkpoints(
+            finalized=int(self.state.finalized_checkpoint.epoch),
+            justified=int(self.state.current_justified_checkpoint.epoch),
+        )
+
+        logger.info(
+            f"Reorg: head moved from {old_head} → "
+            f"{target_root.hex()[:16]} at slot {target_slot}"
+        )
+
+        # Forkchoice update with EL so it tracks the new head.
+        try:
+            await self._update_forkchoice()
+        except Exception as e:
+            logger.warning(f"Reorg: forkchoice_updated after reorg failed: {e}")
 
     async def _apply_block_to_state(self, block, block_root: bytes, signed_block=None) -> None:
         """Apply a received block to the local state using full state transition.
