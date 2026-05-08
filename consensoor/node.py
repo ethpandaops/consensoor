@@ -351,78 +351,113 @@ class BeaconNode:
             config.altair_fork_epoch = 0
 
         # Compute genesis block root per the spec:
-        # The state's latest_block_header.state_root is ZERO_HASH at genesis.
-        # The genesis block root is computed by filling in the actual state_root.
-        from .spec.types import BeaconBlockHeader
+        # `get_genesis_block(state) = SignedBeaconBlock(message=BeaconBlock(
+        #     state_root=hash_tree_root(state)))`
+        # — i.e. all body / header fields default and state_root = state hash.
+        # We MUST hash the synthetic empty block ourselves rather than reuse
+        # state.latest_block_header.body_root: kurtosis's eth-beacon-genesis
+        # stores the hash of an empty *body* there too, but if its dynssz
+        # schema disagrees with our remerkleable schema by a single field
+        # (e.g. PTC bitvector size, KZG commitment limits) the values
+        # diverge and our head_root won't match prysm's. Always compute
+        # head_root = hash_tree_root(BeaconBlock(state_root=..., body=defaults)).
         genesis_state_root = hash_tree_root(self.state)
-        header = self.state.latest_block_header
-        logger.info(
-            f"Genesis header from state: slot={header.slot}, proposer_index={header.proposer_index}, "
-            f"parent_root={bytes(header.parent_root).hex()[:16]}, "
-            f"state_root={bytes(header.state_root).hex()[:16]}, "
-            f"body_root={bytes(header.body_root).hex()[:16]}"
-        )
-        logger.info(f"Computed genesis state root: {genesis_state_root.hex()}")
-        genesis_block_header = BeaconBlockHeader(
-            slot=header.slot,
-            proposer_index=header.proposer_index,
-            parent_root=header.parent_root,
-            state_root=genesis_state_root,
-            body_root=header.body_root,
-        )
-        self.head_root = hash_tree_root(genesis_block_header)
         self.head_slot = int(self.state.slot)
         self._genesis_time = int(self.state.genesis_time)
+        header = self.state.latest_block_header  # used below for parent_root etc.
+        logger.info(f"Computed genesis state root: {genesis_state_root.hex()}")
 
-        # Save genesis block root and state for potential reorg handling
+        # Build the synthetic genesis block (defaults) and use ITS hash for
+        # head_root — see comment above.
+        if detected_fork == "gloas":
+            from .spec.types.gloas import (
+                BeaconBlockBody as GloasBeaconBlockBody,
+                BeaconBlock as GloasBeaconBlock,
+                SignedBeaconBlock as SignedGloasBeaconBlock,
+                ExecutionPayloadBid as GloasExecutionPayloadBid,
+                SignedExecutionPayloadBid as GloasSignedExecutionPayloadBid,
+            )
+            # Mirror state.latest_execution_payload_bid into the genesis
+            # body's signed_execution_payload_bid.message — lighthouse does
+            # this so its genesis body_root != prysm's. Prysm uses empty
+            # defaults; lighthouse populates parent_block_hash + execution
+            # requests_root from the state's bid. We follow lighthouse here
+            # to interop on the lighthouse-glamsterdam-devnet-3 chain.
+            state_bid = self.state.latest_execution_payload_bid
+            genesis_bid_msg = GloasExecutionPayloadBid(
+                parent_block_hash=state_bid.parent_block_hash,
+                parent_block_root=state_bid.parent_block_root,
+                block_hash=state_bid.block_hash,
+                prev_randao=state_bid.prev_randao,
+                fee_recipient=state_bid.fee_recipient,
+                gas_limit=state_bid.gas_limit,
+                builder_index=state_bid.builder_index,
+                slot=state_bid.slot,
+                value=state_bid.value,
+                execution_payment=state_bid.execution_payment,
+                blob_kzg_commitments=list(state_bid.blob_kzg_commitments),
+                execution_requests_root=state_bid.execution_requests_root,
+            )
+            genesis_signed_bid = GloasSignedExecutionPayloadBid(
+                message=genesis_bid_msg,
+                signature=BLSSignature(b'\x00' * 96),
+            )
+            genesis_body = GloasBeaconBlockBody(
+                signed_execution_payload_bid=genesis_signed_bid,
+            )
+            genesis_block = GloasBeaconBlock(
+                slot=int(header.slot),
+                proposer_index=int(header.proposer_index),
+                parent_root=header.parent_root,
+                state_root=genesis_state_root,
+                body=genesis_body,
+            )
+            signed_genesis_block = SignedGloasBeaconBlock(
+                message=genesis_block,
+                signature=BLSSignature(b'\x00' * 96),
+            )
+        else:
+            genesis_body = ElectraBeaconBlockBody(
+                randao_reveal=BLSSignature(b'\x00' * 96),
+                eth1_data=Eth1Data(),
+                graffiti=Bytes32(b'\x00' * 32),
+                proposer_slashings=[],
+                attester_slashings=[],
+                attestations=[],
+                deposits=[],
+                voluntary_exits=[],
+                sync_aggregate=SyncAggregate(),
+                execution_payload=ExecutionPayload(),
+                bls_to_execution_changes=[],
+                blob_kzg_commitments=[],
+                execution_requests=ExecutionRequests(),
+            )
+            genesis_block = ElectraBeaconBlock(
+                slot=int(header.slot),
+                proposer_index=int(header.proposer_index),
+                parent_root=header.parent_root,
+                state_root=genesis_state_root,
+                body=genesis_body,
+            )
+            signed_genesis_block = SignedElectraBeaconBlock(
+                message=genesis_block,
+                signature=BLSSignature(b'\x00' * 96),
+            )
+
+        self.head_root = hash_tree_root(genesis_block)
         self._genesis_block_root = self.head_root
         self._genesis_state = self.state.__class__.decode_bytes(bytes(self.state.encode_bytes()))
 
         # Save state by genesis_state_root (its true hash). Per spec the
         # genesis state has latest_block_header.state_root == ZERO_HASH;
-        # process_slot for slot 1 is what fills it in via
-        #     if state.latest_block_header.state_root == ZERO_HASH:
-        #         state.latest_block_header.state_root = previous_state_root
-        # If we mutate it here, state.state_roots[0] gets cached against a
-        # state hash that no other client computes, and every subsequent
-        # block we apply diverges from spec. Leave it ZERO and let
-        # process_slot handle it.
+        # process_slot for slot 1 fills it in. Don't mutate it here or
+        # state.state_roots[0] gets cached against a hash no other client
+        # computes.
         self.store.save_state(genesis_state_root, self.state)
-        # Also save state by head_root (block_root) for explorer lookup.
         self.store.save_state(self.head_root, self.state)
         self.store.set_head(self.head_root)
-        logger.info(f"Genesis block root: {self.head_root.hex()}")
-
-        # Create and save genesis block for API compatibility
-        # The genesis block body is empty with default values
-        genesis_body = ElectraBeaconBlockBody(
-            randao_reveal=BLSSignature(b'\x00' * 96),
-            eth1_data=Eth1Data(),
-            graffiti=Bytes32(b'\x00' * 32),
-            proposer_slashings=[],
-            attester_slashings=[],
-            attestations=[],
-            deposits=[],
-            voluntary_exits=[],
-            sync_aggregate=SyncAggregate(),
-            execution_payload=ExecutionPayload(),
-            bls_to_execution_changes=[],
-            blob_kzg_commitments=[],
-            execution_requests=ExecutionRequests(),
-        )
-        genesis_block = ElectraBeaconBlock(
-            slot=int(header.slot),
-            proposer_index=int(header.proposer_index),
-            parent_root=header.parent_root,
-            state_root=genesis_state_root,
-            body=genesis_body,
-        )
-        signed_genesis_block = SignedElectraBeaconBlock(
-            message=genesis_block,
-            signature=BLSSignature(b'\x00' * 96),
-        )
         self.store.save_block(self.head_root, signed_genesis_block)
-        logger.info(f"Saved genesis block to store")
+        logger.info(f"Genesis block root: {self.head_root.hex()} (fork={detected_fork})")
 
         # Update metrics
         from .spec import constants

@@ -76,7 +76,7 @@ def process_execution_payload_envelope(
     previous_state_root = hash_tree_root(state)
     header = state.latest_block_header
     if bytes(header.state_root) == b"\x00" * 32:
-        from ....types import BeaconBlockHeader
+        from ...types import BeaconBlockHeader
         check_header = BeaconBlockHeader(
             slot=header.slot,
             proposer_index=header.proposer_index,
@@ -87,7 +87,9 @@ def process_execution_payload_envelope(
     else:
         check_header = header
     assert envelope.beacon_block_root == hash_tree_root(check_header)
-    assert int(envelope.slot) == int(state.slot)
+    # alpha-7 envelope schema doesn't carry an explicit `slot` field; the
+    # slot is implicit via beacon_block_root → state.latest_block_header.slot.
+    assert int(state.latest_block_header.slot) == int(state.slot)
 
     committed_bid = state.latest_execution_payload_bid
     assert int(envelope.builder_index) == int(committed_bid.builder_index)
