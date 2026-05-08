@@ -431,6 +431,18 @@ class BlockBuilder:
         base_fields["blob_gas_used"] = uint64(hex_to_int(payload_dict.get("blobGasUsed", "0x0")))
         base_fields["excess_blob_gas"] = uint64(hex_to_int(payload_dict.get("excessBlobGas", "0x0")))
 
+        if fork == "gloas":
+            # Gloas adds block_access_list (EIP-7928) and slot_number (EIP-7843).
+            from ..spec.types.gloas import (
+                ExecutionPayload as GloasExecutionPayload,
+                BlockAccessList,
+            )
+            # block_access_list comes from EL via amsterdam engine API.
+            # If absent, default-empty is the right choice.
+            base_fields["block_access_list"] = BlockAccessList()
+            base_fields["slot_number"] = uint64(hex_to_int(payload_dict.get("slotNumber", "0x0")))
+            return GloasExecutionPayload(**base_fields)
+
         return ExecutionPayload(**base_fields)
 
     def _build_block_body(self, state, randao_reveal: BLSSignature, execution_payload, fork: str, attestations=None):

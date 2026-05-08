@@ -1821,45 +1821,19 @@ class BeaconNode:
                 commitment_bytes = bytes.fromhex(commitment_hex.replace("0x", ""))
                 kzg_commitments.append(KZGCommitment(commitment_bytes))
 
-        # Build envelope with placeholder state_root (will be computed after phase 2)
+        # alpha-7 ExecutionPayloadEnvelope: payload, execution_requests,
+        # builder_index, beacon_block_root, parent_beacon_block_root.
+        # No `slot` / `state_root` — those are dev-spec only.
+        parent_beacon_block_root = bytes(self.state.latest_block_header.parent_root)
         envelope = ExecutionPayloadEnvelope(
             payload=execution_payload,
             execution_requests=exec_requests_obj,
             builder_index=BUILDER_INDEX_SELF_BUILD,
             beacon_block_root=Root(beacon_block_root),
-            slot=Slot(slot),
-            state_root=Root(b"\x00" * 32),
+            parent_beacon_block_root=Root(parent_beacon_block_root),
         )
 
         g2_point_at_infinity = b"\xc0" + b"\x00" * 95
-        signed_envelope = SignedExecutionPayloadEnvelope(
-            message=envelope,
-            signature=BLSSignature(g2_point_at_infinity),
-        )
-
-        # Apply phase 2 (envelope processing) to state - updates latest_block_hash,
-        # execution_payload_availability, processes execution requests, etc.
-        from .spec.state_transition.block.execution_payload_envelope import (
-            process_execution_payload_envelope,
-        )
-
-        def _apply_envelope_and_root(state, env):
-            process_execution_payload_envelope(state, env, verify=False)
-            return hash_tree_root(state)
-
-        state_root = await self._on_state_thread(
-            _apply_envelope_and_root, self.state, signed_envelope
-        )
-
-        # Rebuild envelope with correct state_root
-        envelope = ExecutionPayloadEnvelope(
-            payload=execution_payload,
-            execution_requests=exec_requests_obj,
-            builder_index=BUILDER_INDEX_SELF_BUILD,
-            beacon_block_root=Root(beacon_block_root),
-            slot=Slot(slot),
-            state_root=Root(state_root),
-        )
         signed_envelope = SignedExecutionPayloadEnvelope(
             message=envelope,
             signature=BLSSignature(g2_point_at_infinity),
