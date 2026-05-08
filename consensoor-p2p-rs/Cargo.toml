@@ -39,3 +39,4 @@ hex = "0.4"
 sha2 = "0.10"
 async-trait = "0.1"
 enr = { version = "0.13", features = ["ed25519", "k256"] }
+discv5 = "0.10"

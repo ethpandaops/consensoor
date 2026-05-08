@@ -11,6 +11,7 @@
 
 mod blocks_by_range;
 mod bootnode;
+mod discovery;
 mod gossip;
 mod network;
 mod peer_score;

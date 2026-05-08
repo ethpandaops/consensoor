@@ -279,6 +279,11 @@ impl Network {
         let mut secret_bytes = secp_kp.secret().to_bytes();
         let enr_key = CombinedKey::secp256k1_from_bytes(&mut secret_bytes)
             .map_err(|e| PyRuntimeError::new_err(format!("enr secp256k1: {e}")))?;
+        // Second copy for discv5 — `secp256k1_from_bytes` zeroizes its input,
+        // and `CombinedKey` itself isn't Clone.
+        let mut secret_bytes_for_discv5 = secp_kp.secret().to_bytes();
+        let discv5_enr_key = CombinedKey::secp256k1_from_bytes(&mut secret_bytes_for_discv5)
+            .map_err(|e| PyRuntimeError::new_err(format!("discv5 secp256k1: {e}")))?;
 
         let listen_addr: Multiaddr = config
             .listen_addr
@@ -301,6 +306,16 @@ impl Network {
             })
             .collect::<Result<_, _>>()?;
 
+        // Parse bootnodes that look like ENRs into actual Enr<CombinedKey>
+        // values for the discv5 routing table. Multiaddr-only bootnodes are
+        // skipped (discv5 needs an ENR to walk the network from).
+        let bootnode_enrs: Vec<Enr<CombinedKey>> = config
+            .bootnodes
+            .iter()
+            .filter(|s| s.starts_with("enr:"))
+            .filter_map(|s| s.parse::<Enr<CombinedKey>>().ok())
+            .collect();
+
         let agent_version = config.agent_version.clone();
 
         let (cmd_tx, cmd_rx) = bounded::<Command>(64);
@@ -316,6 +331,7 @@ impl Network {
         let connected_peers_clone = connected_peers.clone();
 
         let runtime_clone = runtime.clone();
+        let discv5_local_enr = initial_enr.clone();
         runtime_clone.spawn(async move {
             if let Err(e) = run_swarm(
                 key,
@@ -331,6 +347,10 @@ impl Network {
                 by_range_tx,
                 listen_addrs_clone,
                 connected_peers_clone,
+                discv5_local_enr,
+                discv5_enr_key,
+                bootnode_enrs,
+                tcp_port,
             )
             .await
             {
@@ -701,6 +721,10 @@ async fn run_swarm(
     by_range_tx: Sender<BlocksByRangeEvent>,
     listen_addrs: Arc<Mutex<Vec<String>>>,
     connected_peers: Arc<Mutex<HashMap<String, &'static str>>>,
+    discv5_local_enr: Enr<CombinedKey>,
+    discv5_enr_key: CombinedKey,
+    bootnode_enrs: Vec<Enr<CombinedKey>>,
+    udp_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let local_peer_id = key.public().to_peer_id();
 
@@ -783,6 +807,26 @@ async fn run_swarm(
         }
     }
 
+    // Spawn discv5 alongside libp2p. As it discovers ENRs, it pushes the
+    // libp2p multiaddr we'd dial onto `discovered_rx`, which we drain in
+    // the main select! loop and feed to swarm.dial().
+    let (discovered_tx, discovered_rx) = bounded::<Multiaddr>(64);
+    if let Err(e) = crate::discovery::spawn_discovery(
+        discv5_local_enr,
+        discv5_enr_key,
+        udp_port,
+        bootnode_enrs,
+        discovered_tx,
+    )
+    .await
+    {
+        tracing::warn!("discv5 failed to start: {e} (continuing without discovery)");
+    }
+    // Track which peers we've already dialed via discovery so we don't
+    // re-issue dial commands every time the same ENR re-surfaces.
+    let mut dialed_via_discovery: std::collections::HashSet<libp2p::PeerId> =
+        std::collections::HashSet::new();
+
     let mut topic_subs: HashMap<String, IdentTopic> = HashMap::new();
     let mut pending_status: HashMap<u64, request_response::ResponseChannel<StatusMessage>> =
         HashMap::new();
@@ -800,6 +844,33 @@ async fn run_swarm(
 
     loop {
         tokio::select! {
+            // Drain peers discovered by discv5 and dial them via libp2p.
+            // Skip peers we already dialed (or that match our local id).
+            disc = discovered_rx.recv() => match disc {
+                Ok(addr) => {
+                    use libp2p::multiaddr::Protocol;
+                    let pid = addr.iter().find_map(|p| match p {
+                        Protocol::P2p(id) => Some(id),
+                        _ => None,
+                    });
+                    if let Some(pid) = pid {
+                        if pid == local_peer_id {
+                            continue;
+                        }
+                        if !dialed_via_discovery.insert(pid) {
+                            continue;
+                        }
+                    }
+                    if let Err(e) = swarm.dial(addr.clone()) {
+                        tracing::debug!("discv5-dial failed for {addr}: {e}");
+                    } else {
+                        tracing::info!("discv5: dialing {addr}");
+                    }
+                }
+                Err(_) => {
+                    // discovery channel closed — keep the swarm running.
+                }
+            },
             event = swarm.select_next_some() => match event {
                 SwarmEvent::NewListenAddr { address, .. } => {
                     tracing::info!("listening on {address}");
