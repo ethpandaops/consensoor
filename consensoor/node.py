@@ -57,7 +57,6 @@ from .spec.network_config import (
 )
 from .spec.constants import SLOTS_PER_EPOCH
 from .spec.state_transition import process_slots
-from .network import Gossip, GossipConfig, MessageType
 from .engine import EngineAPIClient, ForkchoiceState, PayloadStatusEnum
 from .store import Store
 from .beacon_api import BeaconAPI
@@ -168,12 +167,6 @@ class BeaconNode:
 
         self.store = Store(config.data_dir)
 
-        gossip_config = GossipConfig(
-            listen_host=config.listen_host,
-            listen_port=config.listen_port,
-            peers=config.peers,
-        )
-        self.gossip = Gossip(gossip_config)
         self.engine: Optional[EngineAPIClient] = None
         self.beacon_api: Optional[BeaconAPI] = None
         self.validator_client: Optional[ValidatorClient] = None
@@ -251,13 +244,6 @@ class BeaconNode:
         # they drop the connection with "no chain status for peer". If we
         # load 128 keystores on the asyncio thread first, we miss prysm's
         # Status timeout and lose the only peer we have.
-        #
-        # NOTE: the legacy `consensoor.network.gossip` UDP layer is intentionally
-        # NOT started here. It used to bind UDP/<p2p_port>, which collides with
-        # discv5 (also UDP/<p2p_port>) and prevents discovery from coming up
-        # with `Address already in use`. Rust libp2p + discv5 handle all P2P
-        # now; the Gossip object stays in self.gossip only so legacy subscribe()
-        # calls don't blow up.
         await self._setup_p2p()
 
         await self._load_validator_keys()
@@ -294,7 +280,6 @@ class BeaconNode:
             except asyncio.CancelledError:
                 pass
 
-        await self.gossip.stop()
         if self.beacon_gossip:
             await self.beacon_gossip.stop()
         if self.state_sync:
@@ -553,16 +538,6 @@ class BeaconNode:
             logger.error(f"Failed to start beacon sync: {e}")
             self.state_sync = None
             self.remote_beacon = None
-
-    async def _setup_gossip(self) -> None:
-        """Set up gossip message handlers."""
-        self.gossip.subscribe(MessageType.BEACON_BLOCK, self._on_block)
-        self.gossip.subscribe(MessageType.EXECUTION_PAYLOAD_BID, self._on_bid)
-        self.gossip.subscribe(MessageType.EXECUTION_PAYLOAD, self._on_payload)
-        self.gossip.subscribe(MessageType.PAYLOAD_ATTESTATION, self._on_ptc_attestation)
-        self.gossip.subscribe(MessageType.ATTESTATION, self._on_attestation)
-
-        await self.gossip.start()
 
     async def _setup_p2p(self) -> None:
         """Set up libp2p-based gossipsub for Ethereum P2P networking."""
@@ -1456,6 +1431,9 @@ class BeaconNode:
         # Avoids expensive deep copy + process_slots that blocks the event loop.
         state_for_signing = self.state
 
+        produced_validators: list[int] = []
+        produced_positions: list[int] = []
+        block_root_hex: Optional[str] = None
         for validator_index, positions in self._sync_committee_duties.items():
             for pubkey, key in self.validator_client.keys.items():
                 if key.validator_index == validator_index:
@@ -1463,14 +1441,24 @@ class BeaconNode:
                         state_for_signing, slot, key
                     )
                     if message:
+                        produced_validators.append(int(validator_index))
                         for position in positions:
                             self.sync_committee_pool.add(message, position)
+                            produced_positions.append(int(position))
+                        if block_root_hex is None:
+                            block_root_hex = bytes(message.beacon_block_root).hex()[:16]
                     break
 
-        logger.debug(
-            f"Produced sync committee messages: slot={slot}, "
-            f"pool_size={self.sync_committee_pool.size}"
-        )
+        if produced_validators:
+            logger.debug(
+                f"Sync committee messages: slot={slot} "
+                f"validators({len(produced_validators)})="
+                f"{sorted(produced_validators)} "
+                f"positions({len(produced_positions)})="
+                f"{sorted(produced_positions)} "
+                f"block_root={block_root_hex} "
+                f"pool_size={self.sync_committee_pool.size}"
+            )
 
     async def _broadcast_sync_committee_contributions(self, slot: int, state) -> None:
         """Broadcast sync committee contributions for each subcommittee."""
@@ -2052,143 +2040,6 @@ class BeaconNode:
             logger.error(f"Block production failed: {e}")
             import traceback
             traceback.print_exc()
-
-    async def _on_block(self, payload: bytes, sender: tuple[str, int]) -> None:
-        """Handle a received beacon block."""
-        try:
-            signed_block = decode_signed_beacon_block(payload)
-            block = signed_block.message
-            block_root = hash_tree_root(block)
-
-            logger.info(
-                f"Received block: slot={block.slot}, root={block_root.hex()[:16]}"
-            )
-
-            metrics.record_block_received()
-
-            if self.store.get_block(block_root):
-                return
-
-            self.store.save_block(block_root, signed_block)
-
-            if int(block.slot) > self.head_slot:
-                # Apply state transition FIRST (before updating head, to avoid race with SSE events)
-                await self._apply_block_to_state(block, block_root, signed_block)
-
-                # Fill in state.latest_block_header.state_root with the actual post-state root
-                if bytes(self.state.latest_block_header.state_root) == b"\x00" * 32:
-                    self.state.latest_block_header.state_root = bytes(block.state_root)
-
-                # Save state for epoch queries (Dora needs historical states by state_root)
-                # This MUST happen before updating head_slot/head_root to avoid race condition
-                # where SSE event is emitted before state is saved
-                state_root = await self._on_state_thread(hash_tree_root, self.state)
-                self.store.save_state(state_root, self.state)
-                self.store.save_state(block_root, self.state)  # Also by block_root for flexibility
-                # Also save by the block's state_root field, as that's what Dora looks for
-                block_state_root = bytes(block.state_root)
-                if block_state_root != state_root:
-                    self.store.save_state(block_state_root, self.state)
-
-                # NOW update head_slot/head_root (SSE event loop will see this change)
-                self.head_slot = int(block.slot)
-                self.head_root = block_root
-                self.store.set_head(block_root)
-
-                # Update metrics
-                from .spec import constants
-                slot = int(block.slot)
-                epoch = slot // constants.SLOTS_PER_EPOCH()
-                metrics.update_head(slot, epoch)
-
-                # Remove included attestations from pool to avoid re-inclusion
-                self.attestation_pool.remove_included(list(block.body.attestations))
-
-                await self._update_forkchoice()
-
-                # Emit ePBS SSE events for received blocks
-                if self.beacon_api and hasattr(block.body, 'signed_execution_payload_bid'):
-                    try:
-                        await self.beacon_api.emit_execution_payload_bid(
-                            block.body.signed_execution_payload_bid
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to emit execution_payload_bid event: {e}")
-
-        except Exception as e:
-            logger.error(f"Error processing block: {e}")
-
-    async def _on_bid(self, payload: bytes, sender: tuple[str, int]) -> None:
-        """Handle a received execution payload bid (ePBS)."""
-        try:
-            signed_bid = SignedExecutionPayloadBid.decode_bytes(payload)
-            bid = signed_bid.message
-
-            logger.debug(
-                f"Received bid: slot={bid.slot}, builder={bid.builder_index}"
-            )
-
-            self.store.save_bid(int(bid.slot), signed_bid)
-
-            if self.beacon_api:
-                try:
-                    await self.beacon_api.emit_execution_payload_bid(signed_bid)
-                except Exception as e:
-                    logger.error(f"Failed to emit execution_payload_bid event: {e}")
-
-        except Exception as e:
-            logger.error(f"Error processing bid: {e}")
-
-    async def _on_payload(self, payload: bytes, sender: tuple[str, int]) -> None:
-        """Handle a received execution payload envelope (ePBS)."""
-        try:
-            signed_envelope = SignedExecutionPayloadEnvelope.decode_bytes(payload)
-            envelope = signed_envelope.message
-            slot = self._envelope_slot(envelope)
-
-            logger.info(
-                f"Received payload: slot={slot if slot is not None else '?'}, "
-                f"block_hash={bytes(envelope.payload.block_hash).hex()[:16]}"
-            )
-
-            payload_root = hash_tree_root(envelope)
-            self.store.save_payload(payload_root, signed_envelope)
-            self.store.save_payload(bytes(envelope.beacon_block_root), signed_envelope)
-
-            if self.engine:
-                await self._validate_execution_payload(envelope)
-
-            if self.beacon_api and slot is not None:
-                try:
-                    await self.beacon_api.emit_execution_payload_available(
-                        slot, bytes(envelope.beacon_block_root)
-                    )
-                except Exception as e:
-                    logger.error(f"Failed to emit execution_payload_available event: {e}")
-
-        except Exception as e:
-            logger.error(f"Error processing payload: {e}")
-
-    async def _on_ptc_attestation(
-        self, payload: bytes, sender: tuple[str, int]
-    ) -> None:
-        """Handle a received payload attestation (ePBS)."""
-        try:
-            attestation = PayloadAttestationMessage.decode_bytes(payload)
-            logger.debug(
-                f"Received PTC attestation: slot={attestation.data.slot}, "
-                f"validator={attestation.validator_index}"
-            )
-        except Exception as e:
-            logger.error(f"Error processing PTC attestation: {e}")
-
-    async def _on_attestation(self, payload: bytes, sender: tuple[str, int]) -> None:
-        """Handle a received attestation."""
-        try:
-            attestation = Attestation.decode_bytes(payload)
-            logger.debug(f"Received attestation: slot={attestation.data.slot}")
-        except Exception as e:
-            logger.error(f"Error processing attestation: {e}")
 
     async def _block_sync_loop(self) -> None:
         """Independent block-sync poller.
