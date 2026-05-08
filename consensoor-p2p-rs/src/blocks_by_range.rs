@@ -1,11 +1,20 @@
-//! BeaconBlocksByRange v3 (`/eth2/beacon_chain/req/beacon_blocks_by_range/3/ssz_snappy`).
+//! BeaconBlocksByRange v2 + v3.
 //!
 //! Wire format:
 //!
-//!     request   := varint(uncompressed_len) ‖ snappy_framed(start_slot ‖ count)   // 16-byte payload
-//!     response  := stream of chunks, where each chunk is:
-//!         <result_byte=0> ‖ <context=fork_digest:4> ‖ varint(uncompressed_len) ‖ snappy_framed(SignedBeaconBlock_ssz)
-//!     ...stream is closed by the responder after the last chunk.
+//!   v2 (`/eth2/beacon_chain/req/beacon_blocks_by_range/2/ssz_snappy`):
+//!     request   := varint(uncompressed_len) ‖ snappy_framed(start_slot ‖ count ‖ step)
+//!                  // 24-byte payload — `step` is deprecated since Altair but
+//!                  // is still part of the v2 SSZ schema and MUST be `1`.
+//!   v3 (`/eth2/beacon_chain/req/beacon_blocks_by_range/3/ssz_snappy`):
+//!     request   := varint(uncompressed_len) ‖ snappy_framed(start_slot ‖ count)
+//!                  // 16-byte payload — `step` removed entirely.
+//!
+//!   response (both versions, identical):
+//!     stream of chunks, where each chunk is:
+//!       <result_byte=0> ‖ <context=fork_digest:4> ‖
+//!       varint(uncompressed_len) ‖ snappy_framed(SignedBeaconBlock_ssz)
+//!     stream is closed by the responder after the last chunk.
 //!
 //! Up to MAX_REQUEST_BLOCKS (currently 1024) chunks may be returned.
 
@@ -19,7 +28,11 @@ use unsigned_varint::{decode as varint_decode, encode as varint_encode};
 const MAX_BLOCK_BYTES: usize = 10 * 1024 * 1024;
 const MAX_REQUEST_BLOCKS: usize = 1024;
 
-/// 16-byte SSZ-fixed Eth2 ByRange request body.
+const PROTO_V2: &str = "/eth2/beacon_chain/req/beacon_blocks_by_range/2/ssz_snappy";
+const PROTO_V3: &str = "/eth2/beacon_chain/req/beacon_blocks_by_range/3/ssz_snappy";
+
+/// SSZ-fixed Eth2 ByRange request body (16 bytes for v3, 24 bytes for v2 with
+/// the trailing deprecated `step` always set to 1 on the wire).
 #[pyclass]
 #[derive(Clone, Debug)]
 pub struct BlocksByRangeRequest {
@@ -44,20 +57,37 @@ impl BlocksByRangeRequest {
 }
 
 impl BlocksByRangeRequest {
-    pub fn encode_ssz(&self) -> Vec<u8> {
+    /// Encode for v3 (16 bytes).
+    pub fn encode_ssz_v3(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(16);
         out.extend_from_slice(&self.start_slot.to_le_bytes());
         out.extend_from_slice(&self.count.to_le_bytes());
         out
     }
+    /// Encode for v2 (24 bytes; trailing `step` is the deprecated field, set
+    /// to 1 per spec — the only value v2 peers will accept).
+    pub fn encode_ssz_v2(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(24);
+        out.extend_from_slice(&self.start_slot.to_le_bytes());
+        out.extend_from_slice(&self.count.to_le_bytes());
+        out.extend_from_slice(&1u64.to_le_bytes()); // step (deprecated, MUST be 1)
+        out
+    }
+    /// Decode either v2 (24 bytes) or v3 (16 bytes). For v2 we ignore the
+    /// trailing `step` field — the spec deprecates it and we never honor
+    /// values other than 1.
     pub fn decode_ssz(bytes: &[u8]) -> Result<Self, String> {
-        if bytes.len() != 16 {
-            return Err(format!("blocks_by_range request expects 16 bytes, got {}", bytes.len()));
+        match bytes.len() {
+            16 => Ok(Self {
+                start_slot: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+                count: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            }),
+            24 => Ok(Self {
+                start_slot: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+                count: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            }),
+            n => Err(format!("blocks_by_range request expects 16 or 24 bytes, got {n}")),
         }
-        Ok(Self {
-            start_slot: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
-            count: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-        })
     }
 }
 
@@ -162,27 +192,30 @@ impl Codec for BlocksByRangeCodec {
 
     async fn read_request<T>(
         &mut self,
-        _: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
     ) -> io::Result<Self::Request>
     where
         T: futures::AsyncRead + Unpin + Send,
     {
         use futures::AsyncReadExt;
+        let expected = expected_request_len(protocol.as_ref());
         let mut buf = Vec::new();
         io.take(64).read_to_end(&mut buf).await?;
-        // Decode one Eth2 RPC payload (varint(len) ‖ framed-snappy)
-        let (expected_len, rest) = varint_decode::usize(&buf).map_err(|e| {
+        let (declared_len, rest) = varint_decode::usize(&buf).map_err(|e| {
             io::Error::new(io::ErrorKind::InvalidData, format!("varint: {e}"))
         })?;
-        if expected_len != 16 {
+        if declared_len != expected {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("by_range request expects 16 bytes, declared {expected_len}"),
+                format!(
+                    "by_range request expects {expected} bytes on {}, declared {declared_len}",
+                    protocol.as_ref()
+                ),
             ));
         }
         let mut decoder = snap::read::FrameDecoder::new(Cursor::new(rest));
-        let mut payload = Vec::with_capacity(16);
+        let mut payload = Vec::with_capacity(expected);
         decoder.read_to_end(&mut payload)?;
         BlocksByRangeRequest::decode_ssz(&payload)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -293,7 +326,7 @@ impl Codec for BlocksByRangeCodec {
 
     async fn write_request<T>(
         &mut self,
-        _: &Self::Protocol,
+        protocol: &Self::Protocol,
         io: &mut T,
         req: Self::Request,
     ) -> io::Result<()>
@@ -301,7 +334,14 @@ impl Codec for BlocksByRangeCodec {
         T: futures::AsyncWrite + Unpin + Send,
     {
         use futures::AsyncWriteExt;
-        let payload = req.encode_ssz();
+        // v2 wants 24 bytes (start_slot ‖ count ‖ step=1); v3 wants 16 bytes.
+        // Sending the wrong size on v2 makes prysm/lighthouse register a
+        // bad-response strike against us and disconnect after 5 strikes.
+        let payload = if protocol.as_ref() == PROTO_V2 {
+            req.encode_ssz_v2()
+        } else {
+            req.encode_ssz_v3()
+        };
 
         let mut framed = Vec::new();
         let mut varint_buf = varint_encode::usize_buffer();
@@ -410,12 +450,21 @@ fn is_snappy_chunk_continuation(byte: u8) -> bool {
 
 pub type BlocksByRangeBehaviour = request_response::Behaviour<BlocksByRangeCodec>;
 
+fn expected_request_len(protocol: &str) -> usize {
+    if protocol == PROTO_V2 {
+        24
+    } else {
+        16
+    }
+}
+
 pub fn new_blocks_by_range_behaviour() -> BlocksByRangeBehaviour {
-    // Lighthouse currently advertises both v2 and v3; v2 is the safer default
-    // (required since Bellatrix). With multiple protocols here libp2p picks
-    // whichever the peer also supports during stream upgrade.
-    let v2 = StreamProtocol::new("/eth2/beacon_chain/req/beacon_blocks_by_range/2/ssz_snappy");
-    let v3 = StreamProtocol::new("/eth2/beacon_chain/req/beacon_blocks_by_range/3/ssz_snappy");
+    // Advertise both v2 and v3. The codec serialises the body according to
+    // whichever protocol libp2p negotiates with the peer:
+    //   - prysm currently registers only v2 — uses 24-byte body with step=1
+    //   - lighthouse advertises both — typically picks v3 (16 bytes)
+    let v2 = StreamProtocol::new(PROTO_V2);
+    let v3 = StreamProtocol::new(PROTO_V3);
     let cfg = request_response::Config::default()
         .with_request_timeout(std::time::Duration::from_secs(30));
     request_response::Behaviour::with_codec(
@@ -433,10 +482,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn request_roundtrip() {
+    fn request_v3_roundtrip() {
         let r = BlocksByRangeRequest::new(123, 32);
-        let b = r.encode_ssz();
+        let b = r.encode_ssz_v3();
         assert_eq!(b.len(), 16);
+        let d = BlocksByRangeRequest::decode_ssz(&b).unwrap();
+        assert_eq!(d.start_slot, 123);
+        assert_eq!(d.count, 32);
+    }
+
+    #[test]
+    fn request_v2_roundtrip() {
+        let r = BlocksByRangeRequest::new(123, 32);
+        let b = r.encode_ssz_v2();
+        assert_eq!(b.len(), 24);
+        // Trailing step field MUST be 1 on the wire.
+        assert_eq!(&b[16..24], &1u64.to_le_bytes());
         let d = BlocksByRangeRequest::decode_ssz(&b).unwrap();
         assert_eq!(d.start_slot, 123);
         assert_eq!(d.count, 32);
