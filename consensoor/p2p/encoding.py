@@ -74,19 +74,13 @@ def get_blob_sidecar_topic(subnet_id: int, fork_digest: bytes, encoding: str = "
 
 
 def encode_message(data: bytes) -> bytes:
-    """Encode a message for gossip transmission.
-
-    Messages are snappy compressed.
-    """
-    return snappy.compress(data)
+    """Pass-through: the Rust p2p stack does snappy compression on publish."""
+    return data
 
 
 def decode_message(data: bytes) -> bytes:
-    """Decode a message received from gossip.
-
-    Messages are snappy decompressed.
-    """
-    return snappy.uncompress(data)
+    """Pass-through: the Rust p2p stack decompresses on receive."""
+    return data
 
 
 def compute_message_id(message_data: bytes) -> bytes:
