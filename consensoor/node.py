@@ -1262,6 +1262,12 @@ class BeaconNode:
         if not self.state:
             return
 
+        if not self._is_synced():
+            logger.debug(
+                f"Skip proposal for slot {slot} — not synced (head={self.head_slot})"
+            )
+            return
+
         # Check proposer duty using current state — proposer_lookahead allows O(1)
         # lookup without needing state advanced to the exact slot. Only fall back to
         # expensive deep copy + process_slots if lookahead is unavailable.
@@ -1303,6 +1309,25 @@ class BeaconNode:
         for e in old_epochs:
             del self._attester_duties[e]
 
+    def _is_synced(self) -> bool:
+        """Are we close enough to the network head to safely publish?
+
+        Publishing attestations / aggregates / sync-committee msgs while our
+        cached head is far from the wall-clock slot produces messages that
+        peers (prysm, lighthouse) reject as invalid. Each rejection counts
+        against our gossipsub peer score (~-214 weight per invalid msg);
+        a few rejections in <30s and they prune our peer entirely. Gate all
+        publishing until we're within a small window of the current slot.
+        """
+        if not self.state or not self.head_root or not self._genesis_time:
+            return False
+        try:
+            slot_duration = get_config().slot_duration_ms / 1000.0
+        except Exception:
+            return False
+        current_slot = int((time.time() - self._genesis_time) // slot_duration)
+        return self.head_slot >= current_slot - 4
+
     async def _produce_attestations(self, slot: int) -> None:
         """Produce attestations for validators with duties at this slot.
 
@@ -1312,6 +1337,12 @@ class BeaconNode:
         if not self.validator_client or not self.validator_client.keys:
             return
         if not self.state or not self.head_root:
+            return
+        if not self._is_synced():
+            logger.debug(
+                f"[ATTESTER] slot={slot} skipped — not synced "
+                f"(head={self.head_slot}, current={int((time.time() - self._genesis_time) / (get_config().slot_duration_ms / 1000.0))})"
+            )
             return
 
         # Log timing for debugging attestation rate issues
@@ -1464,6 +1495,8 @@ class BeaconNode:
         """Broadcast sync committee contributions for each subcommittee."""
         if not self.beacon_gossip or not self.validator_client:
             return
+        if not self._is_synced():
+            return
 
         from .spec.constants import SYNC_COMMITTEE_SIZE, SYNC_COMMITTEE_SUBNET_COUNT, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_CONTRIBUTION_AND_PROOF
         from .spec.types.altair import (
@@ -1481,6 +1514,7 @@ class BeaconNode:
         if not messages:
             return
 
+        broadcast_summary: list[tuple[int, int]] = []  # (subcommittee_index, bits)
         for subcommittee_index in range(SYNC_COMMITTEE_SUBNET_COUNT):
             base_position = subcommittee_index * subcommittee_size
 
@@ -1558,12 +1592,18 @@ class BeaconNode:
                 await self.beacon_gossip.publish_sync_committee_contribution(
                     bytes(signed_contribution.encode_bytes())
                 )
-                logger.debug(
-                    f"Broadcast sync committee contribution: slot={slot}, "
-                    f"subcommittee={subcommittee_index}, bits={len(signatures)}"
-                )
+                broadcast_summary.append((subcommittee_index, len(signatures)))
             except Exception as e:
                 logger.warning(f"Failed to broadcast contribution: {e}")
+
+        if broadcast_summary:
+            bits_per_sub = ", ".join(
+                f"sub{idx}={bits}" for idx, bits in broadcast_summary
+            )
+            logger.debug(
+                f"Broadcast sync committee contributions: slot={slot} "
+                f"subcommittees={len(broadcast_summary)} {bits_per_sub}"
+            )
 
     async def _broadcast_attestation_as_aggregate(
         self, attestation, validator_index: int, pubkey: bytes
@@ -1622,7 +1662,6 @@ class BeaconNode:
         # Broadcast
         ssz_bytes = signed_aggregate.encode_bytes()
         await self.beacon_gossip.publish_aggregate(ssz_bytes)
-        logger.debug(f"Broadcast attestation as aggregate for slot {slot}, electra={is_electra}")
 
     async def _broadcast_execution_payload_envelope(
         self,
@@ -2339,14 +2378,18 @@ class BeaconNode:
             slot = int(contribution.slot)
             subcommittee_index = int(contribution.subcommittee_index)
 
-            self.sync_committee_pool.add_contribution(contribution)
+            added = self.sync_committee_pool.add_contribution(contribution)
 
-            participant_count = sum(1 for b in contribution.aggregation_bits if b)
-            logger.info(
-                f"P2P: Received sync committee contribution slot={slot}, "
-                f"subcommittee={subcommittee_index}, participants={participant_count}, "
-                f"from={from_peer[:16]}"
-            )
+            # Only log contributions that actually changed pool state. Steady-state
+            # mesh chatter (everyone republishes the same aggregate to everyone)
+            # would otherwise emit one debug line per (slot × subcommittee × peer).
+            if added:
+                participant_count = sum(1 for b in contribution.aggregation_bits if b)
+                logger.debug(
+                    f"P2P: merged sync committee contribution slot={slot}, "
+                    f"subcommittee={subcommittee_index}, participants={participant_count}, "
+                    f"from={from_peer[:16]}"
+                )
         except Exception as e:
             logger.error(f"Error processing P2P sync committee contribution: {e}")
 

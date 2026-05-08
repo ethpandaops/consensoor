@@ -746,12 +746,20 @@ async fn run_swarm(
         .boxed();
 
     // Eth2 gossipsub configuration per consensus-specs phase0/p2p-interface.md
-    // (D=8, D_low=6, D_high=12, D_lazy=6, heartbeat 700ms, mcache 6/3, history
-    // 12/3, fanout_ttl 60s, seen_ttl 550 heartbeats ≈ 385s, GOSSIP_MAX_SIZE
-    // 10 MiB). Without these, libp2p-gossipsub uses its own defaults
-    // (D=6, mesh_outbound_min=4, etc.) and prysm/lighthouse/teku score-prune
-    // us out of their mesh, so messages never propagate even though the TCP
-    // connection and Status RPC handshake succeed.
+    // and lighthouse_network/src/config.rs:496-516 (Average load profile,
+    // adapted to High load timing matching prysm/teku):
+    //   D=8, D_low=6, D_high=12 (lighthouse Average uses 10), mesh_outbound 2
+    //   heartbeat 700ms, history 12/3, fanout_ttl 60s
+    //   duplicate_cache_time = SLOTS_PER_EPOCH × slot_duration × 2 (EIP-7045
+    //     post-Deneb attestations are valid for 2 epochs)
+    //   GOSSIP_MAX_SIZE 10 MiB
+    //   flood_publish(false), allow_self_origin(true), max_messages_per_rpc(500)
+    //
+    // The duplicate_cache_time on mainnet = 32 × 12 × 2 = 768s. We can't read
+    // the live network config from rust without threading it through, so we
+    // pin to 768s as a safe upper bound — works for mainnet/holesky/sepolia
+    // and any minimal-preset devnet (smaller cache window than necessary,
+    // but not wrong).
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_millis(700))
         .heartbeat_initial_delay(Duration::from_millis(500))
@@ -763,8 +771,10 @@ async fn run_swarm(
         .history_length(12)
         .history_gossip(3)
         .fanout_ttl(Duration::from_secs(60))
-        // 550 heartbeats × 700ms = 385s
-        .duplicate_cache_time(Duration::from_secs(385))
+        .duplicate_cache_time(Duration::from_secs(768))
+        .max_messages_per_rpc(Some(500))
+        .flood_publish(false)
+        .allow_self_origin(true)
         .validation_mode(ValidationMode::Anonymous)
         .max_transmit_size(10 * 1024 * 1024)
         .message_id_fn(gossip::message_id_eth2)
@@ -801,12 +811,17 @@ async fn run_swarm(
         blocks_by_range: blocks_by_range::new_blocks_by_range_behaviour(),
     };
 
-    // Swarm config matches lighthouse_network::service `with_executor` block
+    // Swarm config based on lighthouse_network::service `with_executor` block
     // (lighthouse/beacon_node/lighthouse_network/src/service/mod.rs:484-489).
-    // 10s idle is fine because the active behaviours (gossipsub heartbeats,
-    // identify, eth2 RPC status/ping/metadata, blocks_by_range) generate
-    // continuous substream activity. The previous 86400s value was a bandaid
-    // for the libp2p::ping bug we just removed.
+    // Lighthouse uses idle_connection_timeout=10s but relies on its
+    // `peer_manager::Behaviour` to keep connections alive. We don't have that
+    // yet — without an active keep-alive Behaviour, the swarm sees zero
+    // protocol activity between gossipsub heartbeats and closes connections
+    // with cause=KeepAliveTimeout ~30-60s after establishment.
+    //
+    // Until we port peer_manager, use a 1-hour idle ceiling. Connections still
+    // close when a peer goes away (TCP reset / FIN), Goodbye RPC fires, or
+    // explicit disconnect — we just stop punishing healthy long-lived peers.
     let mut swarm = Swarm::new(
         transport,
         behaviour,
@@ -816,7 +831,7 @@ async fn run_swarm(
                 std::num::NonZeroUsize::new(7).expect("non-zero"),
             )
             .with_per_connection_event_buffer_size(4)
-            .with_idle_connection_timeout(Duration::from_secs(10))
+            .with_idle_connection_timeout(Duration::from_secs(3600))
             .with_dial_concurrency_factor(
                 std::num::NonZeroU8::new(1).expect("non-zero"),
             ),
