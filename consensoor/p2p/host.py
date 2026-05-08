@@ -316,3 +316,45 @@ class P2PHost:
 
     def get_mesh_info(self, topic: str) -> str:
         return f"topic={topic} peers=unknown (rust binding stub)"
+
+    # ------------------------------------------------------------------ ReqResp
+
+    async def request_blocks_by_range(
+        self, start_slot: int, count: int, timeout: float = 15.0
+    ) -> list[bytes]:
+        """Issue a BeaconBlocksByRange request via the rust binding.
+
+        Returns a list of raw SSZ-encoded SignedBeaconBlock bytes (one per
+        chunk). Empty list if no peer is connected, the request times out,
+        or the responder declined.
+
+        We pick the first peer that has a /eth2/.../beacon_blocks_by_range
+        protocol (in practice, the upstream we auto-bootstrapped against).
+        """
+        if self._network is None:
+            return []
+        # Use any connected peer — the rust binding's send_request uses libp2p
+        # peer-routing under the hood. We just dial each known bootnode.
+        target_peer = None
+        for addr in self.config.static_peers:
+            if "/p2p/" in addr:
+                target_peer = addr.rsplit("/p2p/", 1)[1]
+                break
+        if target_peer is None:
+            logger.debug("request_blocks_by_range: no known peer to dial")
+            return []
+        try:
+            self._network.request_blocks_by_range(target_peer, int(start_slot), int(count))
+        except Exception as e:
+            logger.debug(f"request_blocks_by_range send failed: {e}")
+            return []
+        # Wait for the response on the rust event channel.
+        loop = asyncio.get_running_loop()
+        ev = await loop.run_in_executor(
+            None, lambda: self._network.next_blocks_by_range(int(timeout * 1000))
+        )
+        if ev is None or ev.error or ev.response is None:
+            if ev and ev.error:
+                logger.debug(f"BeaconBlocksByRange failed: {ev.error}")
+            return []
+        return [bytes(c.ssz_block) for c in ev.response.chunks]
