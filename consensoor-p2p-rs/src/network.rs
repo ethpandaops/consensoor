@@ -796,7 +796,13 @@ async fn run_swarm(
         behaviour,
         local_peer_id,
         libp2p::swarm::Config::with_tokio_executor()
-            .with_idle_connection_timeout(Duration::from_secs(60)),
+            // Lighthouse uses 1 day; we go with the same. libp2p's idle
+            // timeout counts substream activity only — gossipsub heartbeat
+            // control messages don't always count, so a ~60s idle timer
+            // causes peers to drop ~1 min after connect even though both
+            // sides are healthy. Effectively disable it; prysm/teku/lh
+            // do the same.
+            .with_idle_connection_timeout(Duration::from_secs(86_400)),
     );
 
     swarm.listen_on(listen_addr)?;
