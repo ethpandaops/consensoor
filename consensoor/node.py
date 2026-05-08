@@ -844,11 +844,34 @@ class BeaconNode:
                 # Same epoch - use the target epoch's mix directly
                 prev_randao = bytes(randao_mixes[target_epoch % len(randao_mixes)])
 
+            withdrawals_list = []
+            if hasattr(self.state, "payload_expected_withdrawals"):
+                for w in self.state.payload_expected_withdrawals:
+                    withdrawals_list.append({
+                        "index": hex(int(w.index)),
+                        "validatorIndex": hex(int(w.validator_index)),
+                        "address": "0x" + bytes(w.address).hex(),
+                        "amount": hex(int(w.amount)),
+                    })
+            elif hasattr(self.state, "next_withdrawal_index"):
+                from .spec.state_transition.block.withdrawals import get_expected_withdrawals
+                try:
+                    expected = get_expected_withdrawals(self.state)
+                    for w in expected.withdrawals:
+                        withdrawals_list.append({
+                            "index": hex(int(w.index)),
+                            "validatorIndex": hex(int(w.validator_index)),
+                            "address": "0x" + bytes(w.address).hex(),
+                            "amount": hex(int(w.amount)),
+                        })
+                except Exception as we:
+                    logger.warning(f"get_expected_withdrawals failed: {we}")
+
             payload_attributes = {
                 "timestamp": hex(timestamp),
                 "prevRandao": "0x" + prev_randao.hex(),
                 "suggestedFeeRecipient": "0x" + "00" * 20,
-                "withdrawals": [],
+                "withdrawals": withdrawals_list,
                 "parentBeaconBlockRoot": "0x" + (self.head_root or b"\x00" * 32).hex(),
             }
             if hasattr(self.state, "ptc_window"):
@@ -1077,11 +1100,36 @@ class BeaconNode:
                 # Same epoch - use the target epoch's mix directly
                 prev_randao = bytes(randao_mixes[target_epoch % len(randao_mixes)])
 
+            # Withdrawals: Gloas keeps the expected withdrawals on state itself
+            # (payload_expected_withdrawals); pre-Gloas we compute them from state.
+            withdrawals_list = []
+            if hasattr(self.state, "payload_expected_withdrawals"):
+                for w in self.state.payload_expected_withdrawals:
+                    withdrawals_list.append({
+                        "index": hex(int(w.index)),
+                        "validatorIndex": hex(int(w.validator_index)),
+                        "address": "0x" + bytes(w.address).hex(),
+                        "amount": hex(int(w.amount)),
+                    })
+            elif hasattr(self.state, "next_withdrawal_index"):
+                from .spec.state_transition.block.withdrawals import get_expected_withdrawals
+                try:
+                    expected = get_expected_withdrawals(self.state)
+                    for w in expected.withdrawals:
+                        withdrawals_list.append({
+                            "index": hex(int(w.index)),
+                            "validatorIndex": hex(int(w.validator_index)),
+                            "address": "0x" + bytes(w.address).hex(),
+                            "amount": hex(int(w.amount)),
+                        })
+                except Exception as we:
+                    logger.warning(f"get_expected_withdrawals failed: {we}; sending empty list")
+
             payload_attributes = {
                 "timestamp": hex(timestamp),
                 "prevRandao": "0x" + prev_randao.hex(),
                 "suggestedFeeRecipient": "0x" + "00" * 20,  # Default fee recipient
-                "withdrawals": [],
+                "withdrawals": withdrawals_list,
                 "parentBeaconBlockRoot": "0x" + (self.head_root or b"\x00" * 32).hex(),
             }
             if hasattr(self.state, "ptc_window"):
