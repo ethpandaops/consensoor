@@ -23,6 +23,7 @@ use std::time::Duration;
 use libp2p::gossipsub::{PeerScoreParams, PeerScoreThresholds};
 
 /// Eth2 spec thresholds (the ones lighthouse/prysm/teku all use).
+#[allow(dead_code)]
 pub fn eth2_thresholds() -> PeerScoreThresholds {
     PeerScoreThresholds {
         gossip_threshold: -4000.0,
@@ -37,6 +38,7 @@ pub fn eth2_thresholds() -> PeerScoreThresholds {
 /// SLOTS_PER_EPOCH... we just pin to a 12s decay interval which is what
 /// lighthouse uses on mainnet — the decay model doesn't break on shorter
 /// devnet slots, it just decays slower in slot-relative terms).
+#[allow(dead_code)]
 pub fn eth2_peer_score_params() -> PeerScoreParams {
     PeerScoreParams {
         // Aggregate cap on positive topic contributions. Eth2 uses 3600.0

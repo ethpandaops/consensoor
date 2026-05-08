@@ -1,10 +1,12 @@
 //! Tokio-driven libp2p host that consensoor drives from Python.
 
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_channel::{bounded, Receiver, Sender};
+use enr::{CombinedKey, Enr};
 use futures::StreamExt;
 use libp2p::{
     core::{upgrade, ConnectedPoint},
@@ -60,12 +62,44 @@ pub struct NetworkConfig {
     pub max_peers: usize,
     #[pyo3(get, set)]
     pub agent_version: String,
+    /// SSZ-encoded `next_fork_version` (4 bytes) for the `eth2` ENR field.
+    #[pyo3(get, set)]
+    pub next_fork_version: Vec<u8>,
+    /// `next_fork_epoch` for the `eth2` ENR field.
+    #[pyo3(get, set)]
+    pub next_fork_epoch: u64,
+    /// SSZ-encoded `attnets` Bitvector[ATTESTATION_SUBNET_COUNT].
+    #[pyo3(get, set)]
+    pub attnets: Vec<u8>,
+    /// SSZ-encoded `syncnets` Bitvector[SYNC_COMMITTEE_SUBNET_COUNT].
+    #[pyo3(get, set)]
+    pub syncnets: Vec<u8>,
+    /// PeerDAS `custody_group_count` (`cgc` ENR field).
+    #[pyo3(get, set)]
+    pub cgc: u64,
+    /// External IPv4 to advertise in the ENR. None = omit ip field.
+    #[pyo3(get, set)]
+    pub external_ip: Option<String>,
 }
 
 #[pymethods]
 impl NetworkConfig {
     #[new]
-    #[pyo3(signature = (listen_addr="/ip4/0.0.0.0/tcp/9000".to_string(), external_addr=None, bootnodes=Vec::new(), fork_digest=Vec::new(), seed_phrase=None, max_peers=64, agent_version=ETH2_AGENT_VERSION.to_string()))]
+    #[pyo3(signature = (
+        listen_addr="/ip4/0.0.0.0/tcp/9000".to_string(),
+        external_addr=None,
+        bootnodes=Vec::new(),
+        fork_digest=Vec::new(),
+        seed_phrase=None,
+        max_peers=64,
+        agent_version=ETH2_AGENT_VERSION.to_string(),
+        next_fork_version=vec![0u8; 4],
+        next_fork_epoch=u64::MAX,
+        attnets=vec![0u8; 8],
+        syncnets=vec![0u8; 1],
+        cgc=4,
+        external_ip=None,
+    ))]
     pub fn new(
         listen_addr: String,
         external_addr: Option<String>,
@@ -74,6 +108,12 @@ impl NetworkConfig {
         seed_phrase: Option<String>,
         max_peers: usize,
         agent_version: String,
+        next_fork_version: Vec<u8>,
+        next_fork_epoch: u64,
+        attnets: Vec<u8>,
+        syncnets: Vec<u8>,
+        cgc: u64,
+        external_ip: Option<String>,
     ) -> Self {
         Self {
             listen_addr,
@@ -83,8 +123,68 @@ impl NetworkConfig {
             seed_phrase,
             max_peers,
             agent_version,
+            next_fork_version,
+            next_fork_epoch,
+            attnets,
+            syncnets,
+            cgc,
+            external_ip,
         }
     }
+}
+
+/// Extract the `/tcp/<port>` component from a libp2p Multiaddr.
+fn parse_tcp_port(addr: &Multiaddr) -> Option<u16> {
+    use libp2p::multiaddr::Protocol;
+    addr.iter().find_map(|p| match p {
+        Protocol::Tcp(port) => Some(port),
+        _ => None,
+    })
+}
+
+/// Build (or rebuild) our local Eth2 ENR using the libp2p secp256k1 key.
+///
+/// Eth2 custom fields follow Lighthouse's encoding (see
+/// `lighthouse_network/src/discovery/enr.rs`):
+///   - `eth2`  : RLP byte string of SSZ(`ENRForkID { fork_digest,
+///               next_fork_version, next_fork_epoch }`).
+///   - `attnets` / `syncnets`: RLP byte string of the SSZ-serialised
+///     Bitvector (caller passes the already-SSZ'd bytes).
+///   - `cgc`   : RLP-encoded u64 (PeerDAS / EIP-7594).
+fn build_local_enr(
+    enr_key: &CombinedKey,
+    cfg: &NetworkConfig,
+    tcp_port: u16,
+    seq: u64,
+) -> Result<Enr<CombinedKey>, Box<dyn std::error::Error>> {
+    use bytes::Bytes;
+    let mut builder = Enr::builder();
+    builder.seq(seq);
+    builder.tcp4(tcp_port);
+    builder.udp4(tcp_port);
+    if let Some(ip_str) = &cfg.external_ip {
+        if let Ok(ip) = ip_str.parse::<IpAddr>() {
+            builder.ip(ip);
+        }
+    }
+    // eth2 = SSZ(ENRForkID): fork_digest (4) || next_fork_version (4) || next_fork_epoch (u64 LE) = 16 bytes.
+    let mut eth2_bytes = Vec::with_capacity(16);
+    eth2_bytes.extend_from_slice(if cfg.fork_digest.len() >= 4 {
+        &cfg.fork_digest[..4]
+    } else {
+        &[0u8; 4]
+    });
+    eth2_bytes.extend_from_slice(if cfg.next_fork_version.len() >= 4 {
+        &cfg.next_fork_version[..4]
+    } else {
+        &[0u8; 4]
+    });
+    eth2_bytes.extend_from_slice(&cfg.next_fork_epoch.to_le_bytes());
+    builder.add_value::<Bytes>("eth2", &Bytes::from(eth2_bytes));
+    builder.add_value::<Bytes>("attnets", &Bytes::from(cfg.attnets.clone()));
+    builder.add_value::<Bytes>("syncnets", &Bytes::from(cfg.syncnets.clone()));
+    builder.add_value("cgc", &cfg.cgc);
+    Ok(builder.build(enr_key)?)
 }
 
 /// Decompressed gossipsub message (Python sees the original SSZ payload).
@@ -140,6 +240,15 @@ pub struct Network {
     local_peer_id: String,
     listen_addrs: Arc<Mutex<Vec<String>>>,
     connected_peers: Arc<Mutex<HashMap<String, &'static str>>>,
+    /// secp256k1 key for ENR signing (cloned from the libp2p keypair).
+    enr_key: Arc<CombinedKey>,
+    /// The latest signed local ENR. Replaced on update_enr_*.
+    local_enr: Arc<Mutex<Enr<CombinedKey>>>,
+    /// ENR seq_number — bumped on every rebuild so peers re-fetch.
+    enr_seq: Arc<Mutex<u64>>,
+    /// Cached for ENR rebuilds.
+    cfg: Arc<Mutex<NetworkConfig>>,
+    tcp_port: u16,
 }
 
 #[pymethods]
@@ -158,10 +267,30 @@ impl Network {
         let local_peer_id = key.public().to_peer_id();
         let local_peer_id_str = local_peer_id.to_string();
 
+        // Bridge libp2p secp256k1 secret bytes into an enr::CombinedKey so
+        // we can sign the local ENR with the same identity that drives the
+        // libp2p PeerId. libp2p's SecretKey is a wrapper around
+        // k256::ecdsa::SigningKey, and `secp256k1_from_bytes` accepts the
+        // 32-byte raw form.
+        let secp_kp = key
+            .clone()
+            .try_into_secp256k1()
+            .map_err(|e| PyRuntimeError::new_err(format!("secp256k1 keypair: {e}")))?;
+        let mut secret_bytes = secp_kp.secret().to_bytes();
+        let enr_key = CombinedKey::secp256k1_from_bytes(&mut secret_bytes)
+            .map_err(|e| PyRuntimeError::new_err(format!("enr secp256k1: {e}")))?;
+
         let listen_addr: Multiaddr = config
             .listen_addr
             .parse()
             .map_err(|e| PyValueError::new_err(format!("listen_addr parse: {e}")))?;
+
+        // Pull out the tcp port for the ENR (Multiaddr like /ip4/.../tcp/9000).
+        let tcp_port = parse_tcp_port(&listen_addr).unwrap_or(9000);
+
+        let initial_enr = build_local_enr(&enr_key, &config, tcp_port, 1)
+            .map_err(|e| PyRuntimeError::new_err(format!("build local ENR: {e}")))?;
+        tracing::info!("local ENR: {}", initial_enr.to_base64());
 
         let dial_targets: Vec<Multiaddr> = config
             .bootnodes
@@ -221,7 +350,63 @@ impl Network {
             local_peer_id: local_peer_id_str,
             listen_addrs,
             connected_peers,
+            enr_key: Arc::new(enr_key),
+            local_enr: Arc::new(Mutex::new(initial_enr)),
+            enr_seq: Arc::new(Mutex::new(1)),
+            cfg: Arc::new(Mutex::new(config)),
+            tcp_port,
         })
+    }
+
+    /// Return the current local ENR as a base64 `enr:` string.
+    pub fn enr(&self) -> String {
+        self.local_enr.lock().to_base64()
+    }
+
+    /// Rebuild + re-sign the local ENR with new Eth2 fields, bumping seq.
+    /// Mirrors the dynamic adjustments described in
+    /// `consensus-specs/specs/fulu/validator.md` (cgc bumps, fork digest
+    /// rotations).
+    #[pyo3(signature = (fork_digest=None, next_fork_version=None, next_fork_epoch=None, attnets=None, syncnets=None, cgc=None, external_ip=None))]
+    pub fn update_enr(
+        &self,
+        fork_digest: Option<Vec<u8>>,
+        next_fork_version: Option<Vec<u8>>,
+        next_fork_epoch: Option<u64>,
+        attnets: Option<Vec<u8>>,
+        syncnets: Option<Vec<u8>>,
+        cgc: Option<u64>,
+        external_ip: Option<String>,
+    ) -> PyResult<String> {
+        let mut cfg = self.cfg.lock();
+        if let Some(v) = fork_digest {
+            cfg.fork_digest = v;
+        }
+        if let Some(v) = next_fork_version {
+            cfg.next_fork_version = v;
+        }
+        if let Some(v) = next_fork_epoch {
+            cfg.next_fork_epoch = v;
+        }
+        if let Some(v) = attnets {
+            cfg.attnets = v;
+        }
+        if let Some(v) = syncnets {
+            cfg.syncnets = v;
+        }
+        if let Some(v) = cgc {
+            cfg.cgc = v;
+        }
+        if let Some(v) = external_ip {
+            cfg.external_ip = Some(v);
+        }
+        let mut seq = self.enr_seq.lock();
+        *seq += 1;
+        let new_enr = build_local_enr(&self.enr_key, &cfg, self.tcp_port, *seq)
+            .map_err(|e| PyRuntimeError::new_err(format!("rebuild ENR: {e}")))?;
+        let b64 = new_enr.to_base64();
+        *self.local_enr.lock() = new_enr;
+        Ok(b64)
     }
 
     /// Snapshot of currently-connected peer IDs (as base58 strings).
@@ -551,22 +736,18 @@ async fn run_swarm(
         .build()
         .map_err(|e| -> Box<dyn std::error::Error> { Box::from(e.to_string()) })?;
 
-    let mut gossipsub = gossipsub::Behaviour::new(
+    let gossipsub = gossipsub::Behaviour::new(
         gossipsub::MessageAuthenticity::Anonymous,
         gossipsub_config,
     )
     .map_err(|e| -> Box<dyn std::error::Error> { Box::from(e.to_string()) })?;
-
-    // Eth2 peer scoring — required so mesh GRAFT negotiation with prysm /
-    // lighthouse / teku actually completes. Without it our gossipsub treats
-    // every peer neutrally; prysm GRAFTs us, scores us at default 0, and
-    // since we never reciprocate scoring properly, prysm prunes us back out.
-    if let Err(e) = gossipsub.with_peer_score(
-        crate::peer_score::eth2_peer_score_params(),
-        crate::peer_score::eth2_thresholds(),
-    ) {
-        tracing::warn!("with_peer_score failed: {e} (continuing without scoring)");
-    }
+    // NOTE: Eth2 peer-scoring is intentionally NOT enabled here yet. With
+    // libp2p scoring on but per-topic params empty (we don't have proper
+    // P1..P4 wired yet), our local mesh maintenance prunes peers that
+    // haven't accrued positive topic score — i.e. every peer at startup.
+    // Result: our publishes find zero mesh peers and go nowhere, while
+    // we still receive their messages. Re-enable once per-topic params are
+    // populated; see crate::peer_score for the threshold/global params.
 
     let identify = identify::Behaviour::new(
         identify::Config::new(format!("/eth2/beacon_chain/req/status/2"), key.public())
