@@ -1312,21 +1312,16 @@ class BeaconNode:
     def _is_synced(self) -> bool:
         """Are we close enough to the network head to safely publish?
 
-        Publishing attestations / aggregates / sync-committee msgs while our
-        cached head is far from the wall-clock slot produces messages that
-        peers (prysm, lighthouse) reject as invalid. Each rejection counts
-        against our gossipsub peer score (~-214 weight per invalid msg);
-        a few rejections in <30s and they prune our peer entirely. Gate all
-        publishing until we're within a small window of the current slot.
+        Currently HARD-DISABLED: even with a tight gate, our attestations /
+        aggregates / sync-committee msgs end up scoring negatively on prysm's
+        gossipsub (probably wrong target_root / source_root / domain — we'll
+        debug separately). Returning False here means we never broadcast
+        validator messages and never propose blocks; we stay in pure
+        follower mode. Peer connections hold, we keep importing blocks via
+        req/resp + gossipsub. Re-enable once attestation production is
+        spec-compliant.
         """
-        if not self.state or not self.head_root or not self._genesis_time:
-            return False
-        try:
-            slot_duration = get_config().slot_duration_ms / 1000.0
-        except Exception:
-            return False
-        current_slot = int((time.time() - self._genesis_time) // slot_duration)
-        return self.head_slot >= current_slot - 4
+        return False
 
     async def _produce_attestations(self, slot: int) -> None:
         """Produce attestations for validators with duties at this slot.

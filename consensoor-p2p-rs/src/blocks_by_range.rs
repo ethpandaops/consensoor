@@ -286,26 +286,19 @@ impl Codec for BlocksByRangeCodec {
             let varint_consumed = (cursor.len() - rest.len()) as usize;
             cursor = &cursor[varint_consumed..];
 
-            // The framed-snappy reader consumes from `cursor` until it has
-            // enough decompressed bytes (`block_len`). We don't know the
-            // compressed length up front, so we decode incrementally and
-            // remember how much of cursor we ate.
+            // The framed-snappy reader consumes from a Cursor over `cursor`
+            // until it has decompressed `block_len` bytes. Read EXACTLY
+            // `block_len` (not `read_to_end`) — the next bytes after the
+            // last data frame belong to the *next* RPC chunk, not to this
+            // snappy stream, and there is no explicit end-of-stream marker
+            // in the snappy framed format. After read_exact, `inner.position()`
+            // tells us how many of `cursor`'s bytes were actually consumed
+            // off the wire; advance past that.
+            use std::io::Read as _;
             let mut decoder = snap::read::FrameDecoder::new(Cursor::new(cursor));
-            let mut ssz_block = Vec::with_capacity(block_len);
-            decoder.read_to_end(&mut ssz_block)?;
-            if ssz_block.len() != block_len {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "decompressed block size {} != declared {}",
-                        ssz_block.len(),
-                        block_len
-                    ),
-                ));
-            }
-            // Determine how many bytes the FrameDecoder consumed. The cleanest
-            // way is to walk all four-byte snappy frame headers ourselves.
-            let consumed = consumed_snappy_frame_bytes(cursor)?;
+            let mut ssz_block = vec![0u8; block_len];
+            decoder.read_exact(&mut ssz_block)?;
+            let consumed = decoder.into_inner().position() as usize;
             cursor = &cursor[consumed..];
 
             chunks.push(BlockChunk {
