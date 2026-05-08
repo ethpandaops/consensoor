@@ -13,6 +13,7 @@ mod blocks_by_range;
 mod bootnode;
 mod gossip;
 mod network;
+mod peer_score;
 mod rpc;
 
 use pyo3::prelude::*;

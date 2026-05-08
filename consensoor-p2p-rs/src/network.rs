@@ -551,11 +551,22 @@ async fn run_swarm(
         .build()
         .map_err(|e| -> Box<dyn std::error::Error> { Box::from(e.to_string()) })?;
 
-    let gossipsub = gossipsub::Behaviour::new(
+    let mut gossipsub = gossipsub::Behaviour::new(
         gossipsub::MessageAuthenticity::Anonymous,
         gossipsub_config,
     )
     .map_err(|e| -> Box<dyn std::error::Error> { Box::from(e.to_string()) })?;
+
+    // Eth2 peer scoring — required so mesh GRAFT negotiation with prysm /
+    // lighthouse / teku actually completes. Without it our gossipsub treats
+    // every peer neutrally; prysm GRAFTs us, scores us at default 0, and
+    // since we never reciprocate scoring properly, prysm prunes us back out.
+    if let Err(e) = gossipsub.with_peer_score(
+        crate::peer_score::eth2_peer_score_params(),
+        crate::peer_score::eth2_thresholds(),
+    ) {
+        tracing::warn!("with_peer_score failed: {e} (continuing without scoring)");
+    }
 
     let identify = identify::Behaviour::new(
         identify::Config::new(format!("/eth2/beacon_chain/req/status/2"), key.public())
