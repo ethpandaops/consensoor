@@ -411,12 +411,19 @@ fn is_snappy_chunk_continuation(byte: u8) -> bool {
 pub type BlocksByRangeBehaviour = request_response::Behaviour<BlocksByRangeCodec>;
 
 pub fn new_blocks_by_range_behaviour() -> BlocksByRangeBehaviour {
-    let proto = StreamProtocol::new("/eth2/beacon_chain/req/beacon_blocks_by_range/3/ssz_snappy");
+    // Lighthouse currently advertises both v2 and v3; v2 is the safer default
+    // (required since Bellatrix). With multiple protocols here libp2p picks
+    // whichever the peer also supports during stream upgrade.
+    let v2 = StreamProtocol::new("/eth2/beacon_chain/req/beacon_blocks_by_range/2/ssz_snappy");
+    let v3 = StreamProtocol::new("/eth2/beacon_chain/req/beacon_blocks_by_range/3/ssz_snappy");
     let cfg = request_response::Config::default()
         .with_request_timeout(std::time::Duration::from_secs(30));
     request_response::Behaviour::with_codec(
         BlocksByRangeCodec,
-        std::iter::once((proto, ProtocolSupport::Full)),
+        [
+            (v2, ProtocolSupport::Full),
+            (v3, ProtocolSupport::Full),
+        ],
         cfg,
     )
 }

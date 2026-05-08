@@ -38,6 +38,10 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<rpc::GoodbyeEvent>()?;
     m.add_class::<rpc::MetaDataMessage>()?;
     m.add_class::<rpc::MetadataEvent>()?;
+    m.add_class::<blocks_by_range::BlocksByRangeRequest>()?;
+    m.add_class::<blocks_by_range::BlockChunk>()?;
+    m.add_class::<blocks_by_range::BlocksByRangeResponse>()?;
+    m.add_class::<blocks_by_range::BlocksByRangeEvent>()?;
     m.add_function(wrap_pyfunction!(network::generate_keypair, m)?)?;
     Ok(())
 }

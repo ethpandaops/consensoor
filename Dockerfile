@@ -15,7 +15,7 @@ COPY consensoor/ consensoor/
 RUN python -m build --wheel
 
 # --- Stage 2: build the Rust p2p wheel (consensoor-p2p-rs) -------------------
-FROM rust:1.83-slim AS rust-builder
+FROM rust:1.90-slim AS rust-builder
 
 WORKDIR /app
 
@@ -35,7 +35,7 @@ FROM python:3.12-slim
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libleveldb-dev \
+    gcc g++ libc6-dev libleveldb-dev \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/dist/*.whl /tmp/

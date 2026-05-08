@@ -19,6 +19,9 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use tokio::runtime::Runtime;
 
+use crate::blocks_by_range::{
+    self, BlocksByRangeBehaviour, BlocksByRangeEvent, BlocksByRangeRequest, BlocksByRangeResponse,
+};
 use crate::gossip;
 use crate::rpc::{
     self, GoodbyeEvent, GoodbyeMessage, MetaDataMessage, MetaDataRequest, MetadataEvent,
@@ -36,6 +39,7 @@ struct Eth2Behaviour {
     eth2_ping: rpc::PingBehaviour,
     goodbye: rpc::GoodbyeBehaviour,
     metadata: rpc::MetadataBehaviour,
+    blocks_by_range: BlocksByRangeBehaviour,
 }
 
 #[pyclass]
@@ -117,6 +121,8 @@ enum Command {
     AnswerGoodbye { id: u64, goodbye: GoodbyeMessage },
     RequestMetadata { peer: String },
     AnswerMetadata { id: u64, metadata: MetaDataMessage },
+    RequestBlocksByRange { peer: String, request: BlocksByRangeRequest },
+    AnswerBlocksByRange { id: u64, response: BlocksByRangeResponse },
     Shutdown,
 }
 
@@ -129,6 +135,7 @@ pub struct Network {
     ping_rx: Mutex<Receiver<PingEvent>>,
     goodbye_rx: Mutex<Receiver<GoodbyeEvent>>,
     metadata_rx: Mutex<Receiver<MetadataEvent>>,
+    by_range_rx: Mutex<Receiver<BlocksByRangeEvent>>,
     local_peer_id: String,
     listen_addrs: Arc<Mutex<Vec<String>>>,
 }
@@ -171,6 +178,7 @@ impl Network {
         let (ping_tx, ping_rx) = bounded::<PingEvent>(256);
         let (goodbye_tx, goodbye_rx) = bounded::<GoodbyeEvent>(256);
         let (metadata_tx, metadata_rx) = bounded::<MetadataEvent>(256);
+        let (by_range_tx, by_range_rx) = bounded::<BlocksByRangeEvent>(64);
         let listen_addrs = Arc::new(Mutex::new(Vec::<String>::new()));
         let listen_addrs_clone = listen_addrs.clone();
 
@@ -187,6 +195,7 @@ impl Network {
                 ping_tx,
                 goodbye_tx,
                 metadata_tx,
+                by_range_tx,
                 listen_addrs_clone,
             )
             .await
@@ -203,6 +212,7 @@ impl Network {
             ping_rx: Mutex::new(ping_rx),
             goodbye_rx: Mutex::new(goodbye_rx),
             metadata_rx: Mutex::new(metadata_rx),
+            by_range_rx: Mutex::new(by_range_rx),
             local_peer_id: local_peer_id_str,
             listen_addrs,
         })
@@ -291,6 +301,53 @@ impl Network {
                 metadata,
             })
             .map_err(|e| PyRuntimeError::new_err(format!("answer_metadata: {e}")))
+    }
+
+    pub fn request_blocks_by_range(
+        &self,
+        peer: String,
+        start_slot: u64,
+        count: u64,
+    ) -> PyResult<()> {
+        self.cmd_tx
+            .send_blocking(Command::RequestBlocksByRange {
+                peer,
+                request: BlocksByRangeRequest::new(start_slot, count),
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("request_blocks_by_range: {e}")))
+    }
+
+    pub fn answer_blocks_by_range(
+        &self,
+        request_id: u64,
+        response: BlocksByRangeResponse,
+    ) -> PyResult<()> {
+        self.cmd_tx
+            .send_blocking(Command::AnswerBlocksByRange {
+                id: request_id,
+                response,
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("answer_blocks_by_range: {e}")))
+    }
+
+    pub fn next_blocks_by_range(
+        &self,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Option<Py<BlocksByRangeEvent>>> {
+        let rx = self.by_range_rx.lock().clone();
+        let result = match timeout_ms {
+            Some(ms) => self.runtime.block_on(async move {
+                tokio::time::timeout(Duration::from_millis(ms), rx.recv())
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+            }),
+            None => self.runtime.block_on(async move { rx.recv().await.ok() }),
+        };
+        match result {
+            Some(ev) => Python::with_gil(|py| Ok(Some(Py::new(py, ev)?))),
+            None => Ok(None),
+        }
     }
 
     /// Block until a gossipsub message arrives or `timeout_ms` elapses.
@@ -397,6 +454,7 @@ async fn run_swarm(
     ping_tx: Sender<PingEvent>,
     goodbye_tx: Sender<GoodbyeEvent>,
     metadata_tx: Sender<MetadataEvent>,
+    by_range_tx: Sender<BlocksByRangeEvent>,
     listen_addrs: Arc<Mutex<Vec<String>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let local_peer_id = key.public().to_peer_id();
@@ -436,6 +494,7 @@ async fn run_swarm(
         eth2_ping: rpc::new_ping_behaviour(),
         goodbye: rpc::new_goodbye_behaviour(),
         metadata: rpc::new_metadata_behaviour(),
+        blocks_by_range: blocks_by_range::new_blocks_by_range_behaviour(),
     };
 
     let mut swarm = Swarm::new(
@@ -463,6 +522,10 @@ async fn run_swarm(
         HashMap::new();
     let mut pending_metadata: HashMap<u64, request_response::ResponseChannel<MetaDataMessage>> =
         HashMap::new();
+    let mut pending_by_range: HashMap<
+        u64,
+        request_response::ResponseChannel<BlocksByRangeResponse>,
+    > = HashMap::new();
     let mut next_response_id: u64 = 1;
 
     loop {
@@ -532,6 +595,14 @@ async fn run_swarm(
                         rr_event,
                         &metadata_tx,
                         &mut pending_metadata,
+                        &mut next_response_id,
+                    ).await;
+                }
+                SwarmEvent::Behaviour(Eth2BehaviourEvent::BlocksByRange(rr_event)) => {
+                    handle_blocks_by_range_event(
+                        rr_event,
+                        &by_range_tx,
+                        &mut pending_by_range,
                         &mut next_response_id,
                     ).await;
                 }
@@ -634,6 +705,23 @@ async fn run_swarm(
                         tracing::warn!("answer_metadata: no pending metadata request id {id}");
                     }
                 }
+                Ok(Command::RequestBlocksByRange { peer, request }) => {
+                    match peer.parse::<libp2p::PeerId>() {
+                        Ok(peer_id) => {
+                            let _ = swarm.behaviour_mut().blocks_by_range.send_request(&peer_id, request);
+                        }
+                        Err(e) => tracing::warn!("request_blocks_by_range: bad peer id {peer}: {e}"),
+                    }
+                }
+                Ok(Command::AnswerBlocksByRange { id, response }) => {
+                    if let Some(channel) = pending_by_range.remove(&id) {
+                        if swarm.behaviour_mut().blocks_by_range.send_response(channel, response).is_err() {
+                            tracing::warn!("answer_blocks_by_range: channel dropped for id {id}");
+                        }
+                    } else {
+                        tracing::warn!("answer_blocks_by_range: no pending request id {id}");
+                    }
+                }
                 Ok(Command::Shutdown) => break,
                 Err(_) => break,
             }
@@ -703,6 +791,70 @@ async fn handle_symmetric_rpc_event<M, EvT, Mk>(
                     None,
                     Some(format!("{error}")),
                 ))
+                .await;
+        }
+        Event::ResponseSent { .. } => {}
+    }
+}
+
+async fn handle_blocks_by_range_event(
+    ev: request_response::Event<BlocksByRangeRequest, BlocksByRangeResponse>,
+    tx: &Sender<BlocksByRangeEvent>,
+    pending: &mut HashMap<u64, request_response::ResponseChannel<BlocksByRangeResponse>>,
+    next_id: &mut u64,
+) {
+    use request_response::Event;
+    use request_response::Message;
+    match ev {
+        Event::Message { peer, message, .. } => match message {
+            Message::Request {
+                request, channel, ..
+            } => {
+                let id = *next_id;
+                *next_id = next_id.wrapping_add(1);
+                pending.insert(id, channel);
+                let _ = tx
+                    .send(BlocksByRangeEvent {
+                        peer: peer.to_string(),
+                        kind: format!("request:{id}"),
+                        request: Some(request),
+                        response: None,
+                        error: None,
+                    })
+                    .await;
+            }
+            Message::Response { response, .. } => {
+                let _ = tx
+                    .send(BlocksByRangeEvent {
+                        peer: peer.to_string(),
+                        kind: "response".into(),
+                        request: None,
+                        response: Some(response),
+                        error: None,
+                    })
+                    .await;
+            }
+        },
+        Event::OutboundFailure { peer, error, .. } => {
+            let _ = tx
+                .send(BlocksByRangeEvent {
+                    peer: peer.to_string(),
+                    kind: "failure".into(),
+                    request: None,
+                    response: None,
+                    error: Some(format!("{error}")),
+                })
+                .await;
+        }
+        Event::InboundFailure { peer, error, .. } => {
+            let _ = tx
+                .send(BlocksByRangeEvent {
+                    peer: peer.to_string(),
+                    kind: "failure".into(),
+                    request: None,
+                    response: None,
+                    error: Some(format!("{error}")),
+                })
                 .await;
         }
         Event::ResponseSent { .. } => {}

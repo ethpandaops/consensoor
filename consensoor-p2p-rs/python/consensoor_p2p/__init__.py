@@ -13,6 +13,11 @@ from ._native import (
     MetaDataMessage,
     MetadataEvent,
     generate_keypair,
+    BlocksByRangeRequest,
+    BlockChunk,
+    BlocksByRangeResponse,
+    BlocksByRangeEvent,
+
 )
 
 __all__ = [
@@ -28,4 +33,8 @@ __all__ = [
     "MetaDataMessage",
     "MetadataEvent",
     "generate_keypair",
+    "BlocksByRangeRequest",
+    "BlockChunk",
+    "BlocksByRangeResponse",
+    "BlocksByRangeEvent",
 ]
