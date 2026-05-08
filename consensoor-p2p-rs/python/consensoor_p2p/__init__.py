@@ -6,6 +6,12 @@ from ._native import (
     GossipMessage,
     StatusMessage,
     StatusEvent,
+    PingMessage,
+    PingEvent,
+    GoodbyeMessage,
+    GoodbyeEvent,
+    MetaDataMessage,
+    MetadataEvent,
     generate_keypair,
 )
 
@@ -15,5 +21,11 @@ __all__ = [
     "GossipMessage",
     "StatusMessage",
     "StatusEvent",
+    "PingMessage",
+    "PingEvent",
+    "GoodbyeMessage",
+    "GoodbyeEvent",
+    "MetaDataMessage",
+    "MetadataEvent",
     "generate_keypair",
 ]

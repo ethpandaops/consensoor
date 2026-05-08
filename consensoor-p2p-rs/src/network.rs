@@ -20,7 +20,10 @@ use pyo3::prelude::*;
 use tokio::runtime::Runtime;
 
 use crate::gossip;
-use crate::rpc::{self, StatusEvent, StatusMessage};
+use crate::rpc::{
+    self, GoodbyeEvent, GoodbyeMessage, MetaDataMessage, MetaDataRequest, MetadataEvent,
+    PingEvent, PingMessage, StatusEvent, StatusMessage,
+};
 
 const ETH2_AGENT_VERSION: &str = "consensoor/0.1.0";
 
@@ -28,8 +31,11 @@ const ETH2_AGENT_VERSION: &str = "consensoor/0.1.0";
 struct Eth2Behaviour {
     gossipsub: gossipsub::Behaviour,
     identify: identify::Behaviour,
-    ping: ping::Behaviour,
+    ping_libp2p: ping::Behaviour,
     status: rpc::StatusBehaviour,
+    eth2_ping: rpc::PingBehaviour,
+    goodbye: rpc::GoodbyeBehaviour,
+    metadata: rpc::MetadataBehaviour,
 }
 
 #[pyclass]
@@ -105,6 +111,12 @@ enum Command {
     Dial(Multiaddr),
     SendStatus { peer: String, status: StatusMessage },
     AnswerStatus { id: u64, status: StatusMessage },
+    SendPing { peer: String, ping: PingMessage },
+    AnswerPing { id: u64, pong: PingMessage },
+    SendGoodbye { peer: String, goodbye: GoodbyeMessage },
+    AnswerGoodbye { id: u64, goodbye: GoodbyeMessage },
+    RequestMetadata { peer: String },
+    AnswerMetadata { id: u64, metadata: MetaDataMessage },
     Shutdown,
 }
 
@@ -114,6 +126,9 @@ pub struct Network {
     cmd_tx: Sender<Command>,
     msg_rx: Mutex<Receiver<GossipMessage>>,
     status_rx: Mutex<Receiver<StatusEvent>>,
+    ping_rx: Mutex<Receiver<PingEvent>>,
+    goodbye_rx: Mutex<Receiver<GoodbyeEvent>>,
+    metadata_rx: Mutex<Receiver<MetadataEvent>>,
     local_peer_id: String,
     listen_addrs: Arc<Mutex<Vec<String>>>,
 }
@@ -153,6 +168,9 @@ impl Network {
         let (cmd_tx, cmd_rx) = bounded::<Command>(64);
         let (msg_tx, msg_rx) = bounded::<GossipMessage>(2048);
         let (status_tx, status_rx) = bounded::<StatusEvent>(256);
+        let (ping_tx, ping_rx) = bounded::<PingEvent>(256);
+        let (goodbye_tx, goodbye_rx) = bounded::<GoodbyeEvent>(256);
+        let (metadata_tx, metadata_rx) = bounded::<MetadataEvent>(256);
         let listen_addrs = Arc::new(Mutex::new(Vec::<String>::new()));
         let listen_addrs_clone = listen_addrs.clone();
 
@@ -166,6 +184,9 @@ impl Network {
                 cmd_rx,
                 msg_tx,
                 status_tx,
+                ping_tx,
+                goodbye_tx,
+                metadata_tx,
                 listen_addrs_clone,
             )
             .await
@@ -179,6 +200,9 @@ impl Network {
             cmd_tx,
             msg_rx: Mutex::new(msg_rx),
             status_rx: Mutex::new(status_rx),
+            ping_rx: Mutex::new(ping_rx),
+            goodbye_rx: Mutex::new(goodbye_rx),
+            metadata_rx: Mutex::new(metadata_rx),
             local_peer_id: local_peer_id_str,
             listen_addrs,
         })
@@ -230,6 +254,45 @@ impl Network {
             .map_err(|e| PyRuntimeError::new_err(format!("answer_status: {e}")))
     }
 
+    pub fn send_ping(&self, peer: String, ping: PingMessage) -> PyResult<()> {
+        self.cmd_tx
+            .send_blocking(Command::SendPing { peer, ping })
+            .map_err(|e| PyRuntimeError::new_err(format!("send_ping: {e}")))
+    }
+
+    pub fn answer_ping(&self, request_id: u64, pong: PingMessage) -> PyResult<()> {
+        self.cmd_tx
+            .send_blocking(Command::AnswerPing { id: request_id, pong })
+            .map_err(|e| PyRuntimeError::new_err(format!("answer_ping: {e}")))
+    }
+
+    pub fn send_goodbye(&self, peer: String, goodbye: GoodbyeMessage) -> PyResult<()> {
+        self.cmd_tx
+            .send_blocking(Command::SendGoodbye { peer, goodbye })
+            .map_err(|e| PyRuntimeError::new_err(format!("send_goodbye: {e}")))
+    }
+
+    pub fn answer_goodbye(&self, request_id: u64, goodbye: GoodbyeMessage) -> PyResult<()> {
+        self.cmd_tx
+            .send_blocking(Command::AnswerGoodbye { id: request_id, goodbye })
+            .map_err(|e| PyRuntimeError::new_err(format!("answer_goodbye: {e}")))
+    }
+
+    pub fn request_metadata(&self, peer: String) -> PyResult<()> {
+        self.cmd_tx
+            .send_blocking(Command::RequestMetadata { peer })
+            .map_err(|e| PyRuntimeError::new_err(format!("request_metadata: {e}")))
+    }
+
+    pub fn answer_metadata(&self, request_id: u64, metadata: MetaDataMessage) -> PyResult<()> {
+        self.cmd_tx
+            .send_blocking(Command::AnswerMetadata {
+                id: request_id,
+                metadata,
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("answer_metadata: {e}")))
+    }
+
     /// Block until a gossipsub message arrives or `timeout_ms` elapses.
     pub fn next_message(&self, timeout_ms: Option<u64>) -> PyResult<Option<Py<GossipMessage>>> {
         let rx = self.msg_rx.lock().clone();
@@ -266,6 +329,57 @@ impl Network {
         }
     }
 
+    pub fn next_ping(&self, timeout_ms: Option<u64>) -> PyResult<Option<Py<PingEvent>>> {
+        let rx = self.ping_rx.lock().clone();
+        let result = match timeout_ms {
+            Some(ms) => self.runtime.block_on(async move {
+                tokio::time::timeout(Duration::from_millis(ms), rx.recv())
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+            }),
+            None => self.runtime.block_on(async move { rx.recv().await.ok() }),
+        };
+        match result {
+            Some(ev) => Python::with_gil(|py| Ok(Some(Py::new(py, ev)?))),
+            None => Ok(None),
+        }
+    }
+
+    pub fn next_goodbye(&self, timeout_ms: Option<u64>) -> PyResult<Option<Py<GoodbyeEvent>>> {
+        let rx = self.goodbye_rx.lock().clone();
+        let result = match timeout_ms {
+            Some(ms) => self.runtime.block_on(async move {
+                tokio::time::timeout(Duration::from_millis(ms), rx.recv())
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+            }),
+            None => self.runtime.block_on(async move { rx.recv().await.ok() }),
+        };
+        match result {
+            Some(ev) => Python::with_gil(|py| Ok(Some(Py::new(py, ev)?))),
+            None => Ok(None),
+        }
+    }
+
+    pub fn next_metadata(&self, timeout_ms: Option<u64>) -> PyResult<Option<Py<MetadataEvent>>> {
+        let rx = self.metadata_rx.lock().clone();
+        let result = match timeout_ms {
+            Some(ms) => self.runtime.block_on(async move {
+                tokio::time::timeout(Duration::from_millis(ms), rx.recv())
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+            }),
+            None => self.runtime.block_on(async move { rx.recv().await.ok() }),
+        };
+        match result {
+            Some(ev) => Python::with_gil(|py| Ok(Some(Py::new(py, ev)?))),
+            None => Ok(None),
+        }
+    }
+
     pub fn shutdown(&self) -> PyResult<()> {
         let _ = self.cmd_tx.send_blocking(Command::Shutdown);
         Ok(())
@@ -280,6 +394,9 @@ async fn run_swarm(
     cmd_rx: Receiver<Command>,
     msg_tx: Sender<GossipMessage>,
     status_tx: Sender<StatusEvent>,
+    ping_tx: Sender<PingEvent>,
+    goodbye_tx: Sender<GoodbyeEvent>,
+    metadata_tx: Sender<MetadataEvent>,
     listen_addrs: Arc<Mutex<Vec<String>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let local_peer_id = key.public().to_peer_id();
@@ -309,13 +426,16 @@ async fn run_swarm(
             .with_agent_version(agent_version),
     );
 
-    let ping = ping::Behaviour::new(ping::Config::new());
+    let ping_libp2p = ping::Behaviour::new(ping::Config::new());
 
     let behaviour = Eth2Behaviour {
         gossipsub,
         identify,
-        ping,
+        ping_libp2p,
         status: rpc::new_status_behaviour(),
+        eth2_ping: rpc::new_ping_behaviour(),
+        goodbye: rpc::new_goodbye_behaviour(),
+        metadata: rpc::new_metadata_behaviour(),
     };
 
     let mut swarm = Swarm::new(
@@ -335,7 +455,13 @@ async fn run_swarm(
     }
 
     let mut topic_subs: HashMap<String, IdentTopic> = HashMap::new();
-    let mut pending_responses: HashMap<u64, request_response::ResponseChannel<StatusMessage>> =
+    let mut pending_status: HashMap<u64, request_response::ResponseChannel<StatusMessage>> =
+        HashMap::new();
+    let mut pending_ping: HashMap<u64, request_response::ResponseChannel<PingMessage>> =
+        HashMap::new();
+    let mut pending_goodbye: HashMap<u64, request_response::ResponseChannel<GoodbyeMessage>> =
+        HashMap::new();
+    let mut pending_metadata: HashMap<u64, request_response::ResponseChannel<MetaDataMessage>> =
         HashMap::new();
     let mut next_response_id: u64 = 1;
 
@@ -375,7 +501,39 @@ async fn run_swarm(
                         .await;
                 }
                 SwarmEvent::Behaviour(Eth2BehaviourEvent::Status(rr_event)) => {
-                    handle_status_event(rr_event, &status_tx, &mut pending_responses, &mut next_response_id).await;
+                    handle_symmetric_rpc_event(
+                        rr_event,
+                        &status_tx,
+                        &mut pending_status,
+                        &mut next_response_id,
+                        |peer, kind, msg, err| StatusEvent { peer, kind, message: msg, error: err },
+                    ).await;
+                }
+                SwarmEvent::Behaviour(Eth2BehaviourEvent::Eth2Ping(rr_event)) => {
+                    handle_symmetric_rpc_event(
+                        rr_event,
+                        &ping_tx,
+                        &mut pending_ping,
+                        &mut next_response_id,
+                        |peer, kind, msg, err| PingEvent { peer, kind, message: msg, error: err },
+                    ).await;
+                }
+                SwarmEvent::Behaviour(Eth2BehaviourEvent::Goodbye(rr_event)) => {
+                    handle_symmetric_rpc_event(
+                        rr_event,
+                        &goodbye_tx,
+                        &mut pending_goodbye,
+                        &mut next_response_id,
+                        |peer, kind, msg, err| GoodbyeEvent { peer, kind, message: msg, error: err },
+                    ).await;
+                }
+                SwarmEvent::Behaviour(Eth2BehaviourEvent::Metadata(rr_event)) => {
+                    handle_metadata_event(
+                        rr_event,
+                        &metadata_tx,
+                        &mut pending_metadata,
+                        &mut next_response_id,
+                    ).await;
                 }
                 _ => {}
             },
@@ -417,12 +575,63 @@ async fn run_swarm(
                     }
                 }
                 Ok(Command::AnswerStatus { id, status }) => {
-                    if let Some(channel) = pending_responses.remove(&id) {
+                    if let Some(channel) = pending_status.remove(&id) {
                         if swarm.behaviour_mut().status.send_response(channel, status).is_err() {
                             tracing::warn!("answer_status: channel dropped for id {id}");
                         }
                     } else {
-                        tracing::warn!("answer_status: no pending request id {id}");
+                        tracing::warn!("answer_status: no pending status request id {id}");
+                    }
+                }
+                Ok(Command::SendPing { peer, ping }) => {
+                    match peer.parse::<libp2p::PeerId>() {
+                        Ok(peer_id) => {
+                            let _ = swarm.behaviour_mut().eth2_ping.send_request(&peer_id, ping);
+                        }
+                        Err(e) => tracing::warn!("send_ping: bad peer id {peer}: {e}"),
+                    }
+                }
+                Ok(Command::AnswerPing { id, pong }) => {
+                    if let Some(channel) = pending_ping.remove(&id) {
+                        if swarm.behaviour_mut().eth2_ping.send_response(channel, pong).is_err() {
+                            tracing::warn!("answer_ping: channel dropped for id {id}");
+                        }
+                    } else {
+                        tracing::warn!("answer_ping: no pending ping request id {id}");
+                    }
+                }
+                Ok(Command::SendGoodbye { peer, goodbye }) => {
+                    match peer.parse::<libp2p::PeerId>() {
+                        Ok(peer_id) => {
+                            let _ = swarm.behaviour_mut().goodbye.send_request(&peer_id, goodbye);
+                        }
+                        Err(e) => tracing::warn!("send_goodbye: bad peer id {peer}: {e}"),
+                    }
+                }
+                Ok(Command::AnswerGoodbye { id, goodbye }) => {
+                    if let Some(channel) = pending_goodbye.remove(&id) {
+                        if swarm.behaviour_mut().goodbye.send_response(channel, goodbye).is_err() {
+                            tracing::warn!("answer_goodbye: channel dropped for id {id}");
+                        }
+                    } else {
+                        tracing::warn!("answer_goodbye: no pending goodbye request id {id}");
+                    }
+                }
+                Ok(Command::RequestMetadata { peer }) => {
+                    match peer.parse::<libp2p::PeerId>() {
+                        Ok(peer_id) => {
+                            let _ = swarm.behaviour_mut().metadata.send_request(&peer_id, MetaDataRequest);
+                        }
+                        Err(e) => tracing::warn!("request_metadata: bad peer id {peer}: {e}"),
+                    }
+                }
+                Ok(Command::AnswerMetadata { id, metadata }) => {
+                    if let Some(channel) = pending_metadata.remove(&id) {
+                        if swarm.behaviour_mut().metadata.send_response(channel, metadata).is_err() {
+                            tracing::warn!("answer_metadata: channel dropped for id {id}");
+                        }
+                    } else {
+                        tracing::warn!("answer_metadata: no pending metadata request id {id}");
                     }
                 }
                 Ok(Command::Shutdown) => break,
@@ -434,12 +643,18 @@ async fn run_swarm(
     Ok(())
 }
 
-async fn handle_status_event(
-    ev: request_response::Event<StatusMessage, StatusMessage>,
-    status_tx: &Sender<StatusEvent>,
-    pending: &mut HashMap<u64, request_response::ResponseChannel<StatusMessage>>,
+/// Handle a symmetric RPC event (Req == Resp). Used for status, ping, goodbye.
+async fn handle_symmetric_rpc_event<M, EvT, Mk>(
+    ev: request_response::Event<M, M>,
+    tx: &Sender<EvT>,
+    pending: &mut HashMap<u64, request_response::ResponseChannel<M>>,
     next_id: &mut u64,
-) {
+    make_event: Mk,
+) where
+    M: Clone + std::fmt::Debug,
+    EvT: Send,
+    Mk: Fn(String, String, Option<M>, Option<String>) -> EvT,
+{
     use request_response::Event;
     use request_response::Message;
     match ev {
@@ -450,18 +665,76 @@ async fn handle_status_event(
                 let id = *next_id;
                 *next_id = next_id.wrapping_add(1);
                 pending.insert(id, channel);
-                let _ = status_tx
-                    .send(StatusEvent {
+                let _ = tx
+                    .send(make_event(
+                        peer.to_string(),
+                        format!("request:{id}"),
+                        Some(request),
+                        None,
+                    ))
+                    .await;
+            }
+            Message::Response { response, .. } => {
+                let _ = tx
+                    .send(make_event(
+                        peer.to_string(),
+                        "response".into(),
+                        Some(response),
+                        None,
+                    ))
+                    .await;
+            }
+        },
+        Event::OutboundFailure { peer, error, .. } => {
+            let _ = tx
+                .send(make_event(
+                    peer.to_string(),
+                    "failure".into(),
+                    None,
+                    Some(format!("{error}")),
+                ))
+                .await;
+        }
+        Event::InboundFailure { peer, error, .. } => {
+            let _ = tx
+                .send(make_event(
+                    peer.to_string(),
+                    "failure".into(),
+                    None,
+                    Some(format!("{error}")),
+                ))
+                .await;
+        }
+        Event::ResponseSent { .. } => {}
+    }
+}
+
+async fn handle_metadata_event(
+    ev: request_response::Event<MetaDataRequest, MetaDataMessage>,
+    metadata_tx: &Sender<MetadataEvent>,
+    pending: &mut HashMap<u64, request_response::ResponseChannel<MetaDataMessage>>,
+    next_id: &mut u64,
+) {
+    use request_response::Event;
+    use request_response::Message;
+    match ev {
+        Event::Message { peer, message, .. } => match message {
+            Message::Request { channel, .. } => {
+                let id = *next_id;
+                *next_id = next_id.wrapping_add(1);
+                pending.insert(id, channel);
+                let _ = metadata_tx
+                    .send(MetadataEvent {
                         peer: peer.to_string(),
                         kind: format!("request:{id}"),
-                        message: Some(request),
+                        message: None,
                         error: None,
                     })
                     .await;
             }
             Message::Response { response, .. } => {
-                let _ = status_tx
-                    .send(StatusEvent {
+                let _ = metadata_tx
+                    .send(MetadataEvent {
                         peer: peer.to_string(),
                         kind: "response".into(),
                         message: Some(response),
@@ -471,8 +744,8 @@ async fn handle_status_event(
             }
         },
         Event::OutboundFailure { peer, error, .. } => {
-            let _ = status_tx
-                .send(StatusEvent {
+            let _ = metadata_tx
+                .send(MetadataEvent {
                     peer: peer.to_string(),
                     kind: "failure".into(),
                     message: None,
@@ -481,8 +754,8 @@ async fn handle_status_event(
                 .await;
         }
         Event::InboundFailure { peer, error, .. } => {
-            let _ = status_tx
-                .send(StatusEvent {
+            let _ = metadata_tx
+                .send(MetadataEvent {
                     peer: peer.to_string(),
                     kind: "failure".into(),
                     message: None,

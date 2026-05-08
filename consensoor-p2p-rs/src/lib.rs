@@ -31,6 +31,12 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<network::GossipMessage>()?;
     m.add_class::<rpc::StatusMessage>()?;
     m.add_class::<rpc::StatusEvent>()?;
+    m.add_class::<rpc::PingMessage>()?;
+    m.add_class::<rpc::PingEvent>()?;
+    m.add_class::<rpc::GoodbyeMessage>()?;
+    m.add_class::<rpc::GoodbyeEvent>()?;
+    m.add_class::<rpc::MetaDataMessage>()?;
+    m.add_class::<rpc::MetadataEvent>()?;
     m.add_function(wrap_pyfunction!(network::generate_keypair, m)?)?;
     Ok(())
 }
