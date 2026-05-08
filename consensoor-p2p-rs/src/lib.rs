@@ -2,14 +2,16 @@
 //!
 //! This is a thin Python binding around `rust-libp2p` configured the same way
 //! Lighthouse configures its `lighthouse_network` crate (TCP + Noise + Yamux,
-//! gossipsub with the Eth2 message-id rules, request/response, identify, ping).
+//! gossipsub with the Eth2 message-id rules, identify, ping, request/response).
 //!
-//! The goal is to replace the slow / buggy py-libp2p stack used by consensoor
-//! today.  The Python API exposed here mirrors what consensoor needs from a
-//! gossipsub host: subscribe to a topic, publish to a topic, get a callback for
-//! each incoming message, plus a request/response client/handler API.
+//! The Python API exposed here mirrors what consensoor needs from a gossipsub
+//! host: subscribe to a topic, publish to a topic, get a callback for each
+//! incoming message, plus a request/response client/handler API for the Eth2
+//! Status protocol.
 
+mod gossip;
 mod network;
+mod rpc;
 
 use pyo3::prelude::*;
 
@@ -27,6 +29,8 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<network::Network>()?;
     m.add_class::<network::NetworkConfig>()?;
     m.add_class::<network::GossipMessage>()?;
+    m.add_class::<rpc::StatusMessage>()?;
+    m.add_class::<rpc::StatusEvent>()?;
     m.add_function(wrap_pyfunction!(network::generate_keypair, m)?)?;
     Ok(())
 }

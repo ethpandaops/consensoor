@@ -4,7 +4,16 @@ from ._native import (
     Network,
     NetworkConfig,
     GossipMessage,
+    StatusMessage,
+    StatusEvent,
     generate_keypair,
 )
 
-__all__ = ["Network", "NetworkConfig", "GossipMessage", "generate_keypair"]
+__all__ = [
+    "Network",
+    "NetworkConfig",
+    "GossipMessage",
+    "StatusMessage",
+    "StatusEvent",
+    "generate_keypair",
+]
