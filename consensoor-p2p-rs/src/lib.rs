@@ -9,6 +9,7 @@
 //! incoming message, plus a request/response client/handler API for the Eth2
 //! Status protocol.
 
+mod blocks_by_range;
 mod gossip;
 mod network;
 mod rpc;

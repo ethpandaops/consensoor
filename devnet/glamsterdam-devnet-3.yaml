@@ -1,0 +1,27 @@
+participants:
+  - el_type: geth
+    el_image: ethpandaops/geth:bal-devnet-6
+    cl_type: lighthouse
+    cl_image: ethpandaops/lighthouse:glamsterdam-devnet-3
+    count: 1
+    validator_count: 0
+  - el_type: geth
+    el_image: ethpandaops/geth:bal-devnet-6
+    cl_type: consensoor
+    cl_image: ethpandaops/consensoor:main
+    count: 1
+    validator_count: 0
+
+network_params:
+  network: glamsterdam-devnet-3
+
+additional_services:
+  - dora
+snooper_enabled: true
+global_log_level: debug
+
+port_publisher:
+  cl:
+    enabled: true
+  el:
+    enabled: true
