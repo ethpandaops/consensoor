@@ -11,6 +11,8 @@ participants:
     cl_image: ethpandaops/consensoor:main
     count: 1
     validator_count: 0
+    cl_extra_params:
+      - "--checkpoint-sync-url=http://cl-1-lighthouse-geth:4000"
 
 network_params:
   network: glamsterdam-devnet-3

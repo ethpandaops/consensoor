@@ -151,34 +151,40 @@ class StateSyncManager:
                 logger.error(f"Periodic sync error: {e}")
 
     async def _initial_sync(self) -> None:
-        """Perform initial sync on startup."""
+        """Perform initial sync on startup.
+
+        Try finalized first (lightweight checkpoint-sync endpoints typically
+        only serve finalized) and fall back to head for full beacon nodes.
+        """
         logger.info("Performing initial state sync...")
+        try:
+            await self._sync_state_at_slot("finalized")
+            return
+        except Exception as e:
+            logger.warning(
+                f"Initial sync at 'finalized' failed ({e}); trying 'head'"
+            )
         try:
             await self._sync_state_at_slot("head")
         except Exception as e:
             logger.error(f"Initial sync failed: {e}")
 
     async def _sync_state_at_slot(self, slot_or_id: Union[int, str]) -> None:
-        """Sync state at a specific slot or state ID."""
-        try:
-            state_id = str(slot_or_id)
-            logger.info(f"Fetching state at {state_id}...")
+        """Sync state at a specific slot or state ID. Raises on failure."""
+        state_id = str(slot_or_id)
+        logger.info(f"Fetching state at {state_id}...")
 
-            state_bytes = await self.client.get_state(state_id)
-            state = self._decode_state(state_bytes)
+        state_bytes = await self.client.get_state(state_id)
+        state = self._decode_state(state_bytes)
 
-            if state is None:
-                logger.error("Failed to decode state from upstream")
-                return
+        if state is None:
+            raise RuntimeError(f"Failed to decode state from upstream at {state_id}")
 
-            await self._apply_state(state)
-            logger.info(
-                f"State synced: slot={state.slot}, "
-                f"validators={len(state.validators)}"
-            )
-
-        except Exception as e:
-            logger.error(f"Failed to sync state at {slot_or_id}: {e}")
+        await self._apply_state(state)
+        logger.info(
+            f"State synced: slot={state.slot}, "
+            f"validators={len(state.validators)}"
+        )
 
     def _decode_state(self, state_bytes: bytes) -> Optional[AnyBeaconState]:
         """Decode state bytes, trying different fork types."""
