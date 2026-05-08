@@ -251,7 +251,13 @@ class BeaconNode:
         # they drop the connection with "no chain status for peer". If we
         # load 128 keystores on the asyncio thread first, we miss prysm's
         # Status timeout and lose the only peer we have.
-        await self._setup_gossip()
+        #
+        # NOTE: the legacy `consensoor.network.gossip` UDP layer is intentionally
+        # NOT started here. It used to bind UDP/<p2p_port>, which collides with
+        # discv5 (also UDP/<p2p_port>) and prevents discovery from coming up
+        # with `Address already in use`. Rust libp2p + discv5 handle all P2P
+        # now; the Gossip object stays in self.gossip only so legacy subscribe()
+        # calls don't blow up.
         await self._setup_p2p()
 
         await self._load_validator_keys()
