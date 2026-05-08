@@ -778,7 +778,15 @@ async fn run_swarm(
             .with_agent_version(agent_version),
     );
 
-    let ping_libp2p = ping::Behaviour::new(ping::Config::new());
+    // Bump ping interval/timeout vs. libp2p defaults — the default 15s
+    // interval + 20s timeout means a single dropped ping silently kills
+    // the connection ~30s in. Use 30s/30s to give peers more slack while
+    // we hold the GIL during heavy SSZ work on the asyncio side.
+    let ping_libp2p = ping::Behaviour::new(
+        ping::Config::new()
+            .with_interval(Duration::from_secs(30))
+            .with_timeout(Duration::from_secs(30)),
+    );
 
     let behaviour = Eth2Behaviour {
         gossipsub,
@@ -890,9 +898,9 @@ async fn run_swarm(
                     tracing::info!("connection established with {peer_id} ({direction})");
                     connected_peers.lock().insert(peer_id.to_string(), direction);
                 }
-                SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
                     if num_established == 0 {
-                        tracing::info!("connection closed with {peer_id}");
+                        tracing::info!("connection closed with {peer_id} cause={cause:?}");
                         connected_peers.lock().remove(&peer_id.to_string());
                     }
                 }
