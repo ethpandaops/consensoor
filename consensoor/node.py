@@ -2189,11 +2189,19 @@ class BeaconNode:
 
         Runs alongside the slot ticker so that req/resp catch-up keeps making
         progress even when the slot ticker is busy with heavy validator-duty
-        compute. Polls roughly every half-slot.
+        compute.
+
+        Polling cadence is one slot — anything tighter exceeds prysm's
+        per-peer beacon_blocks_by_range rate limit (128 req / 10s) and
+        gets us downscored / kicked. Once we've actually fallen behind we
+        fan out larger requests instead of one-block requests every poll.
         """
         network_config = get_config()
         slot_duration = network_config.slot_duration_ms / 1000.0
-        poll = max(0.25, slot_duration / 2.0)
+        # One full slot between polls. With 6s gloas-minimal slots that's
+        # well under prysm's 128/10s ceiling even if we burst-request a
+        # whole batch of blocks in one call.
+        poll = max(2.0, slot_duration)
 
         while self._running:
             try:
@@ -2208,6 +2216,14 @@ class BeaconNode:
                 now = time.time()
                 current_slot = int((now - self._genesis_time) // slot_duration)
                 if current_slot < 1:
+                    await asyncio.sleep(poll)
+                    continue
+
+                # Don't bother peers if we're <2 slots behind — gossipsub
+                # will deliver the next block. Only fire req/resp catch-up
+                # when there's a meaningful gap.
+                state_slot = int(self.state.slot)
+                if current_slot - state_slot < 2:
                     await asyncio.sleep(poll)
                     continue
 
