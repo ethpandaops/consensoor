@@ -62,6 +62,7 @@ ATTESTER_SLASHING_TOPIC = "attester_slashing"
 BLS_TO_EXECUTION_CHANGE_TOPIC = "bls_to_execution_change"
 SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_TOPIC = "sync_committee_contribution_and_proof"
 BLOB_SIDECAR_TOPIC_PREFIX = "blob_sidecar_"  # blob_sidecar_{subnet_id}
+BEACON_ATTESTATION_TOPIC_PREFIX = "beacon_attestation_"  # beacon_attestation_{subnet_id}
 EXECUTION_PAYLOAD_TOPIC = "execution_payload"  # GLOAS/ePBS execution payload envelope
 
 
@@ -71,6 +72,14 @@ def get_blob_sidecar_topic(subnet_id: int, fork_digest: bytes, encoding: str = "
     Format: /eth2/{fork_digest}/blob_sidecar_{subnet_id}/{encoding}
     """
     return f"/eth2/{fork_digest.hex()}/{BLOB_SIDECAR_TOPIC_PREFIX}{subnet_id}/{encoding}"
+
+
+def get_attestation_subnet_topic(subnet_id: int, fork_digest: bytes, encoding: str = "ssz_snappy") -> str:
+    """Get the full topic name for an unaggregated attestation subnet.
+
+    Format: /eth2/{fork_digest}/beacon_attestation_{subnet_id}/{encoding}
+    """
+    return f"/eth2/{fork_digest.hex()}/{BEACON_ATTESTATION_TOPIC_PREFIX}{subnet_id}/{encoding}"
 
 
 def encode_message(data: bytes) -> bytes:

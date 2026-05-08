@@ -256,20 +256,17 @@ class EngineAPIClient:
         forkchoice_state: ForkchoiceState,
         payload_attributes: Optional[dict] = None,
     ) -> ForkchoiceUpdateResponse:
-        """Update the forkchoice state (Electra/Prague — same attrs as V3).
+        """Update the forkchoice state (Amsterdam / Gloas).
 
-        Geth's V4 is Electra; the engine spec for V4 takes
-        {timestamp, prevRandao, suggestedFeeRecipient, withdrawals,
-        parentBeaconBlockRoot}. The CL builder layer may have already added
-        a `slotNumber` field for Gloas/PTC bookkeeping — strip it before
-        handing to geth or it errors with -38003 "Invalid payload attributes".
+        Per `execution-apis/src/engine/amsterdam.md`, `PayloadAttributesV4`
+        is `PayloadAttributesV3` plus a required `slotNumber` field. Strip
+        nothing — pass attrs through verbatim. (Earlier revisions stripped
+        `slotNumber` based on a misread; that produced a `PayloadAttributesV3`
+        shape and geth replied -38003 "Invalid payload attributes".)
         """
-        attrs = None
-        if payload_attributes:
-            attrs = {k: v for k, v in payload_attributes.items() if k != "slotNumber"}
         params = [
             forkchoice_state.to_dict(),
-            attrs,
+            payload_attributes,
         ]
 
         result = await self._call("engine_forkchoiceUpdatedV4", params)

@@ -102,6 +102,11 @@ class BeaconGossip:
 
         self._handlers: dict[str, MessageHandler] = {}
 
+        # Supernodes pin to NUMBER_OF_CUSTODY_GROUPS up-front. Validator
+        # nodes start at the conservative CUSTODY_REQUIREMENT (4) — node.py
+        # bumps it via update_custody_group_count once validator effective
+        # balances are known (per fulu/validator.md).
+        initial_cgc = 128 if supernode else 4
         config = P2PConfig(
             listen_port=listen_port,
             static_peers=static_peers or [],
@@ -111,6 +116,7 @@ class BeaconGossip:
             attnets=attnets or b"\xff\xff\xff\xff\xff\xff\xff\xff",
             syncnets=syncnets or b"\x0f",
             supernode=supernode,
+            custody_group_count=initial_cgc,
         )
         self._host = P2PHost(config)
         logger.info(f"P2P custody_group_count: {config.custody_group_count} (supernode={supernode})")
@@ -205,6 +211,10 @@ class BeaconGossip:
             self.fork_digest = fork_digest
             self._host.update_fork_digest(fork_digest)
 
+    def update_custody_group_count(self, new_count: int) -> None:
+        """Bump the advertised custody_group_count (monotonic per spec)."""
+        self._host.update_custody_group_count(new_count)
+
     async def publish_block(self, block_ssz: bytes) -> None:
         """Publish a signed beacon block."""
         topic = get_topic_name(BEACON_BLOCK_TOPIC, self.fork_digest)
@@ -231,7 +241,6 @@ class BeaconGossip:
         topic = get_topic_name(SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_TOPIC, self.fork_digest)
         encoded = encode_message(contribution_ssz)
         await self._host.publish(topic, encoded)
-        logger.debug(f"Published sync committee contribution: {len(contribution_ssz)} bytes")
 
     async def publish_execution_payload(self, payload_ssz: bytes) -> None:
         """Publish a signed execution payload envelope (GLOAS/ePBS)."""

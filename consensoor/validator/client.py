@@ -51,13 +51,19 @@ class ValidatorClient:
     def update_validator_indices(self, state) -> None:
         """Update validator indices from state."""
         validators = state.validators
+        newly_resolved: list[int] = []
         for i, validator in enumerate(validators):
             pubkey = bytes(validator.pubkey)
-            if pubkey in self.pubkeys:
+            if pubkey in self.pubkeys and pubkey not in self._validator_indices:
                 self._validator_indices[pubkey] = i
                 key = self.keys[pubkey]
                 key.validator_index = i
-                logger.info(f"Validator {pubkey.hex()[:16]}... has index {i}")
+                newly_resolved.append(i)
+        if newly_resolved:
+            logger.info(
+                f"Resolved validator indices ({len(newly_resolved)}/{len(self.pubkeys)}): "
+                f"{sorted(newly_resolved)}"
+            )
 
     def get_validator_index(self, pubkey: bytes) -> Optional[int]:
         """Get validator index for a pubkey."""
@@ -159,10 +165,19 @@ class ValidatorClient:
                                 pubkey=pubkey,
                             )
                             duties.append(duty)
-                            logger.debug(
-                                f"Attester duty: slot={slot}, committee={committee_index}, "
-                                f"position={validator_position}, validator={validator_index}"
-                            )
+
+        if duties and logger.isEnabledFor(logging.DEBUG):
+            # One rollup line per epoch instead of one line per duty.
+            by_slot: dict[int, list[int]] = {}
+            for d in duties:
+                by_slot.setdefault(d.slot, []).append(int(d.validator_index))
+            slot_summary = " ".join(
+                f"s{slot}=[{','.join(str(v) for v in sorted(vs))}]"
+                for slot, vs in sorted(by_slot.items())
+            )
+            logger.debug(
+                f"Attester duties epoch={epoch} count={len(duties)} {slot_summary}"
+            )
 
         return duties
 
@@ -213,15 +228,6 @@ class ValidatorClient:
 
             domain = get_domain(state, DOMAIN_BEACON_ATTESTER, epoch)
 
-            # Debug: log domain computation details for signing
-            fork_version = bytes(state.fork.current_version) if epoch >= int(state.fork.epoch) else bytes(state.fork.previous_version)
-            genesis_root = bytes(state.genesis_validators_root)
-            logger.debug(
-                f"Attestation sign: epoch={epoch}, state_slot={state.slot}, "
-                f"fork_epoch={state.fork.epoch}, fork_version={fork_version.hex()}, "
-                f"genesis_root={genesis_root.hex()[:16]}, domain={domain.hex()[:16]}"
-            )
-
             if self._is_electra_fork(state):
                 # Electra+ attestations use committee_bits
                 attestation_data = AttestationData(
@@ -270,12 +276,6 @@ class ValidatorClient:
                     data=attestation_data,
                     signature=signature,
                 )
-
-            logger.info(
-                f"Produced attestation: slot={slot}, committee={committee_index}, "
-                f"target_epoch={epoch}, source_epoch={int(source.epoch)}, "
-                f"electra={self._is_electra_fork(state)}"
-            )
 
             metrics.record_attestation_produced()
             return attestation
@@ -334,13 +334,6 @@ class ValidatorClient:
                 validator_index=validator_key.validator_index,
                 signature=signature,
             )
-
-            logger.debug(
-                f"Produced sync committee message: slot={slot}, "
-                f"validator={validator_key.validator_index}, "
-                f"block_root={bytes(beacon_block_root).hex()[:16]}"
-            )
-
             return message
 
         except Exception as e:

@@ -65,11 +65,28 @@ def process_execution_payload_envelope(
     if verify:
         assert verify_execution_payload_envelope_signature(state, signed_envelope)
 
+    # Per spec we'd mutate state.latest_block_header.state_root with the
+    # current state's hash so the envelope's beacon_block_root assertion
+    # works. But mutating it here means the next process_slot computes
+    # state_roots[N] from a state with state_root already filled in, while
+    # peers (prysm) cache the pre-fill hash. Result: state_roots[N]
+    # diverges immediately after the first envelope is processed.
+    # Workaround: do the assertion against a *local* filled-in header copy,
+    # leave state.latest_block_header.state_root untouched.
     previous_state_root = hash_tree_root(state)
-    if bytes(state.latest_block_header.state_root) == b"\x00" * 32:
-        state.latest_block_header.state_root = previous_state_root
-
-    assert envelope.beacon_block_root == hash_tree_root(state.latest_block_header)
+    header = state.latest_block_header
+    if bytes(header.state_root) == b"\x00" * 32:
+        from ....types import BeaconBlockHeader
+        check_header = BeaconBlockHeader(
+            slot=header.slot,
+            proposer_index=header.proposer_index,
+            parent_root=header.parent_root,
+            state_root=previous_state_root,
+            body_root=header.body_root,
+        )
+    else:
+        check_header = header
+    assert envelope.beacon_block_root == hash_tree_root(check_header)
     assert int(envelope.slot) == int(state.slot)
 
     committed_bid = state.latest_execution_payload_bid

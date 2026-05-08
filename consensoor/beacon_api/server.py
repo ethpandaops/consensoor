@@ -178,10 +178,11 @@ class BeaconAPI:
         local_ip = get_local_ip()
         listen_port = self.node.config.listen_port
 
+        host = self.node.beacon_gossip._host if self.node.beacon_gossip else None
         if self.node.beacon_gossip and self.node.beacon_gossip.peer_id:
             peer_id = self.node.beacon_gossip.peer_id
-            enr = self.node.beacon_gossip._host.enr or ""
-            multiaddr = self.node.beacon_gossip._host.multiaddr
+            enr = host.enr or "" if host else ""
+            multiaddr = host.multiaddr if host else None
         else:
             peer_id = generate_peer_id(f"consensoor-{local_ip}-{self.port}")
             enr = ""
@@ -194,6 +195,25 @@ class BeaconAPI:
             multiaddr = f"/ip4/{local_ip}/tcp/{listen_port}/p2p/{peer_id}"
         p2p_addresses = [multiaddr]
 
+        # MetaData v3 mirrors what we advertise on the `/eth2/.../meta_data/3`
+        # RPC. Pull the live values out of the P2P host so dora and other
+        # monitors see the current seq_number and the post-bump
+        # custody_group_count instead of the static "1" + hardcoded attnets.
+        if host is not None:
+            meta = {
+                "seq_number": str(host._our_metadata_seq),
+                "attnets": "0x" + host.config.attnets.hex(),
+                "syncnets": "0x" + host.config.syncnets.hex(),
+                "custody_group_count": str(host.config.custody_group_count),
+            }
+        else:
+            meta = {
+                "seq_number": "0",
+                "attnets": "0xffffffffffffffff",
+                "syncnets": "0x0f",
+                "custody_group_count": "4",
+            }
+
         return web.json_response({
             "data": {
                 "peer_id": peer_id,
@@ -202,11 +222,7 @@ class BeaconAPI:
                 "discovery_addresses": [
                     f"/ip4/{local_ip}/udp/{listen_port}/p2p/{peer_id}"
                 ],
-                "metadata": {
-                    "seq_number": "1",
-                    "attnets": "0xffffffffffffffff",
-                    "syncnets": "0x0f",
-                }
+                "metadata": meta,
             }
         })
 
