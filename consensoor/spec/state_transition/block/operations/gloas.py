@@ -157,8 +157,15 @@ def apply_parent_execution_payload(state: "BeaconState", requests) -> None:
 
 
 def process_parent_execution_payload(state: "BeaconState", block) -> None:
-    """Process the parent block's execution payload (Gloas EIP-7732)."""
+    """Process the parent block's execution payload (Gloas EIP-7732).
+
+    All envelope-derived state mutations land HERE (deferred from envelope
+    receipt — see envelope handler comment). When parent's payload was
+    revealed, we update latest_block_hash, set the availability bit, and
+    apply the parent execution_requests.
+    """
     from .....crypto import hash_tree_root
+    from ....constants import SLOTS_PER_HISTORICAL_ROOT
     from ....types.electra import ExecutionRequests
 
     bid = block.body.signed_execution_payload_bid.message
@@ -175,6 +182,14 @@ def process_parent_execution_payload(state: "BeaconState", block) -> None:
         "execution_requests_root mismatch"
     )
     apply_parent_execution_payload(state, requests)
+
+    # Mark parent slot's payload as available + latch the parent's
+    # block_hash as our `latest_block_hash`. These were what the envelope
+    # handler used to do; we move them here so state matches lighthouse's
+    # "envelope = pure verification" semantics.
+    parent_slot = int(parent_bid.slot)
+    state.execution_payload_availability[parent_slot % SLOTS_PER_HISTORICAL_ROOT()] = 0b1
+    state.latest_block_hash = parent_bid.block_hash
 
 
 def process_payload_attestation(state: "BeaconState", payload_attestation: "PayloadAttestation") -> None:

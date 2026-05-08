@@ -118,36 +118,15 @@ def process_execution_payload_envelope(
         )
         assert execution_engine.verify_and_notify_new_payload(request)
 
-    from ..block.operations import (
-        process_deposit_request,
-        process_withdrawal_request,
-        process_consolidation_request,
-    )
-
-    requests = envelope.execution_requests
-    for deposit_request in requests.deposits:
-        process_deposit_request(state, deposit_request)
-    for withdrawal_request in requests.withdrawals:
-        process_withdrawal_request(state, withdrawal_request)
-    for consolidation_request in requests.consolidations:
-        process_consolidation_request(state, consolidation_request)
-
-    payment = state.builder_pending_payments[
-        SLOTS_PER_EPOCH() + int(state.slot) % SLOTS_PER_EPOCH()
-    ]
-    amount = int(payment.withdrawal.amount)
-    if amount > 0:
-        state.builder_pending_withdrawals.append(payment.withdrawal)
-    from ...types.gloas import BuilderPendingPayment
-    state.builder_pending_payments[
-        SLOTS_PER_EPOCH() + int(state.slot) % SLOTS_PER_EPOCH()
-    ] = BuilderPendingPayment()
-
-    state.execution_payload_availability[int(state.slot) % SLOTS_PER_HISTORICAL_ROOT()] = 0b1
-    state.latest_block_hash = payload.block_hash
-
-    if verify:
-        assert envelope.state_root == hash_tree_root(state)
+    # Per lighthouse + alpha-7: envelope verify performs PURE VERIFICATION.
+    # All state mutations (execution_requests processing,
+    # builder_pending_payments rotation, latest_block_hash,
+    # execution_payload_availability) are deferred to the NEXT block's
+    # process_parent_execution_payload. If we mutate state here, our state
+    # at slot N has bit N=1 + latest_block_hash=payload.block_hash, while
+    # lighthouse's has bit N=0 + latest_block_hash=parent's value (until
+    # the next block triggers parent_execution_payload). Diverged states
+    # → diverged block_roots → chain stuck.
 
 
 def process_payload_from_envelope(
