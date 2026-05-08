@@ -494,6 +494,32 @@ class BeaconNode:
                         logger.info(f"Using fork_digest from bootnode ENR: {extracted.hex()}")
                         break
 
+            # Auto-bootstrap from checkpoint_sync_url's beacon API: ask its
+            # /eth/v1/node/identity for a libp2p multiaddr and add it as a
+            # static peer so the rust libp2p host has someone to dial. Without
+            # this consensoor only listens and never connects (we don't have
+            # discv5 yet).
+            if self.config.checkpoint_sync_url and not self.config.peers:
+                try:
+                    import aiohttp
+                    base = self.config.checkpoint_sync_url.rstrip("/")
+                    async with aiohttp.ClientSession() as sess:
+                        async with sess.get(
+                            f"{base}/eth/v1/node/identity",
+                            timeout=aiohttp.ClientTimeout(total=5),
+                        ) as r:
+                            if r.status == 200:
+                                data = (await r.json())["data"]
+                                addrs = data.get("p2p_addresses", [])
+                                if addrs:
+                                    bootstrap_addr = addrs[0]
+                                    self.config.peers = (bootstrap_addr,)
+                                    logger.info(
+                                        f"Auto-bootstrap from checkpoint upstream: {bootstrap_addr}"
+                                    )
+                except Exception as e:
+                    logger.debug(f"Auto-bootstrap from checkpoint URL failed: {e}")
+
             # Compute all fork digests for multi-fork subscription
             all_fork_digests = self._get_all_fork_digests(net_config, genesis_validators_root)
             logger.info(f"All fork digests for subscription: {[d.hex() for d in all_fork_digests]}")
