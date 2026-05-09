@@ -56,9 +56,14 @@ class P2PConfig:
     gossip_degree_low: int = 1
     gossip_degree_high: int = 6
 
-    @property
-    def custody_group_count(self) -> int:
-        return 128 if self.supernode else 4
+    # Mutable. Initial value is the conservative non-validator default
+    # (CUSTODY_REQUIREMENT). BeaconNode overwrites this after validator
+    # keys + state are available, applying
+    # `get_validators_custody_requirement` from
+    # `consensus-specs/specs/fulu/validator.md`. Supernodes are pinned to
+    # NUMBER_OF_CUSTODY_GROUPS up-front. The spec forbids decreases, so
+    # the setter on P2PHost takes max(old, new).
+    custody_group_count: int = 4
 
 
 class P2PHost:
@@ -108,6 +113,35 @@ class P2PHost:
 
     def update_fork_digest(self, fork_digest: bytes) -> None:
         self.config.fork_digest = fork_digest
+        if self._network is not None:
+            try:
+                self._network.update_enr(fork_digest=list(fork_digest))
+            except Exception as e:
+                logger.warning(f"ENR fork_digest update failed: {e}")
+
+    def update_custody_group_count(self, new_count: int) -> None:
+        """Bump our advertised custody_group_count.
+
+        Per `consensus-specs/specs/fulu/validator.md`, the count MUST NOT
+        decrease — once a node advertises a higher CGC it keeps custodying
+        and serving those columns. We take max(current, new) and bump
+        seq_number so peers re-pull MetaData v3.
+        """
+        old = self.config.custody_group_count
+        target = max(old, int(new_count))
+        if target == old:
+            return
+        self.config.custody_group_count = target
+        self._our_metadata_seq += 1
+        logger.info(
+            f"custody_group_count updated: {old} -> {target} "
+            f"(seq_number={self._our_metadata_seq})"
+        )
+        if self._network is not None:
+            try:
+                self._network.update_enr(cgc=target)
+            except Exception as e:
+                logger.warning(f"ENR cgc update failed: {e}")
 
     # ------------------------------------------------------------------ lifecycle
 
@@ -130,6 +164,12 @@ class P2PHost:
             seed_phrase=None,
             max_peers=64,
             agent_version="consensoor/0.1.0",
+            next_fork_version=list(self.config.next_fork_version),
+            next_fork_epoch=int(self.config.next_fork_epoch),
+            attnets=list(self.config.attnets),
+            syncnets=list(self.config.syncnets),
+            cgc=int(self.config.custody_group_count),
+            external_ip=get_local_ip(),
         )
         self._network = cp.Network.start(net_cfg)
         self._peer_id = self._network.peer_id()
@@ -378,8 +418,20 @@ class P2PHost:
 
     @property
     def enr(self) -> Optional[str]:
-        # discv5 / ENR not yet implemented in the rust binding.
-        return None
+        """Latest signed local ENR (`enr:` base64 string).
+
+        The Rust binding builds + signs this with the libp2p secp256k1
+        keypair on construction and re-signs it whenever `fork_digest`,
+        `cgc`, `attnets`, or `syncnets` change. discv5 isn't running yet,
+        so the ENR isn't published over UDP — but `/eth/v1/node/identity`
+        returns it and dora can decode every field.
+        """
+        if self._network is None:
+            return None
+        try:
+            return self._network.enr()
+        except Exception:
+            return None
 
     @property
     def multiaddr(self) -> Optional[str]:

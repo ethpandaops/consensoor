@@ -351,77 +351,113 @@ class BeaconNode:
             config.altair_fork_epoch = 0
 
         # Compute genesis block root per the spec:
-        # The state's latest_block_header.state_root is ZERO_HASH at genesis.
-        # The genesis block root is computed by filling in the actual state_root.
-        from .spec.types import BeaconBlockHeader
+        # `get_genesis_block(state) = SignedBeaconBlock(message=BeaconBlock(
+        #     state_root=hash_tree_root(state)))`
+        # — i.e. all body / header fields default and state_root = state hash.
+        # We MUST hash the synthetic empty block ourselves rather than reuse
+        # state.latest_block_header.body_root: kurtosis's eth-beacon-genesis
+        # stores the hash of an empty *body* there too, but if its dynssz
+        # schema disagrees with our remerkleable schema by a single field
+        # (e.g. PTC bitvector size, KZG commitment limits) the values
+        # diverge and our head_root won't match prysm's. Always compute
+        # head_root = hash_tree_root(BeaconBlock(state_root=..., body=defaults)).
         genesis_state_root = hash_tree_root(self.state)
-        header = self.state.latest_block_header
-        logger.info(
-            f"Genesis header from state: slot={header.slot}, proposer_index={header.proposer_index}, "
-            f"parent_root={bytes(header.parent_root).hex()[:16]}, "
-            f"state_root={bytes(header.state_root).hex()[:16]}, "
-            f"body_root={bytes(header.body_root).hex()[:16]}"
-        )
-        logger.info(f"Computed genesis state root: {genesis_state_root.hex()}")
-        genesis_block_header = BeaconBlockHeader(
-            slot=header.slot,
-            proposer_index=header.proposer_index,
-            parent_root=header.parent_root,
-            state_root=genesis_state_root,
-            body_root=header.body_root,
-        )
-        self.head_root = hash_tree_root(genesis_block_header)
         self.head_slot = int(self.state.slot)
         self._genesis_time = int(self.state.genesis_time)
+        header = self.state.latest_block_header  # used below for parent_root etc.
+        logger.info(f"Computed genesis state root: {genesis_state_root.hex()}")
 
-        # Save genesis block root and state for potential reorg handling
+        # Build the synthetic genesis block (defaults) and use ITS hash for
+        # head_root — see comment above.
+        if detected_fork == "gloas":
+            from .spec.types.gloas import (
+                BeaconBlockBody as GloasBeaconBlockBody,
+                BeaconBlock as GloasBeaconBlock,
+                SignedBeaconBlock as SignedGloasBeaconBlock,
+                ExecutionPayloadBid as GloasExecutionPayloadBid,
+                SignedExecutionPayloadBid as GloasSignedExecutionPayloadBid,
+            )
+            # Mirror state.latest_execution_payload_bid into the genesis
+            # body's signed_execution_payload_bid.message — lighthouse does
+            # this so its genesis body_root != prysm's. Prysm uses empty
+            # defaults; lighthouse populates parent_block_hash + execution
+            # requests_root from the state's bid. We follow lighthouse here
+            # to interop on the lighthouse-glamsterdam-devnet-3 chain.
+            state_bid = self.state.latest_execution_payload_bid
+            genesis_bid_msg = GloasExecutionPayloadBid(
+                parent_block_hash=state_bid.parent_block_hash,
+                parent_block_root=state_bid.parent_block_root,
+                block_hash=state_bid.block_hash,
+                prev_randao=state_bid.prev_randao,
+                fee_recipient=state_bid.fee_recipient,
+                gas_limit=state_bid.gas_limit,
+                builder_index=state_bid.builder_index,
+                slot=state_bid.slot,
+                value=state_bid.value,
+                execution_payment=state_bid.execution_payment,
+                blob_kzg_commitments=list(state_bid.blob_kzg_commitments),
+                execution_requests_root=state_bid.execution_requests_root,
+            )
+            genesis_signed_bid = GloasSignedExecutionPayloadBid(
+                message=genesis_bid_msg,
+                signature=BLSSignature(b'\x00' * 96),
+            )
+            genesis_body = GloasBeaconBlockBody(
+                signed_execution_payload_bid=genesis_signed_bid,
+            )
+            genesis_block = GloasBeaconBlock(
+                slot=int(header.slot),
+                proposer_index=int(header.proposer_index),
+                parent_root=header.parent_root,
+                state_root=genesis_state_root,
+                body=genesis_body,
+            )
+            signed_genesis_block = SignedGloasBeaconBlock(
+                message=genesis_block,
+                signature=BLSSignature(b'\x00' * 96),
+            )
+        else:
+            genesis_body = ElectraBeaconBlockBody(
+                randao_reveal=BLSSignature(b'\x00' * 96),
+                eth1_data=Eth1Data(),
+                graffiti=Bytes32(b'\x00' * 32),
+                proposer_slashings=[],
+                attester_slashings=[],
+                attestations=[],
+                deposits=[],
+                voluntary_exits=[],
+                sync_aggregate=SyncAggregate(),
+                execution_payload=ExecutionPayload(),
+                bls_to_execution_changes=[],
+                blob_kzg_commitments=[],
+                execution_requests=ExecutionRequests(),
+            )
+            genesis_block = ElectraBeaconBlock(
+                slot=int(header.slot),
+                proposer_index=int(header.proposer_index),
+                parent_root=header.parent_root,
+                state_root=genesis_state_root,
+                body=genesis_body,
+            )
+            signed_genesis_block = SignedElectraBeaconBlock(
+                message=genesis_block,
+                signature=BLSSignature(b'\x00' * 96),
+            )
+
+        self.head_root = hash_tree_root(genesis_block)
         self._genesis_block_root = self.head_root
         self._genesis_state = self.state.__class__.decode_bytes(bytes(self.state.encode_bytes()))
 
-        # Save state by genesis_state_root (original hash) BEFORE modifying latest_block_header
+        # Save state by genesis_state_root (its true hash). Per spec the
+        # genesis state has latest_block_header.state_root == ZERO_HASH;
+        # process_slot for slot 1 fills it in. Don't mutate it here or
+        # state.state_roots[0] gets cached against a hash no other client
+        # computes.
         self.store.save_state(genesis_state_root, self.state)
-
-        # Update state's latest_block_header with actual state_root so that
-        # hash_tree_root(state.latest_block_header) == head_root
-        # This is critical for Dora/explorers that compute block root from state
-        self.state.latest_block_header.state_root = genesis_state_root
-        logger.info(f"Updated state.latest_block_header.state_root to {genesis_state_root.hex()[:16]}")
-
-        # Also save state by head_root (block_root) for flexibility
         self.store.save_state(self.head_root, self.state)
         self.store.set_head(self.head_root)
-        logger.info(f"Genesis block root: {self.head_root.hex()}")
-
-        # Create and save genesis block for API compatibility
-        # The genesis block body is empty with default values
-        genesis_body = ElectraBeaconBlockBody(
-            randao_reveal=BLSSignature(b'\x00' * 96),
-            eth1_data=Eth1Data(),
-            graffiti=Bytes32(b'\x00' * 32),
-            proposer_slashings=[],
-            attester_slashings=[],
-            attestations=[],
-            deposits=[],
-            voluntary_exits=[],
-            sync_aggregate=SyncAggregate(),
-            execution_payload=ExecutionPayload(),
-            bls_to_execution_changes=[],
-            blob_kzg_commitments=[],
-            execution_requests=ExecutionRequests(),
-        )
-        genesis_block = ElectraBeaconBlock(
-            slot=int(header.slot),
-            proposer_index=int(header.proposer_index),
-            parent_root=header.parent_root,
-            state_root=genesis_state_root,
-            body=genesis_body,
-        )
-        signed_genesis_block = SignedElectraBeaconBlock(
-            message=genesis_block,
-            signature=BLSSignature(b'\x00' * 96),
-        )
         self.store.save_block(self.head_root, signed_genesis_block)
-        logger.info(f"Saved genesis block to store")
+        logger.info(f"Genesis block root: {self.head_root.hex()} (fork={detected_fork})")
 
         # Update metrics
         from .spec import constants
@@ -1312,16 +1348,28 @@ class BeaconNode:
     def _is_synced(self) -> bool:
         """Are we close enough to the network head to safely publish?
 
-        Currently HARD-DISABLED: even with a tight gate, our attestations /
-        aggregates / sync-committee msgs end up scoring negatively on prysm's
-        gossipsub (probably wrong target_root / source_root / domain — we'll
-        debug separately). Returning False here means we never broadcast
-        validator messages and never propose blocks; we stay in pure
-        follower mode. Peer connections hold, we keep importing blocks via
-        req/resp + gossipsub. Re-enable once attestation production is
-        spec-compliant.
+        Per spec, an attester at slot N votes head=last block we've imported
+        and target=block_root_at(epoch_start). Both reference the chain we
+        already know, so the only correctness gate is: we must have imported
+        at least the previous slot's block (head_slot >= current_slot - 1).
+        If we're further behind, our head root is stale relative to the
+        network and peers will reject the message (~-214 score each, prune
+        threshold ~3 in 30s). state.slot may legitimately lag head_slot
+        when the latest seen block is from a previous slot — _produce_*
+        callers run process_slots on a clone before signing.
+
+        Aggregate broadcasts are also gated by is_aggregator() in
+        _broadcast_attestation_as_aggregate so non-selected validators
+        stay silent on the aggregate topic.
         """
-        return False
+        if not self.state or not self.head_root or not self._genesis_time:
+            return False
+        try:
+            slot_duration = get_config().slot_duration_ms / 1000.0
+        except Exception:
+            return False
+        current_slot = int((time.time() - self._genesis_time) // slot_duration)
+        return self.head_slot >= current_slot - 1
 
     async def _produce_attestations(self, slot: int) -> None:
         """Produce attestations for validators with duties at this slot.
@@ -1381,11 +1429,15 @@ class BeaconNode:
                     self.attestation_pool.add(attestation)
                     produced_count += 1
 
-                    # Broadcast via P2P as aggregate
+                    # Broadcast via P2P as aggregate, but only if this
+                    # validator passes is_aggregator() for this slot.
                     if self.beacon_gossip:
                         try:
                             await self._broadcast_attestation_as_aggregate(
-                                attestation, duty.validator_index, duty.pubkey
+                                attestation,
+                                duty.validator_index,
+                                duty.pubkey,
+                                duty.committee_index,
                             )
                             broadcast_count += 1
                         except Exception as e:
@@ -1493,14 +1545,18 @@ class BeaconNode:
         if not self._is_synced():
             return
 
-        from .spec.constants import SYNC_COMMITTEE_SIZE, SYNC_COMMITTEE_SUBNET_COUNT, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_CONTRIBUTION_AND_PROOF
+        from .spec.constants import (
+            SYNC_COMMITTEE_SIZE, SYNC_COMMITTEE_SUBNET_COUNT,
+            TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE,
+            DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, DOMAIN_CONTRIBUTION_AND_PROOF,
+        )
         from .spec.types.altair import (
             SyncCommitteeContribution, ContributionAndProof, SignedContributionAndProof,
             SyncAggregatorSelectionData,
         )
         from .spec.types.base import Bitvector, BLSSignature, uint64
         from .spec.state_transition.helpers.domain import get_domain, compute_signing_root
-        from .crypto import sign_async as bls_sign_async
+        from .crypto import sign_async as bls_sign_async, sha256
 
         sync_committee_size = SYNC_COMMITTEE_SIZE()
         subcommittee_size = sync_committee_size // SYNC_COMMITTEE_SUBNET_COUNT
@@ -1568,6 +1624,18 @@ class BeaconNode:
             selection_root = compute_signing_root(selection_data, selection_domain)
             selection_proof = await bls_sign_async(aggregator_key.privkey, selection_root)
 
+            # is_sync_committee_aggregator gate (specs/altair/validator.md):
+            #   modulo = max(1, SYNC_COMMITTEE_SIZE // SUBNET_COUNT // TARGET_AGGREGATORS)
+            #   bytes_to_uint64(hash(signature)[0:8]) % modulo == 0
+            sync_modulo = max(
+                1,
+                sync_committee_size // SYNC_COMMITTEE_SUBNET_COUNT
+                // TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE,
+            )
+            sync_h = sha256(selection_proof)
+            if int.from_bytes(sync_h[:8], "little") % sync_modulo != 0:
+                continue
+
             contribution_and_proof = ContributionAndProof(
                 aggregator_index=aggregator_key.validator_index,
                 contribution=contribution,
@@ -1601,15 +1669,34 @@ class BeaconNode:
             )
 
     async def _broadcast_attestation_as_aggregate(
-        self, attestation, validator_index: int, pubkey: bytes
+        self, attestation, validator_index: int, pubkey: bytes, committee_index: int
     ) -> None:
-        """Wrap attestation in SignedAggregateAndProof and broadcast."""
+        """Wrap attestation in SignedAggregateAndProof and broadcast — but
+        ONLY if this validator was selected as an aggregator for this slot
+        per the eth2 spec's `is_aggregator(state, slot, index, slot_signature)`.
+
+        Spec (specs/phase0/validator.md):
+            modulo = max(1, len(committee) // TARGET_AGGREGATORS_PER_COMMITTEE)
+            is_aggregator = bytes_to_uint64(hash(slot_signature)[0:8]) % modulo == 0
+
+        Without this check, we broadcast every validator's attestation as an
+        aggregate. ~16x too many; non-aggregator messages get rejected by
+        prysm's gossipsub validation, our peer score drops to -620 in <30s,
+        and prysm prunes us from its mesh.
+        """
         from .spec.types.electra import ElectraAggregateAndProof, SignedElectraAggregateAndProof
         from .spec.types.phase0 import AggregateAndProof, SignedAggregateAndProof
         from .spec.types.base import BLSSignature
-        from .spec.constants import DOMAIN_SELECTION_PROOF, DOMAIN_AGGREGATE_AND_PROOF
+        from .spec.constants import (
+            DOMAIN_SELECTION_PROOF, DOMAIN_AGGREGATE_AND_PROOF,
+            TARGET_AGGREGATORS_PER_COMMITTEE,
+        )
         from .spec.state_transition.helpers.domain import get_domain, compute_signing_root
+        from .spec.state_transition.helpers.beacon_committee import (
+            get_beacon_committee, get_committee_count_per_slot,
+        )
         from .spec.types import Slot
+        from .crypto import sha256
 
         key = self.validator_client.get_key(pubkey)
         if not key:
@@ -1618,10 +1705,24 @@ class BeaconNode:
         slot = int(attestation.data.slot)
         epoch = slot // SLOTS_PER_EPOCH()
 
-        # Create selection proof (sign the slot)
+        # Selection proof = BLS sign over Slot(slot) with DOMAIN_SELECTION_PROOF.
         domain = get_domain(self.state, DOMAIN_SELECTION_PROOF, epoch)
         signing_root = compute_signing_root(Slot(slot), domain)
         selection_proof = await sign_async(key.privkey, signing_root)
+
+        # is_aggregator gate.
+        try:
+            committee = get_beacon_committee(self.state, slot, committee_index)
+        except Exception as e:
+            logger.debug(f"is_aggregator: get_beacon_committee failed: {e}")
+            return
+        modulo = max(1, len(committee) // TARGET_AGGREGATORS_PER_COMMITTEE)
+        h = sha256(selection_proof)
+        slot_sig_uint = int.from_bytes(h[:8], "little")
+        if slot_sig_uint % modulo != 0:
+            # Not selected as aggregator this slot — staying silent on the
+            # aggregate topic is the spec-correct behaviour.
+            return
 
         is_electra = self._is_electra_fork()
 
@@ -1720,45 +1821,19 @@ class BeaconNode:
                 commitment_bytes = bytes.fromhex(commitment_hex.replace("0x", ""))
                 kzg_commitments.append(KZGCommitment(commitment_bytes))
 
-        # Build envelope with placeholder state_root (will be computed after phase 2)
+        # alpha-7 ExecutionPayloadEnvelope: payload, execution_requests,
+        # builder_index, beacon_block_root, parent_beacon_block_root.
+        # No `slot` / `state_root` — those are dev-spec only.
+        parent_beacon_block_root = bytes(self.state.latest_block_header.parent_root)
         envelope = ExecutionPayloadEnvelope(
             payload=execution_payload,
             execution_requests=exec_requests_obj,
             builder_index=BUILDER_INDEX_SELF_BUILD,
             beacon_block_root=Root(beacon_block_root),
-            slot=Slot(slot),
-            state_root=Root(b"\x00" * 32),
+            parent_beacon_block_root=Root(parent_beacon_block_root),
         )
 
         g2_point_at_infinity = b"\xc0" + b"\x00" * 95
-        signed_envelope = SignedExecutionPayloadEnvelope(
-            message=envelope,
-            signature=BLSSignature(g2_point_at_infinity),
-        )
-
-        # Apply phase 2 (envelope processing) to state - updates latest_block_hash,
-        # execution_payload_availability, processes execution requests, etc.
-        from .spec.state_transition.block.execution_payload_envelope import (
-            process_execution_payload_envelope,
-        )
-
-        def _apply_envelope_and_root(state, env):
-            process_execution_payload_envelope(state, env, verify=False)
-            return hash_tree_root(state)
-
-        state_root = await self._on_state_thread(
-            _apply_envelope_and_root, self.state, signed_envelope
-        )
-
-        # Rebuild envelope with correct state_root
-        envelope = ExecutionPayloadEnvelope(
-            payload=execution_payload,
-            execution_requests=exec_requests_obj,
-            builder_index=BUILDER_INDEX_SELF_BUILD,
-            beacon_block_root=Root(beacon_block_root),
-            slot=Slot(slot),
-            state_root=Root(state_root),
-        )
         signed_envelope = SignedExecutionPayloadEnvelope(
             message=envelope,
             signature=BLSSignature(g2_point_at_infinity),
@@ -1822,6 +1897,22 @@ class BeaconNode:
             if signed_block is None:
                 logger.error("Failed to build block")
                 return
+
+            # PUBLISH IMMEDIATELY before doing any local validation, engine
+            # round-trips, or state persistence. The block was built from
+            # our own state and run through process_block inside
+            # block_builder, so we already know it's coherent. Doing the
+            # importer-side checks here costs ~1.5–2s — long enough that
+            # prysm's late-block-reorg orphans us every time. Local apply
+            # happens below and just duplicates the work an importer would
+            # do; the network publish has to win the race.
+            if self.beacon_gossip:
+                try:
+                    early_ssz = signed_block.encode_bytes()
+                    await self.beacon_gossip.publish_block(early_ssz)
+                    logger.info(f"Block published EARLY to P2P: slot={slot}")
+                except Exception as e:
+                    logger.error(f"Failed to publish block to P2P (early): {e}")
 
             block = signed_block.message
             block_root = hash_tree_root(block)
@@ -1980,13 +2071,13 @@ class BeaconNode:
             # Apply state transition FIRST (before updating head, to avoid race with SSE events)
             await self._apply_block_to_state(block, block_root, signed_block)
 
-            # Fill in state.latest_block_header.state_root with the actual post-state root.
-            # This is normally filled in during process_slot for the NEXT slot, but we need it
-            # now so that hash_tree_root(state.latest_block_header) == block_root for correct
-            # parentBeaconBlockRoot in forkchoiceUpdated/newPayload.
-            if bytes(self.state.latest_block_header.state_root) == b"\x00" * 32:
-                self.state.latest_block_header.state_root = bytes(block.state_root)
-                logger.debug(f"Filled in latest_block_header.state_root: {bytes(block.state_root).hex()[:16]}")
+            # NOTE: do NOT mutate self.state.latest_block_header.state_root here.
+            # Per spec it stays ZERO until process_slot for slot+1 fills it
+            # in via previous_state_root. If we set it now, every subsequent
+            # process_slot caches state.state_roots[slot] against a state hash
+            # no other client computes, and our chain permanently forks from
+            # the network. process_slots in the next state_transition will
+            # fill it in correctly when needed.
 
             # For GLOAS: apply phase 2 (envelope processing) to state BEFORE saving.
             # This updates latest_block_hash, execution_payload_availability, etc.
@@ -2045,30 +2136,23 @@ class BeaconNode:
                 f"root={block_root.hex()[:16]}, block_hash={new_block_hash.hex()[:16]}"
             )
 
-            # Broadcast block via P2P gossipsub
-            if self.beacon_gossip:
-                try:
-                    block_ssz = signed_block.encode_bytes()
-                    await self.beacon_gossip.publish_block(block_ssz)
-                    logger.info(f"Block published to P2P network: slot={slot}")
-                except Exception as e:
-                    logger.error(f"Failed to publish block to P2P: {e}")
+            # (Block was already published EARLY immediately after build_block.)
 
-                if is_gloas:
-                    if self.beacon_api:
-                        try:
-                            await self.beacon_api.emit_execution_payload_available(slot, block_root)
-                        except Exception as e:
-                            logger.error(f"Failed to emit execution_payload_available: {e}")
+            if is_gloas:
+                if self.beacon_api:
+                    try:
+                        await self.beacon_api.emit_execution_payload_available(slot, block_root)
+                    except Exception as e:
+                        logger.error(f"Failed to emit execution_payload_available: {e}")
 
-                    # Emit execution_payload_bid SSE event
-                    if self.beacon_api and hasattr(block.body, 'signed_execution_payload_bid'):
-                        try:
-                            await self.beacon_api.emit_execution_payload_bid(
-                                block.body.signed_execution_payload_bid
-                            )
-                        except Exception as e:
-                            logger.error(f"Failed to emit execution_payload_bid event: {e}")
+                # Emit execution_payload_bid SSE event
+                if self.beacon_api and hasattr(block.body, 'signed_execution_payload_bid'):
+                    try:
+                        await self.beacon_api.emit_execution_payload_bid(
+                            block.body.signed_execution_payload_bid
+                        )
+                    except Exception as e:
+                        logger.error(f"Failed to emit execution_payload_bid event: {e}")
 
         except Exception as e:
             logger.error(f"Block production failed: {e}")
@@ -2277,9 +2361,8 @@ class BeaconNode:
                     await self._apply_block_to_state(block, block_root, signed_block)
                     logger.debug(f"P2P: _apply_block_to_state succeeded for slot={block.slot}")
 
-                    # Fill in state.latest_block_header.state_root with the actual post-state root
-                    if bytes(self.state.latest_block_header.state_root) == b"\x00" * 32:
-                        self.state.latest_block_header.state_root = bytes(block.state_root)
+                    # Do NOT mutate latest_block_header.state_root — see comment
+                    # in _produce_and_broadcast_block; same spec-divergence trap.
 
                     # Save state for epoch queries (Dora needs historical states by state_root)
                     # This MUST happen before updating head_slot/head_root to avoid race condition
@@ -2524,15 +2607,24 @@ class BeaconNode:
         target_block = target_signed_block.message
         target_slot = int(target_block.slot)
 
-        # Walk back collecting (root, signed_block) from target → genesis.
-        # Stop early if we hit a block whose hash matches a stored state we
-        # already know (cheap-ish via store.get_state if it's there) — but
-        # for the MVP we go all the way back to genesis to be safe.
+        # Walk back collecting (root, signed_block) from target until we
+        # reach either:
+        #   (a) an ancestor whose post-state we already have cached in the
+        #       store — start replay from that state, or
+        #   (b) genesis — fall back to a full replay.
+        # Without (a) we'd re-replay from genesis on every Gloas-boundary
+        # block, the replays queue up under wall-clock pressure, head gets
+        # stuck for hours.
         chain: list[tuple[bytes, object]] = [(target_root, target_signed_block)]
         cursor = bytes(target_block.parent_root)
+        anchor_state = None
         max_walk = max(target_slot + 8, 64)
         for _ in range(max_walk):
             if self._genesis_block_root and cursor == self._genesis_block_root:
+                break
+            cached = self.store.get_state(cursor)
+            if cached is not None:
+                anchor_state = cached
                 break
             ancestor_signed = self.store.get_block(cursor)
             if ancestor_signed is None:
@@ -2551,14 +2643,22 @@ class BeaconNode:
         # Reverse so we apply oldest → newest.
         chain.reverse()
 
-        logger.info(
-            f"Reorg: replaying {len(chain)} blocks from genesis to slot {target_slot}"
-        )
-
-        # Fresh deep-copy of genesis state.
-        new_state = self._genesis_state.__class__.decode_bytes(
-            bytes(self._genesis_state.encode_bytes())
-        )
+        if anchor_state is not None:
+            anchor_slot = int(anchor_state.slot)
+            logger.info(
+                f"Reorg: replaying {len(chain)} blocks from cached ancestor "
+                f"slot {anchor_slot} to slot {target_slot}"
+            )
+            new_state = anchor_state.__class__.decode_bytes(
+                bytes(anchor_state.encode_bytes())
+            )
+        else:
+            logger.info(
+                f"Reorg: replaying {len(chain)} blocks from genesis to slot {target_slot}"
+            )
+            new_state = self._genesis_state.__class__.decode_bytes(
+                bytes(self._genesis_state.encode_bytes())
+            )
 
         from .spec.state_transition import state_transition
 
@@ -2572,10 +2672,8 @@ class BeaconNode:
             _replay, new_state, [sb for _, sb in chain]
         )
 
-        # Fill in latest_block_header.state_root if zero, just like the
-        # normal apply path does.
-        if bytes(new_state.latest_block_header.state_root) == b"\x00" * 32:
-            new_state.latest_block_header.state_root = bytes(target_block.state_root)
+        # Per spec, latest_block_header.state_root stays ZERO until the
+        # next slot's process_slot fills it in. Do not mutate here.
 
         # Persist the new state under several keys so the API + dora can
         # find it back.
@@ -2650,8 +2748,28 @@ class BeaconNode:
         # serialise through a single thread.
         t0 = time.monotonic()
         if signed_block is not None:
+            # DIAGNOSTIC: Run state_transition without sig verify but with
+            # state_root validation, comparing our post-state hash against
+            # the block's claimed state_root. First mismatch pinpoints the
+            # exact slot where our state diverges from spec.
+            def _apply_with_check(state, sb):
+                pre_copy = state.__class__.decode_bytes(bytes(state.encode_bytes()))
+                target = int(sb.message.slot)
+                if target > int(pre_copy.slot):
+                    pre_copy = process_slots(pre_copy, target)
+                process_block(pre_copy, sb.message)
+                computed = hash_tree_root(pre_copy)
+                claimed = bytes(sb.message.state_root)
+                if computed != claimed:
+                    logger.error(
+                        f"STATE_ROOT_MISMATCH at slot={target} "
+                        f"block_root={hash_tree_root(sb.message).hex()[:16]} "
+                        f"computed={computed.hex()[:16]} "
+                        f"claimed={claimed.hex()[:16]}"
+                    )
+                return pre_copy
             new_state = await self._on_state_thread(
-                state_transition, self.state, signed_block, False
+                _apply_with_check, self.state, signed_block
             )
             self.state = new_state
             elapsed_ms = (time.monotonic() - t0) * 1000.0
@@ -2742,26 +2860,29 @@ class BeaconNode:
             return
 
         # Verify beacon_block_root matches current state's latest block header.
-        # latest_block_header is small; the heavy call is hash_tree_root over
-        # the full state when filling in a missing state_root.
-        current_header_root = hash_tree_root(self.state.latest_block_header)
+        # If state_root is still ZERO (normal at this point — process_slot for
+        # the next slot hasn't run), compute the would-be filled-in header
+        # WITHOUT mutating self.state (mutating breaks spec, see other notes).
+        header = self.state.latest_block_header
+        current_header_root = hash_tree_root(header)
+        if beacon_block_root != current_header_root and bytes(header.state_root) == b"\x00" * 32:
+            from .spec.types import BeaconBlockHeader
+            full_state_root = await self._on_state_thread(hash_tree_root, self.state)
+            filled_header = BeaconBlockHeader(
+                slot=header.slot,
+                proposer_index=header.proposer_index,
+                parent_root=header.parent_root,
+                state_root=full_state_root,
+                body_root=header.body_root,
+            )
+            current_header_root = hash_tree_root(filled_header)
         if beacon_block_root != current_header_root:
-            # state.latest_block_header.state_root may be 0x00 still - fill it in
-            # and re-check (process_execution_payload_envelope does this too)
-            if bytes(self.state.latest_block_header.state_root) == b"\x00" * 32:
-                full_state_root = await self._on_state_thread(
-                    hash_tree_root, self.state
-                )
-                self.state.latest_block_header.state_root = full_state_root
-                current_header_root = hash_tree_root(self.state.latest_block_header)
-
-            if beacon_block_root != current_header_root:
-                logger.warning(
-                    f"Envelope beacon_block_root {beacon_block_root.hex()[:16]} doesn't match "
-                    f"state header root {current_header_root.hex()[:16]}, saving as pending"
-                )
-                self._pending_envelopes[beacon_block_root] = signed_envelope
-                return
+            logger.warning(
+                f"Envelope beacon_block_root {beacon_block_root.hex()[:16]} doesn't match "
+                f"state header root {current_header_root.hex()[:16]}, saving as pending"
+            )
+            self._pending_envelopes[beacon_block_root] = signed_envelope
+            return
 
         try:
             from .spec.state_transition.block.execution_payload_envelope import (

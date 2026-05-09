@@ -63,10 +63,6 @@ class AttestationPool:
         )
 
         self._attestations[key].append(pooled)
-        logger.debug(
-            f"Added attestation to pool: slot={slot}, committee={committee_index}, "
-            f"bits={sum(1 for b in attestation.aggregation_bits if b)}"
-        )
         return True
 
     def get_attestations_for_block(

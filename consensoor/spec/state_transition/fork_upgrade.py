@@ -344,11 +344,15 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
     for i in range(slots_per_hist):
         availability[i] = True
 
-    # Initialize ptc_window
-    # Compute PTC for current_epoch through current_epoch + MIN_SEED_LOOKAHEAD
-    # Previous epoch slot is empty (zeros)
-    current_epoch = int(pre.slot) // spe
-    ptc_size_val = None
+    # Initialize ptc_window. The spec defines initialize_ptc_window over the
+    # POST-upgrade state, so the "current_epoch" must be the Gloas fork epoch
+    # (the epoch we're transitioning into) — not pre.slot // SPE, which is
+    # still the pre-fork epoch because process_slots calls fork_upgrade BEFORE
+    # incrementing state.slot. Using the pre-fork epoch here makes us cache
+    # PTCs for epoch 0+1 while prysm caches epoch 1+2; the resulting state
+    # diverges by one epoch worth of PTCs and every block from slot 8 onward
+    # is invalid relative to peers.
+    current_epoch = epoch
     from ..constants import PTC_SIZE
     ptc_size_val = PTC_SIZE()
     empty_ptc = [ValidatorIndex(0)] * ptc_size_val
@@ -393,7 +397,7 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
         inactivity_scores=list(pre.inactivity_scores),
         current_sync_committee=pre.current_sync_committee,
         next_sync_committee=pre.next_sync_committee,
-        latest_execution_payload_bid=empty_bid,
+        latest_block_hash=Hash32(pre_header.block_hash),
         next_withdrawal_index=pre.next_withdrawal_index,
         next_withdrawal_validator_index=pre.next_withdrawal_validator_index,
         historical_summaries=list(pre.historical_summaries),
@@ -412,7 +416,7 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
         execution_payload_availability=availability,
         builder_pending_payments=[empty_pending_payment] * slots_2x_epoch,
         builder_pending_withdrawals=[],
-        latest_block_hash=Hash32(pre_header.block_hash),
+        latest_execution_payload_bid=empty_bid,
         payload_expected_withdrawals=[],
         ptc_window=ptc_window,
     )

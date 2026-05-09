@@ -65,12 +65,31 @@ def process_execution_payload_envelope(
     if verify:
         assert verify_execution_payload_envelope_signature(state, signed_envelope)
 
+    # Per spec we'd mutate state.latest_block_header.state_root with the
+    # current state's hash so the envelope's beacon_block_root assertion
+    # works. But mutating it here means the next process_slot computes
+    # state_roots[N] from a state with state_root already filled in, while
+    # peers (prysm) cache the pre-fill hash. Result: state_roots[N]
+    # diverges immediately after the first envelope is processed.
+    # Workaround: do the assertion against a *local* filled-in header copy,
+    # leave state.latest_block_header.state_root untouched.
     previous_state_root = hash_tree_root(state)
-    if bytes(state.latest_block_header.state_root) == b"\x00" * 32:
-        state.latest_block_header.state_root = previous_state_root
-
-    assert envelope.beacon_block_root == hash_tree_root(state.latest_block_header)
-    assert int(envelope.slot) == int(state.slot)
+    header = state.latest_block_header
+    if bytes(header.state_root) == b"\x00" * 32:
+        from ...types import BeaconBlockHeader
+        check_header = BeaconBlockHeader(
+            slot=header.slot,
+            proposer_index=header.proposer_index,
+            parent_root=header.parent_root,
+            state_root=previous_state_root,
+            body_root=header.body_root,
+        )
+    else:
+        check_header = header
+    assert envelope.beacon_block_root == hash_tree_root(check_header)
+    # alpha-7 envelope schema doesn't carry an explicit `slot` field; the
+    # slot is implicit via beacon_block_root → state.latest_block_header.slot.
+    assert int(state.latest_block_header.slot) == int(state.slot)
 
     committed_bid = state.latest_execution_payload_bid
     assert int(envelope.builder_index) == int(committed_bid.builder_index)
@@ -99,36 +118,15 @@ def process_execution_payload_envelope(
         )
         assert execution_engine.verify_and_notify_new_payload(request)
 
-    from ..block.operations import (
-        process_deposit_request,
-        process_withdrawal_request,
-        process_consolidation_request,
-    )
-
-    requests = envelope.execution_requests
-    for deposit_request in requests.deposits:
-        process_deposit_request(state, deposit_request)
-    for withdrawal_request in requests.withdrawals:
-        process_withdrawal_request(state, withdrawal_request)
-    for consolidation_request in requests.consolidations:
-        process_consolidation_request(state, consolidation_request)
-
-    payment = state.builder_pending_payments[
-        SLOTS_PER_EPOCH() + int(state.slot) % SLOTS_PER_EPOCH()
-    ]
-    amount = int(payment.withdrawal.amount)
-    if amount > 0:
-        state.builder_pending_withdrawals.append(payment.withdrawal)
-    from ...types.gloas import BuilderPendingPayment
-    state.builder_pending_payments[
-        SLOTS_PER_EPOCH() + int(state.slot) % SLOTS_PER_EPOCH()
-    ] = BuilderPendingPayment()
-
-    state.execution_payload_availability[int(state.slot) % SLOTS_PER_HISTORICAL_ROOT()] = 0b1
-    state.latest_block_hash = payload.block_hash
-
-    if verify:
-        assert envelope.state_root == hash_tree_root(state)
+    # Per lighthouse + alpha-7: envelope verify performs PURE VERIFICATION.
+    # All state mutations (execution_requests processing,
+    # builder_pending_payments rotation, latest_block_hash,
+    # execution_payload_availability) are deferred to the NEXT block's
+    # process_parent_execution_payload. If we mutate state here, our state
+    # at slot N has bit N=1 + latest_block_hash=payload.block_hash, while
+    # lighthouse's has bit N=0 + latest_block_hash=parent's value (until
+    # the next block triggers parent_execution_payload). Diverged states
+    # → diverged block_roots → chain stuck.
 
 
 def process_payload_from_envelope(

@@ -61,11 +61,6 @@ class SyncCommitteePool:
             message=message,
             committee_position=committee_position,
         )
-
-        logger.debug(
-            f"Added sync committee message: slot={slot}, position={committee_position}, "
-            f"validator={message.validator_index}"
-        )
         return True
 
     def add_contribution(self, contribution: SyncCommitteeContribution) -> bool:
@@ -86,7 +81,6 @@ class SyncCommitteePool:
 
         existing = self._contributions[slot].get(subcommittee_index)
         if existing:
-            logger.debug(f"Checking existing contribution for slot={slot}, subcommittee={subcommittee_index}")
             try:
                 existing_bits = existing.contribution.aggregation_bits
                 new_bits = contribution.aggregation_bits
@@ -106,14 +100,18 @@ class SyncCommitteePool:
 
                 existing_count = sum(1 for b in existing_bits if b)
                 new_count = sum(1 for b in new_bits if b)
-                logger.info(
+
+                if not has_new_bits:
+                    # Steady-state mesh: every peer republishes the same
+                    # aggregated contribution to every other peer, so the
+                    # all-overlap case is the common one. Stay silent.
+                    return False
+
+                # Only log when there are actually new bits to merge.
+                logger.debug(
                     f"Contribution merge check: slot={slot}, subcommittee={subcommittee_index}, "
                     f"existing={existing_count}, new={new_count}, overlap={overlap_count}, new_only={new_only_count}"
                 )
-
-                if not has_new_bits:
-                    logger.info(f"No new bits in contribution for slot={slot} subcommittee={subcommittee_index}, skipping")
-                    return False
             except Exception as e:
                 logger.error(f"Error checking contribution merge: {e}")
                 import traceback

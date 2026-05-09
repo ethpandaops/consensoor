@@ -256,20 +256,17 @@ class EngineAPIClient:
         forkchoice_state: ForkchoiceState,
         payload_attributes: Optional[dict] = None,
     ) -> ForkchoiceUpdateResponse:
-        """Update the forkchoice state (Electra/Prague — same attrs as V3).
+        """Update the forkchoice state (Amsterdam / Gloas).
 
-        Geth's V4 is Electra; the engine spec for V4 takes
-        {timestamp, prevRandao, suggestedFeeRecipient, withdrawals,
-        parentBeaconBlockRoot}. The CL builder layer may have already added
-        a `slotNumber` field for Gloas/PTC bookkeeping — strip it before
-        handing to geth or it errors with -38003 "Invalid payload attributes".
+        Per `execution-apis/src/engine/amsterdam.md`, `PayloadAttributesV4`
+        is `PayloadAttributesV3` plus a required `slotNumber` field. Strip
+        nothing — pass attrs through verbatim. (Earlier revisions stripped
+        `slotNumber` based on a misread; that produced a `PayloadAttributesV3`
+        shape and geth replied -38003 "Invalid payload attributes".)
         """
-        attrs = None
-        if payload_attributes:
-            attrs = {k: v for k, v in payload_attributes.items() if k != "slotNumber"}
         params = [
             forkchoice_state.to_dict(),
-            attrs,
+            payload_attributes,
         ]
 
         result = await self._call("engine_forkchoiceUpdatedV4", params)
@@ -323,15 +320,14 @@ class EngineAPIClient:
         logger.debug(f"forkchoice_updated: timestamp={timestamp}, fork={fork}")
 
         if fork == "gloas":
-            # In Gloas/ePBS the builder drives payload construction, not the
-            # CL via forkchoiceUpdated. Sending payloadAttributes through
-            # engine_forkchoiceUpdatedV4 makes geth respond with -38003
-            # "Invalid payload attributes". We still need to send the
-            # forkchoice state so geth tracks the head/safe/finalized hashes;
-            # we just drop the attrs.
-            if payload_attributes is not None:
-                logger.debug("Gloas: dropping payload_attributes from forkchoiceUpdated (builder owns payload)")
-            return await self.forkchoice_updated_v4(forkchoice_state, None)
+            # Self-build mode: WE are both proposer and builder, so we DO
+            # need a payload from the EL. forkchoiceUpdatedV4 with full
+            # PayloadAttributesV4 (incl. slotNumber) is the right call.
+            # Earlier revisions dropped attrs assuming "builder owns
+            # payload" — true for an external-builder PBS flow, but not for
+            # our self-build setup, and the drop meant we never received a
+            # payload_id and never proposed any block.
+            return await self.forkchoice_updated_v4(forkchoice_state, payload_attributes)
         if fork in ("fulu", "electra", "deneb"):
             return await self.forkchoice_updated_v3(forkchoice_state, payload_attributes)
         elif fork == "capella":
