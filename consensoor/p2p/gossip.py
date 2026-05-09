@@ -25,6 +25,7 @@ from .encoding import (
     SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_TOPIC,
     BLOB_SIDECAR_TOPIC_PREFIX,
     EXECUTION_PAYLOAD_TOPIC,
+    PAYLOAD_ATTESTATION_MESSAGE_TOPIC,
 )
 
 logger = logging.getLogger(__name__)
@@ -157,6 +158,15 @@ class BeaconGossip:
     def subscribe_execution_payloads(self, handler: MessageHandler) -> None:
         """Subscribe to execution payload envelope messages (GLOAS/ePBS)."""
         self._handlers[EXECUTION_PAYLOAD_TOPIC] = handler
+
+    def subscribe_payload_attestation_messages(self, handler: MessageHandler) -> None:
+        """Subscribe to PTC payload attestation message gossip (GLOAS/ePBS)."""
+        self._handlers[PAYLOAD_ATTESTATION_MESSAGE_TOPIC] = handler
+
+    async def publish_payload_attestation_message(self, message_ssz: bytes) -> None:
+        """Publish a PayloadAttestationMessage from one of our PTC validators."""
+        topic = get_topic_name(PAYLOAD_ATTESTATION_MESSAGE_TOPIC, self.fork_digest)
+        await self._host.publish(topic, message_ssz)
 
     def subscribe_blob_sidecars(self, handler: MessageHandler) -> None:
         """Subscribe to blob sidecar messages on all subnets."""

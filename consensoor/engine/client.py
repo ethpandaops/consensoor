@@ -560,6 +560,12 @@ class EngineAPIClient:
             result["blobGasUsed"] = hex(int(payload.blob_gas_used))
         if hasattr(payload, 'excess_blob_gas'):
             result["excessBlobGas"] = hex(int(payload.excess_blob_gas))
+        # Gloas/amsterdam fields — geth bal-devnet-6 rejects with
+        # "nil slotnumber post-amsterdam" if these are missing.
+        if hasattr(payload, 'slot_number'):
+            result["slotNumber"] = hex(int(payload.slot_number))
+        if hasattr(payload, 'block_access_list'):
+            result["blockAccessList"] = "0x" + bytes(payload.block_access_list).hex()
         return result
 
     async def __aenter__(self):

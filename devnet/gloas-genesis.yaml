@@ -10,7 +10,7 @@ participants:
     cl_image: consensoor:latest
 network_params:
   gloas_fork_epoch: 0
-  preset: minimal
+  preset: mainnet
 
 additional_services:
   - dora

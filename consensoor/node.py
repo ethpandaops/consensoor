@@ -176,6 +176,8 @@ class BeaconNode:
         self.beacon_gossip: Optional[BeaconGossip] = None
         self.attestation_pool = AttestationPool()
         self.sync_committee_pool = SyncCommitteePool()
+        from .payload_attestation_pool import PayloadAttestationPool
+        self.payload_attestation_pool = PayloadAttestationPool()
         self._attester_duties: dict[int, list] = {}  # epoch -> duties
         self._sync_committee_duties: dict[int, list] = {}  # validator_index -> committee positions
 
@@ -653,6 +655,7 @@ class BeaconNode:
             self.beacon_gossip.subscribe_sync_committee_contributions(self._on_p2p_sync_committee_contribution)
             self.beacon_gossip.subscribe_blob_sidecars(self._on_p2p_blob_sidecar)
             self.beacon_gossip.subscribe_execution_payloads(self._on_p2p_execution_payload)
+            self.beacon_gossip.subscribe_payload_attestation_messages(self._on_p2p_payload_attestation_message)
             self.beacon_gossip.set_status_provider(self._get_chain_status)
             self.beacon_gossip.set_block_provider(self._get_block_for_slot)
 
@@ -1188,11 +1191,7 @@ class BeaconNode:
                     self.state.latest_execution_payload_header.block_hash
                 )
 
-            # Finalized block hash - need the EXECUTION block hash, not beacon root
-            # The finalized_checkpoint.root is a beacon block root, but EL needs execution block hash
-            # For now, use zeros until finalization (which needs looking up the finalized block)
-            # In production, we'd look up the finalized beacon block and get its execution payload hash
-            finalized_hash = b"\x00" * 32
+            finalized_hash = self._resolve_finalized_block_hash() or b"\x00" * 32
             finalized_epoch = int(self.state.finalized_checkpoint.epoch)
 
             forkchoice_state = ForkchoiceState(
@@ -1766,6 +1765,7 @@ class BeaconNode:
         execution_payload_dict: dict,
         execution_requests: list,
         blobs_bundle: dict | None,
+        proposer_key=None,
     ) -> None:
         """Build and broadcast the SignedExecutionPayloadEnvelope for GLOAS self-build.
 
@@ -1833,10 +1833,22 @@ class BeaconNode:
             parent_beacon_block_root=Root(parent_beacon_block_root),
         )
 
-        g2_point_at_infinity = b"\xc0" + b"\x00" * 95
+        # Sign envelope with proposer key (self-build mode: builder_index ==
+        # SELF_BUILD, so verify_execution_payload_envelope_signature uses
+        # state.validators[proposer_index].pubkey).
+        from .spec.constants import DOMAIN_BEACON_BUILDER
+        from .spec.state_transition.helpers.domain import get_domain, compute_signing_root
+        from .crypto import sign as bls_sign
+        if proposer_key is None or getattr(proposer_key, "privkey", None) is None:
+            logger.warning("envelope publish: no proposer_key, signing with infinity")
+            envelope_signature = b"\xc0" + b"\x00" * 95
+        else:
+            domain = get_domain(self.state, DOMAIN_BEACON_BUILDER)
+            signing_root = compute_signing_root(envelope, domain)
+            envelope_signature = bls_sign(proposer_key.privkey, signing_root)
         signed_envelope = SignedExecutionPayloadEnvelope(
             message=envelope,
-            signature=BLSSignature(g2_point_at_infinity),
+            signature=BLSSignature(envelope_signature),
         )
 
         # Save by both envelope root and block root for API lookups
@@ -1893,6 +1905,7 @@ class BeaconNode:
             signed_block = await self.block_builder.build_block(
                 slot, proposer_key, execution_payload_dict,
                 blobs_bundle=payload_response.blobs_bundle,
+                execution_requests=el_execution_requests,
             )
             if signed_block is None:
                 logger.error("Failed to build block")
@@ -2086,7 +2099,7 @@ class BeaconNode:
                 try:
                     await self._broadcast_execution_payload_envelope(
                         slot, block_root, execution_payload_dict, el_execution_requests,
-                        payload_response.blobs_bundle
+                        payload_response.blobs_bundle, proposer_key,
                     )
                 except Exception as e:
                     logger.error(f"Failed to build/apply execution payload envelope: {e}")
@@ -2122,7 +2135,7 @@ class BeaconNode:
             forkchoice_state = ForkchoiceState(
                 head_block_hash=new_block_hash,
                 safe_block_hash=new_block_hash,
-                finalized_block_hash=b"\x00" * 32,  # Use zeros for now
+                finalized_block_hash=self._resolve_finalized_block_hash() or b"\x00" * 32,
             )
 
             fc_response = await self.engine.forkchoice_updated(forkchoice_state, timestamp=payload_timestamp)
@@ -2508,6 +2521,26 @@ class BeaconNode:
         except Exception as e:
             logger.error(f"Error processing P2P execution payload envelope: {e}")
 
+    async def _on_p2p_payload_attestation_message(self, data: bytes, from_peer: str) -> None:
+        """Handle a PayloadAttestationMessage from a PTC validator."""
+        if self.state is None:
+            return
+        try:
+            from .spec.types.gloas import PayloadAttestationMessage
+            from .spec.state_transition.helpers.ptc import get_ptc
+
+            msg = PayloadAttestationMessage.decode_bytes(data)
+            slot = int(msg.data.slot)
+            ptc = list(get_ptc(self.state, slot))
+            self.payload_attestation_pool.add_message(msg, ptc)
+            # Drop messages older than current_epoch's start.
+            current_slot = int(self.state.slot)
+            from .spec.constants import SLOTS_PER_EPOCH
+            keep_from = max(0, (current_slot // SLOTS_PER_EPOCH() - 1) * SLOTS_PER_EPOCH())
+            self.payload_attestation_pool.prune_before(keep_from)
+        except Exception as e:
+            logger.warning(f"P2P payload_attestation_message decode/handle failed: {e}")
+
     async def _on_p2p_blob_sidecar(self, data: bytes, from_peer: str) -> None:
         """Handle a blob sidecar received via libp2p gossipsub."""
         try:
@@ -2797,6 +2830,38 @@ class BeaconNode:
             f"[STATE_TX] fork={fork} from_slot={from_slot} to_slot={target_slot} "
             f"advance={slot_advance} elapsed_ms={elapsed_ms:.0f} (no_sig_verify)"
         )
+
+    def _resolve_finalized_block_hash(self) -> Optional[bytes]:
+        """Get the EL block_hash of the finalized beacon block, or None.
+
+        Walks state.finalized_checkpoint.root → store.get_block(...) →
+        body.signed_execution_payload_bid.message.block_hash (Gloas) or
+        body.execution_payload.block_hash (pre-Gloas). Returns None when
+        we don't have the finalized block (early in chain) or its
+        payload is empty/builder-deferred.
+        """
+        if self.state is None:
+            return None
+        ckpt = self.state.finalized_checkpoint
+        if int(ckpt.epoch) == 0:
+            return None
+        finalized_root = bytes(ckpt.root)
+        if finalized_root == b"\x00" * 32:
+            return None
+        signed_block = self.store.get_block(finalized_root)
+        if signed_block is None:
+            return None
+        block = signed_block.message if hasattr(signed_block, "message") else signed_block
+        body = block.body
+        if hasattr(body, "signed_execution_payload_bid"):
+            bh = bytes(body.signed_execution_payload_bid.message.block_hash)
+            if bh != b"\x00" * 32:
+                return bh
+            # Gloas builder-deferred: fall back to state's latest_block_hash.
+            return bytes(self.state.latest_block_hash)
+        if hasattr(body, "execution_payload"):
+            return bytes(body.execution_payload.block_hash)
+        return None
 
     def _envelope_slot(self, envelope) -> Optional[int]:
         """Derive the slot for an ExecutionPayloadEnvelope.
