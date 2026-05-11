@@ -52,7 +52,7 @@ def pytest_configure(config):
     do_set_preset(preset)
 
     from consensoor.spec.network_config import NetworkConfig, set_config
-    config_path = Path(__file__).parent.parent.parent.parent / "consensus-specs" / "configs" / f"{preset}.yaml"
+    config_path = Path(__file__).parent / "configs" / f"{preset}.yaml"
     if config_path.exists():
         net_config = NetworkConfig.from_yaml(config_path)
     elif preset == "minimal":

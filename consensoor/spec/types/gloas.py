@@ -5,7 +5,7 @@ Updated for v1.7.0-alpha.7.
 
 from .base import (
     Container, Vector, List,
-    Bitvector,
+    Bitvector, Bitlist,
     uint8, uint64, uint256, boolean,
     Bytes32, ByteVector, ByteList, BLSPubkey, BLSSignature,
     Slot, Epoch, ValidatorIndex, Gwei, Root, Hash32, ExecutionAddress,
@@ -73,6 +73,22 @@ class DataColumnSidecar(Container):
     index: uint64
     column: List[Cell, MAX_BLOB_COMMITMENTS_PER_BLOCK]
     kzg_proofs: List[KZGProof, MAX_BLOB_COMMITMENTS_PER_BLOCK]
+    slot: Slot
+    beacon_block_root: Root
+
+
+class PartialDataColumnSidecar(Container):
+    cells_present_bitmap: Bitlist[MAX_BLOB_COMMITMENTS_PER_BLOCK]
+    partial_column: List[Cell, MAX_BLOB_COMMITMENTS_PER_BLOCK]
+    kzg_proofs: List[KZGProof, MAX_BLOB_COMMITMENTS_PER_BLOCK]
+
+
+class PartialDataColumnPartsMetadata(Container):
+    available: Bitlist[MAX_BLOB_COMMITMENTS_PER_BLOCK]
+    requests: Bitlist[MAX_BLOB_COMMITMENTS_PER_BLOCK]
+
+
+class PartialDataColumnGroupID(Container):
     slot: Slot
     beacon_block_root: Root
 
