@@ -1261,11 +1261,20 @@ class TestForkChoiceCompliance:
                 try:
                     signed = _load_signed_block_pyspec(spec_mod, block_file)
                     spec_mod.on_block(store, signed)
-                    # Per spec: also feed each attestation in the block back via on_attestation
-                    for att in signed.message.body.attestations:
-                        spec_mod.on_attestation(store, att, is_from_block=True)
                     if not valid:
                         pytest.fail(f"{case_id} step {i}: block accepted but expected invalid")
+                    # Mirror upstream compliance runner: replay block's body attestations
+                    # and attester_slashings via on_*, silently skip individual failures.
+                    for block_att in signed.message.body.attestations:
+                        try:
+                            spec_mod.on_attestation(store, block_att, is_from_block=True)
+                        except AssertionError:
+                            pass
+                    for block_slash in signed.message.body.attester_slashings:
+                        try:
+                            spec_mod.on_attester_slashing(store, block_slash)
+                        except AssertionError:
+                            pass
                 except (AssertionError, Exception) as e:
                     if valid:
                         raise AssertionError(f"{case_id} step {i}: block rejected unexpectedly: {e}") from e
