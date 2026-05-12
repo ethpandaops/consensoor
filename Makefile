@@ -1,8 +1,10 @@
 # Consensoor Makefile
 
 SPEC_VERSION ?= nightly
+COMPTESTS_VERSION ?= nightly
 SPEC_TESTS_DIR := tests/spec-tests
 DOWNLOAD_REFTESTS := tests/download_reftests.sh
+DOWNLOAD_COMPTESTS := tests/download_comptests.sh
 
 VALID_PRESETS := minimal mainnet
 VALID_FORKS := phase0 altair bellatrix capella deneb electra fulu gloas
@@ -23,13 +25,15 @@ HAS_ALL := $(filter all,$(TEST_PARAMS))
 # Check for unknown params (not a preset, not a fork, not 'all')
 UNKNOWN_PARAMS := $(filter-out all $(VALID_PRESETS) $(VALID_FORKS),$(TEST_PARAMS))
 
-.PHONY:              \
-	docker           \
-	fetch-tests      \
-	help             \
-	test             \
-	all              \
-	$(VALID_PRESETS) \
+.PHONY:                \
+	docker             \
+	fetch-tests        \
+	fetch-comptests    \
+	help               \
+	test               \
+	test-compliance    \
+	all                \
+	$(VALID_PRESETS)   \
 	$(VALID_FORKS)
 
 # No-op targets so make doesn't error on preset/fork/all words
@@ -55,12 +59,21 @@ help:
 	@echo "  make test SPEC_VERSION=nightly-<run_id>    # Pin to run"
 	@echo "  make test SPEC_VERSION=v1.7.0-alpha.2      # Release tag"
 	@echo ""
+	@echo "Fork-choice compliance (pyspec-driven, fulu/gloas):"
+	@echo "  make test-compliance gloas       # Run gloas compliance cases"
+	@echo "  make test-compliance fulu        # Run fulu compliance cases"
+	@echo "  make fetch-comptests             # Download compliance fixtures"
+	@echo ""
 	@echo "Other targets:"
-	@echo "  make fetch-tests  # Download reference tests"
-	@echo "  make docker       # Build Docker image"
+	@echo "  make fetch-tests     # Download reference tests"
+	@echo "  make fetch-comptests # Download compliance reference tests"
+	@echo "  make docker          # Build Docker image"
 
 fetch-tests:
 	@$(DOWNLOAD_REFTESTS) "$(SPEC_TESTS_DIR)" "$(SPEC_VERSION)"
+
+fetch-comptests:
+	@$(DOWNLOAD_COMPTESTS) "$(SPEC_TESTS_DIR)" "$(COMPTESTS_VERSION)"
 
 test: CORES := $(or $(cores),auto)
 test: PRESET := $(or $(PARAM_PRESET),$(preset),minimal)
@@ -79,6 +92,21 @@ test: fetch-tests
 		--preset=$(PRESET)       \
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/$(PRESET) \
 		$(MAYBE_FORK)
+
+# Compliance tests are produced by the `comptests.yml` workflow and are
+# fork-choice only. Currently runs the pyspec reference implementation; not yet
+# wired to consensoor's runtime fork choice.
+test-compliance: CORES := $(or $(cores),auto)
+test-compliance: PRESET := minimal
+test-compliance: FORK := $(or $(PARAM_FORK),$(fork),gloas)
+test-compliance: fetch-comptests
+	@python3 -m pytest                                                  \
+		tests/spec/test_spec_runner.py::TestForkChoiceCompliance        \
+		--verbose                                                       \
+		--numprocesses $(CORES)                                         \
+		--preset=$(PRESET)                                              \
+		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/$(PRESET)              \
+		-k "$(FORK)"
 
 docker:
 	docker build -t consensoor:latest .
