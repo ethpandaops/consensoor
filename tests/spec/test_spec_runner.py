@@ -579,6 +579,44 @@ def discover_shuffling_tests(spec_tests_dir: Path):
     return test_cases
 
 
+def discover_fork_choice_compliance_tests(spec_tests_dir: Path):
+    """Discover all fork-choice compliance test cases.
+
+    Layout: <preset>/<fork>/fork_choice_compliance/<test_name>/pyspec_tests/<case>/{
+        steps.yaml, meta.yaml, anchor_block.ssz_snappy, anchor_state.ssz_snappy,
+        block_0x*.ssz_snappy, attestation_0x*.ssz_snappy,
+        payload_attestation_0x*.ssz_snappy,
+        execution_payload_envelope_0x*.ssz_snappy,
+        attester_slashing_0x*.ssz_snappy
+    }
+    """
+    supported_forks = {"fulu", "gloas"}
+    test_cases = []
+    for fork_dir in sorted(spec_tests_dir.iterdir()):
+        if not fork_dir.is_dir():
+            continue
+        fork = fork_dir.name
+        if fork not in supported_forks:
+            continue
+        fc_dir = fork_dir / "fork_choice_compliance"
+        if not fc_dir.exists():
+            continue
+        for test_name_dir in sorted(fc_dir.iterdir()):
+            if not test_name_dir.is_dir():
+                continue
+            pyspec_dir = test_name_dir / "pyspec_tests"
+            if not pyspec_dir.exists():
+                continue
+            for case_dir in sorted(pyspec_dir.iterdir()):
+                if not case_dir.is_dir():
+                    continue
+                if not (case_dir / "steps.yaml").exists():
+                    continue
+                case_id = f"{fork}/fork_choice_compliance/{test_name_dir.name}/{case_dir.name}"
+                test_cases.append((case_id, fork, test_name_dir.name, case_dir))
+    return test_cases
+
+
 def discover_random_tests(spec_tests_dir: Path):
     """Discover all random test cases."""
     supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas"}
@@ -662,6 +700,12 @@ def pytest_generate_tests(metafunc):
         if test_cases:
             ids = [tc[0] for tc in test_cases]
             metafunc.parametrize("random_case", test_cases, ids=ids)
+
+    if "compliance_case" in metafunc.fixturenames:
+        test_cases = discover_fork_choice_compliance_tests(spec_tests_dir)
+        if test_cases:
+            ids = [tc[0] for tc in test_cases]
+            metafunc.parametrize("compliance_case", test_cases, ids=ids)
 
 
 class TestSSZStatic:
@@ -1127,3 +1171,193 @@ class TestRewards:
 
             inactivity_rewards, inactivity_penalties = get_inactivity_penalty_deltas(pre_state)
             check_deltas("Inactivity", inactivity_rewards, inactivity_penalties, inactivity_penalty_deltas_file)
+
+
+def _pyspec_module(fork: str, preset: str):
+    """Return the pyspec module (eth-consensus-specs) for the given fork+preset.
+
+    Used by the fork-choice compliance runner. Returns None if pyspec is not
+    installed or doesn't carry this fork.
+    """
+    try:
+        import eth_consensus_specs  # noqa: F401
+    except ImportError:
+        return None
+    import importlib
+    try:
+        return importlib.import_module(f"eth_consensus_specs.{fork}.{preset}")
+    except ImportError:
+        return None
+
+
+def _load_signed_block_pyspec(spec_mod, path: Path):
+    with open(path, "rb") as f:
+        return spec_mod.SignedBeaconBlock.decode_bytes(snappy.decompress(f.read()))
+
+
+def _load_attestation_pyspec(spec_mod, path: Path):
+    with open(path, "rb") as f:
+        return spec_mod.Attestation.decode_bytes(snappy.decompress(f.read()))
+
+
+def _load_attester_slashing_pyspec(spec_mod, path: Path):
+    with open(path, "rb") as f:
+        return spec_mod.AttesterSlashing.decode_bytes(snappy.decompress(f.read()))
+
+
+def _load_payload_attestation_pyspec(spec_mod, path: Path):
+    with open(path, "rb") as f:
+        return spec_mod.PayloadAttestationMessage.decode_bytes(snappy.decompress(f.read()))
+
+
+def _load_signed_envelope_pyspec(spec_mod, path: Path):
+    with open(path, "rb") as f:
+        return spec_mod.SignedExecutionPayloadEnvelope.decode_bytes(snappy.decompress(f.read()))
+
+
+class TestForkChoiceCompliance:
+    """Fork-choice compliance tests (from `comptests.yml`).
+
+    Drives the pyspec reference fork-choice store with the recorded events.
+    This validates the compliance fixtures and the test infrastructure; it is
+    not yet wired to consensoor's runtime fork choice (consensoor does not yet
+    expose a spec-style Store with on_block/on_attestation/get_head).
+    """
+
+    def test_fork_choice_compliance(self, compliance_case, preset):
+        case_id, fork, test_name, case_path = compliance_case
+
+        spec_mod = _pyspec_module(fork, preset)
+        if spec_mod is None:
+            pytest.skip(f"pyspec module not available for {fork}/{preset}")
+
+        meta = load_yaml(case_path / "meta.yaml") or {}
+        bls_setting = int(meta.get("bls_setting", 0))
+        if bls_setting != 1:
+            from eth_consensus_specs.utils import bls as pyspec_bls
+            pyspec_bls.bls_active = False
+
+        steps = load_yaml(case_path / "steps.yaml")
+        if not steps:
+            pytest.skip(f"No steps for {case_id}")
+
+        with open(case_path / "anchor_state.ssz_snappy", "rb") as f:
+            anchor_state = spec_mod.BeaconState.decode_bytes(snappy.decompress(f.read()))
+        with open(case_path / "anchor_block.ssz_snappy", "rb") as f:
+            anchor_block = spec_mod.BeaconBlock.decode_bytes(snappy.decompress(f.read()))
+
+        store = spec_mod.get_forkchoice_store(anchor_state, anchor_block)
+
+        for i, step in enumerate(steps):
+            if not isinstance(step, dict):
+                pytest.fail(f"{case_id} step {i}: unexpected step shape {step!r}")
+
+            if "tick" in step:
+                spec_mod.on_tick(store, step["tick"])
+            elif "block" in step:
+                ref = step["block"]
+                valid = step.get("valid", True)
+                block_file = case_path / f"{ref}.ssz_snappy"
+                try:
+                    signed = _load_signed_block_pyspec(spec_mod, block_file)
+                    spec_mod.on_block(store, signed)
+                    # Per spec: also feed each attestation in the block back via on_attestation
+                    for att in signed.message.body.attestations:
+                        spec_mod.on_attestation(store, att, is_from_block=True)
+                    if not valid:
+                        pytest.fail(f"{case_id} step {i}: block accepted but expected invalid")
+                except (AssertionError, Exception) as e:
+                    if valid:
+                        raise AssertionError(f"{case_id} step {i}: block rejected unexpectedly: {e}") from e
+            elif "attestation" in step:
+                ref = step["attestation"]
+                valid = step.get("valid", True)
+                att_file = case_path / f"{ref}.ssz_snappy"
+                try:
+                    att = _load_attestation_pyspec(spec_mod, att_file)
+                    spec_mod.on_attestation(store, att, is_from_block=False)
+                    if not valid:
+                        pytest.fail(f"{case_id} step {i}: attestation accepted but expected invalid")
+                except (AssertionError, Exception) as e:
+                    if valid:
+                        raise AssertionError(f"{case_id} step {i}: attestation rejected unexpectedly: {e}") from e
+            elif "attester_slashing" in step:
+                ref = step["attester_slashing"]
+                valid = step.get("valid", True)
+                slashing_file = case_path / f"{ref}.ssz_snappy"
+                try:
+                    slashing = _load_attester_slashing_pyspec(spec_mod, slashing_file)
+                    spec_mod.on_attester_slashing(store, slashing)
+                    if not valid:
+                        pytest.fail(f"{case_id} step {i}: attester_slashing accepted but expected invalid")
+                except (AssertionError, Exception) as e:
+                    if valid:
+                        raise AssertionError(f"{case_id} step {i}: attester_slashing rejected unexpectedly: {e}") from e
+            elif "payload_attestation" in step:
+                ref = step["payload_attestation"]
+                valid = step.get("valid", True)
+                pa_file = case_path / f"{ref}.ssz_snappy"
+                try:
+                    pa = _load_payload_attestation_pyspec(spec_mod, pa_file)
+                    spec_mod.on_payload_attestation_message(store, pa, is_from_block=False)
+                    if not valid:
+                        pytest.fail(f"{case_id} step {i}: payload_attestation accepted but expected invalid")
+                except (AssertionError, Exception) as e:
+                    if valid:
+                        raise AssertionError(f"{case_id} step {i}: payload_attestation rejected unexpectedly: {e}") from e
+            elif "execution_payload" in step:
+                ref = step["execution_payload"]
+                valid = step.get("valid", True)
+                envelope_file = case_path / f"{ref}.ssz_snappy"
+                try:
+                    envelope = _load_signed_envelope_pyspec(spec_mod, envelope_file)
+                    spec_mod.on_execution_payload_envelope(store, envelope)
+                    if not valid:
+                        pytest.fail(f"{case_id} step {i}: execution_payload accepted but expected invalid")
+                except (AssertionError, Exception) as e:
+                    if valid:
+                        raise AssertionError(f"{case_id} step {i}: execution_payload rejected unexpectedly: {e}") from e
+            elif "checks" in step:
+                checks = step["checks"]
+                head_node = spec_mod.get_head(store)
+                if isinstance(head_node, tuple):
+                    head_root = bytes(head_node[0])
+                    head_payload_status = int(head_node[1]) if len(head_node) > 1 else None
+                else:
+                    head_root = bytes(getattr(head_node, "root", head_node))
+                    head_payload_status = int(getattr(head_node, "payload_status", 0))
+
+                if "head" in checks:
+                    expected_root = bytes.fromhex(checks["head"]["root"][2:])
+                    assert head_root == expected_root, \
+                        f"{case_id} step {i}: head root {head_root.hex()} != expected {expected_root.hex()}"
+                    expected_slot = int(checks["head"]["slot"])
+                    head_block = store.blocks[bytes(head_root)]
+                    assert int(head_block.slot) == expected_slot, \
+                        f"{case_id} step {i}: head slot {int(head_block.slot)} != expected {expected_slot}"
+
+                if "head_payload_status" in checks and head_payload_status is not None:
+                    expected_ps = int(checks["head_payload_status"])
+                    assert head_payload_status == expected_ps, \
+                        f"{case_id} step {i}: head_payload_status {head_payload_status} != expected {expected_ps}"
+
+                if "justified_checkpoint" in checks:
+                    jc = store.justified_checkpoint
+                    exp = checks["justified_checkpoint"]
+                    assert int(jc.epoch) == int(exp["epoch"]) and bytes(jc.root) == bytes.fromhex(exp["root"][2:]), \
+                        f"{case_id} step {i}: justified_checkpoint mismatch ({int(jc.epoch)},{bytes(jc.root).hex()}) vs ({exp['epoch']},{exp['root']})"
+
+                if "finalized_checkpoint" in checks:
+                    fc = store.finalized_checkpoint
+                    exp = checks["finalized_checkpoint"]
+                    assert int(fc.epoch) == int(exp["epoch"]) and bytes(fc.root) == bytes.fromhex(exp["root"][2:]), \
+                        f"{case_id} step {i}: finalized_checkpoint mismatch ({int(fc.epoch)},{bytes(fc.root).hex()}) vs ({exp['epoch']},{exp['root']})"
+
+                if "proposer_boost_root" in checks:
+                    expected_pbr = bytes.fromhex(checks["proposer_boost_root"][2:])
+                    actual_pbr = bytes(store.proposer_boost_root)
+                    assert actual_pbr == expected_pbr, \
+                        f"{case_id} step {i}: proposer_boost_root {actual_pbr.hex()} != expected {expected_pbr.hex()}"
+            else:
+                pytest.fail(f"{case_id} step {i}: unknown step verb in {step!r}")
+
