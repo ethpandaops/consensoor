@@ -3,6 +3,8 @@ set -Eeuo pipefail
 
 if [[ $# -lt 1 ]]; then
   echo "Usage: $0 <spec_tests_dir> [spec_version]"
+  echo "  spec_version: 'nightly', 'nightly-YYYY-MM-DD', 'nightly-<run_id>',"
+  echo "                or a release tag (e.g. v1.5.0)"
   exit 1
 fi
 
@@ -29,6 +31,21 @@ confirm_replace() {
 
 mkdir -p "${spec_tests_dir}"
 
+pinned_run_id=""
+nightly_date=""
+if [[ "${spec_version}" == nightly* && "${spec_version}" != "nightly" ]]; then
+  suffix="${spec_version#nightly-}"
+  if [[ "${suffix}" =~ ^[0-9]+$ ]]; then
+    pinned_run_id="${suffix}"
+  elif [[ "${suffix}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    nightly_date="${suffix}"
+  else
+    echo "Invalid nightly version: ${spec_version}"
+    echo "Expected 'nightly', 'nightly-YYYY-MM-DD', or 'nightly-<run_id>'"
+    exit 1
+  fi
+fi
+
 if [[ "${spec_version}" == nightly* ]]; then
   if [[ -z "${GITHUB_TOKEN:-}" ]]; then
     if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
@@ -41,37 +58,45 @@ if [[ "${spec_version}" == nightly* ]]; then
     fi
   fi
 
-  for cmd in curl jq unzip; do
+  for cmd in curl jq; do
     if ! command -v "${cmd}" >/dev/null 2>&1; then
       echo "Error: ${cmd} is not installed"
       exit 1
     fi
   done
 
-  repo="${CONSENSUS_SPECS_REPO:-ethereum/consensus-specs}"
-  workflow="${CONSENSUS_SPECS_WORKFLOW:-tests.yml}"
-  branch="${CONSENSUS_SPECS_BRANCH:-master}"
+  repo="${SPEC_REPO:-ethereum/consensus-specs}"
+  workflow="tests.yml"
+  branch="${SPEC_BRANCH:-master}"
   api="https://api.github.com"
   auth_header="Authorization: token ${GITHUB_TOKEN}"
 
-  if [[ "${spec_version}" == "nightly" ]]; then
-    run_id="$(curl -s -H "${auth_header}" \
-      "${api}/repos/${repo}/actions/workflows/${workflow}/runs?branch=${branch}&status=success&per_page=1" | \
-      jq -r '.workflow_runs[0].id')"
-
+  if [[ -n "${nightly_date}" ]]; then
+    run_json="$(curl -s -H "${auth_header}" \
+      "${api}/repos/${repo}/actions/workflows/${workflow}/runs?branch=${branch}&status=success&created=${nightly_date}&per_page=1")"
+    run_id="$(echo "${run_json}" | jq -r '.workflow_runs[0].id')"
     if [[ -z "${run_id}" || "${run_id}" == "null" ]]; then
-      echo "No successful nightly workflow run found for ${repo} (${workflow} on ${branch})"
+      echo "No successful nightly run found for ${repo} on ${nightly_date} (${workflow} on ${branch})"
       exit 1
     fi
-    expected_version="nightly-${run_id}"
+    echo "Resolved ${spec_version} to run ${run_id}"
+  elif [[ "${spec_version}" == "nightly" ]]; then
+    run_json="$(curl -s -H "${auth_header}" \
+      "${api}/repos/${repo}/actions/workflows/${workflow}/runs?branch=${branch}&status=success&per_page=1")"
+    run_id="$(echo "${run_json}" | jq -r '.workflow_runs[0].id')"
+    if [[ -z "${run_id}" || "${run_id}" == "null" ]]; then
+      echo "No successful nightly run found for ${repo} (${workflow} on ${branch})"
+      exit 1
+    fi
   else
-    run_id="${spec_version#nightly-}"
-    if [[ -z "${run_id}" || "${run_id}" == "${spec_version}" ]]; then
-      echo "Invalid nightly version: ${spec_version} (expected nightly-<run_id>)"
-      exit 1
-    fi
-    expected_version="${spec_version}"
+    run_id="${pinned_run_id}"
+    run_json="$(curl -sf -H "${auth_header}" \
+      "${api}/repos/${repo}/actions/runs/${run_id}")" || {
+        echo "Error: could not fetch run ${run_id}"
+        exit 1
+      }
   fi
+  expected_version="nightly-${run_id}"
 else
   expected_version="${spec_version}"
 fi
@@ -115,13 +140,12 @@ for preset in ${presets}; do
   artifact_name="${preset}.tar.gz"
 
   artifact_url="$(curl -s -H "${auth_header}" \
-    "${api}/repos/${repo}/actions/runs/${run_id}/artifacts" | \
-    jq -r --arg name "${artifact_name}" '.artifacts[] | select(.name == $name) | .archive_download_url' | \
-    head -n 1)"
+    "${api}/repos/${repo}/actions/runs/${run_id}/artifacts?name=${artifact_name}&per_page=1" | \
+    jq -r '.artifacts[0].archive_download_url')"
 
   if [[ -z "${artifact_url}" || "${artifact_url}" == "null" ]]; then
-    echo "Artifact not found: ${artifact_name} (run ${run_id})"
-    exit 1
+    echo "Skipping ${artifact_name} (not found in run ${run_id})"
+    continue
   fi
 
   tar_path="${spec_tests_dir}/${preset}.tar.gz"

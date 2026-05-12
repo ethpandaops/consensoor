@@ -197,7 +197,13 @@ make test fork=electra                 # Run electra tests (minimal)
 make test fork=electra preset=mainnet  # Run electra tests (mainnet)
 ```
 
-Tests download from consensus-specs releases and cache locally.
+Tests download from consensus-specs releases and cache locally. Specify with `SPEC_VERSION`:
+
+```bash
+make test SPEC_VERSION=nightly-2026-03-19           # last successful run for that date
+make test SPEC_VERSION=nightly-23467328019          # pin to a specific run
+make test SPEC_VERSION=v1.7.0-alpha.2               # release tag
+```
 
 ## Spec Forks
 
