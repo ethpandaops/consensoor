@@ -106,5 +106,27 @@ kurtosis service exec test cl-2-consensoor-geth -- curl -s http://localhost:4000
 kurtosis service exec test cl-1-lighthouse-geth -- curl -s http://localhost:4000/eth/v1/beacon/headers/head
 ```
 
+### Diagnosing state-transition divergence
+When logs show `STATE_ROOT_MISMATCH at slot=N ...` or a reorg replay
+fails with a `parent_root doesn't match expected` assertion, the chain
+is wedged on a state-transition bug — consensoor is computing a
+different post-state than the network's reference client. Don't try to
+bisect the transition by reading code.
+
+Use `debug_state_diff.py` (repo root). It pulls full state SSZ from two
+beacon-API endpoints, decodes with our Gloas types, and reports the
+top-level fields whose hash_tree_roots differ. Almost always narrows the
+bug to one field in a single run.
+
+```bash
+# Run from repo root
+python debug_state_diff.py 5 \
+    http://127.0.0.1:<consensoor-http-port> \
+    http://127.0.0.1:<lighthouse-http-port>
+```
+
+Get the host ports from `kurtosis enclave inspect <enclave>` (look at
+the `http:` line under each `cl-N-*-geth` service).
+
 ### Related Plan File
 A plan file exists at `~/.claude/plans/expressive-enchanting-boole.md` describing HTTP Beacon API sync approach, but user rejected checkpoint sync. The state sync manager (`beacon_sync/sync.py`) is used for initial state only.

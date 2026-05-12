@@ -197,13 +197,54 @@ class BlockBuilder:
         )
 
         # Pre-validate attestations before including in block
-        # This catches attestations from forked chains that would fail BLS verification
-        from ..spec.state_transition.helpers.attestation import get_indexed_attestation
+        # This catches attestations from forked chains that would fail BLS verification.
+        # Per phase0/validator.md: gather aggregates from validators "whose signatures
+        # from the same epoch have not previously been added on chain". Altair makes
+        # this concrete: process_attestation only rewards the proposer for participation
+        # flag bits that transition 0 → 1. An attestation whose attesting indices already
+        # have all relevant flags set in state.{current,previous}_epoch_participation is
+        # pure waste — zero proposer reward, full BLS verify + block-space cost.
+        from ..spec.state_transition.helpers.attestation import (
+            get_indexed_attestation,
+            get_attesting_indices,
+            get_attestation_participation_flag_indices,
+            has_flag,
+        )
         from ..spec.state_transition.helpers.predicates import is_valid_indexed_attestation
+        from ..spec.state_transition.helpers.accessors import get_current_epoch
 
         valid_attestations = []
+        skipped_already_included = 0
+        has_participation_flags = hasattr(temp_state, "previous_epoch_participation")
+        current_epoch_for_state = get_current_epoch(temp_state) if has_participation_flags else None
         for att in pool_attestations:
             try:
+                if has_participation_flags:
+                    data = att.data
+                    inclusion_delay = int(temp_state.slot) - int(data.slot)
+                    flag_indices = get_attestation_participation_flag_indices(
+                        temp_state, data, inclusion_delay
+                    )
+                    if not flag_indices:
+                        skipped_already_included += 1
+                        continue
+                    if int(data.target.epoch) == current_epoch_for_state:
+                        epoch_participation = temp_state.current_epoch_participation
+                    else:
+                        epoch_participation = temp_state.previous_epoch_participation
+                    has_new_bit = False
+                    for idx in get_attesting_indices(temp_state, att):
+                        flags = int(epoch_participation[idx])
+                        for fi in flag_indices:
+                            if not has_flag(flags, fi):
+                                has_new_bit = True
+                                break
+                        if has_new_bit:
+                            break
+                    if not has_new_bit:
+                        skipped_already_included += 1
+                        continue
+
                 indexed = get_indexed_attestation(temp_state, att)
                 if is_valid_indexed_attestation(temp_state, indexed):
                     valid_attestations.append(att)
@@ -213,6 +254,11 @@ class BlockBuilder:
                     logger.debug(f"Skipping invalid attestation: slot={att.data.slot}")
             except Exception as e:
                 logger.debug(f"Error validating attestation: {e}")
+        if skipped_already_included:
+            logger.info(
+                f"Skipped {skipped_already_included} already-on-chain attestations "
+                f"(participation flags already set)"
+            )
 
         attestations = valid_attestations
         logger.info(f"Pre-validated {len(attestations)} of {len(pool_attestations)} attestations")

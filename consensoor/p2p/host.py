@@ -111,6 +111,29 @@ class P2PHost:
     def set_status_provider(self, provider: Callable[[], dict]) -> None:
         self._status_provider = provider
 
+    def push_status_snapshot(self, status: dict) -> None:
+        """Install a StatusMessage snapshot in the Rust binding so inbound
+        Status RPCs are answered without crossing into Python. Should be
+        invoked whenever head_root / head_slot / finalized_checkpoint
+        changes — see the rationale in network.rs (cached_status field).
+        """
+        if self._network is None:
+            return
+        try:
+            import consensoor_p2p as cp
+            fork_digest = bytes(status.get("fork_digest", self.config.fork_digest))
+            msg = cp.StatusMessage(
+                fork_digest=list(fork_digest),
+                finalized_root=list(bytes(status.get("finalized_root", b"\x00" * 32))),
+                finalized_epoch=int(status.get("finalized_epoch", 0)),
+                head_root=list(bytes(status.get("head_root", b"\x00" * 32))),
+                head_slot=int(status.get("head_slot", 0)),
+                earliest_available_slot=int(status.get("earliest_available_slot", 0)),
+            )
+            self._network.set_cached_status(msg)
+        except Exception as e:
+            logger.warning(f"push_status_snapshot failed: {e}")
+
     def update_fork_digest(self, fork_digest: bytes) -> None:
         self.config.fork_digest = fork_digest
         if self._network is not None:

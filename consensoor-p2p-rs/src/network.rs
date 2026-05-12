@@ -260,6 +260,12 @@ pub struct Network {
     /// Cached for ENR rebuilds.
     cfg: Arc<Mutex<NetworkConfig>>,
     tcp_port: u16,
+    /// Latest StatusMessage snapshot pushed from Python. When `Some`, the
+    /// swarm task answers inbound Status RPC requests immediately from this
+    /// cache, avoiding the round-trip into Python (which can stall multiple
+    /// seconds behind the GIL during state_transition / BLS verification —
+    /// long enough to blow prysm's 5s ttfbTimeout and earn a downscore).
+    cached_status: Arc<Mutex<Option<StatusMessage>>>,
 }
 
 #[pymethods]
@@ -341,6 +347,9 @@ impl Network {
         let connected_peers = Arc::new(Mutex::new(HashMap::<String, &'static str>::new()));
         let connected_peers_clone = connected_peers.clone();
 
+        let cached_status: Arc<Mutex<Option<StatusMessage>>> = Arc::new(Mutex::new(None));
+        let cached_status_swarm = cached_status.clone();
+
         let runtime_clone = runtime.clone();
         let discv5_local_enr = initial_enr.clone();
         runtime_clone.spawn(async move {
@@ -362,6 +371,7 @@ impl Network {
                 discv5_enr_key,
                 bootnode_enrs,
                 tcp_port,
+                cached_status_swarm,
             )
             .await
             {
@@ -386,6 +396,7 @@ impl Network {
             enr_seq: Arc::new(Mutex::new(1)),
             cfg: Arc::new(Mutex::new(config)),
             tcp_port,
+            cached_status,
         })
     }
 
@@ -500,6 +511,21 @@ impl Network {
                 status,
             })
             .map_err(|e| PyRuntimeError::new_err(format!("answer_status: {e}")))
+    }
+
+    /// Install a StatusMessage snapshot the swarm task will use to answer
+    /// inbound Status RPC requests directly, without notifying Python. The
+    /// caller should refresh this whenever head_root / head_slot /
+    /// finalized_checkpoint changes. As long as a snapshot is present,
+    /// inbound Status responses are not subject to Python GIL pauses.
+    pub fn set_cached_status(&self, status: StatusMessage) {
+        *self.cached_status.lock() = Some(status);
+    }
+
+    /// Drop the cached StatusMessage. Inbound Status requests revert to the
+    /// Python responder path via `next_status` / `answer_status`.
+    pub fn clear_cached_status(&self) {
+        *self.cached_status.lock() = None;
     }
 
     pub fn send_ping(&self, peer: String, ping: PingMessage) -> PyResult<()> {
@@ -736,6 +762,7 @@ async fn run_swarm(
     discv5_enr_key: CombinedKey,
     bootnode_enrs: Vec<Enr<CombinedKey>>,
     udp_port: u16,
+    cached_status: Arc<Mutex<Option<StatusMessage>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let local_peer_id = key.public().to_peer_id();
 
@@ -954,13 +981,76 @@ async fn run_swarm(
                         .await;
                 }
                 SwarmEvent::Behaviour(Eth2BehaviourEvent::Status(rr_event)) => {
-                    handle_symmetric_rpc_event(
-                        rr_event,
-                        &status_tx,
-                        &mut pending_status,
-                        &mut next_response_id,
-                        |peer, kind, msg, err| StatusEvent { peer, kind, message: msg, error: err },
-                    ).await;
+                    use request_response::{Event as RrEvent, Message as RrMessage};
+                    match rr_event {
+                        RrEvent::Message { peer, message, .. } => match message {
+                            RrMessage::Request { request, channel, .. } => {
+                                // Auto-respond from the Python-pushed snapshot so the
+                                // GIL is never on the critical path of a Status reply.
+                                let cached = cached_status.lock().clone();
+                                match cached {
+                                    Some(msg) => {
+                                        if swarm
+                                            .behaviour_mut()
+                                            .status
+                                            .send_response(channel, msg)
+                                            .is_err()
+                                        {
+                                            tracing::warn!(
+                                                "auto-respond status: send_response failed for {peer}"
+                                            );
+                                        }
+                                    }
+                                    None => {
+                                        // No snapshot installed yet — fall back to the
+                                        // Python responder (next_status / answer_status).
+                                        let id = next_response_id;
+                                        next_response_id = next_response_id.wrapping_add(1);
+                                        pending_status.insert(id, channel);
+                                        let _ = status_tx
+                                            .send(StatusEvent {
+                                                peer: peer.to_string(),
+                                                kind: format!("request:{id}"),
+                                                message: Some(request),
+                                                error: None,
+                                            })
+                                            .await;
+                                    }
+                                }
+                            }
+                            RrMessage::Response { response, .. } => {
+                                let _ = status_tx
+                                    .send(StatusEvent {
+                                        peer: peer.to_string(),
+                                        kind: "response".into(),
+                                        message: Some(response),
+                                        error: None,
+                                    })
+                                    .await;
+                            }
+                        },
+                        RrEvent::OutboundFailure { peer, error, .. } => {
+                            let _ = status_tx
+                                .send(StatusEvent {
+                                    peer: peer.to_string(),
+                                    kind: "failure".into(),
+                                    message: None,
+                                    error: Some(format!("{error}")),
+                                })
+                                .await;
+                        }
+                        RrEvent::InboundFailure { peer, error, .. } => {
+                            let _ = status_tx
+                                .send(StatusEvent {
+                                    peer: peer.to_string(),
+                                    kind: "failure".into(),
+                                    message: None,
+                                    error: Some(format!("{error}")),
+                                })
+                                .await;
+                        }
+                        RrEvent::ResponseSent { .. } => {}
+                    }
                 }
                 SwarmEvent::Behaviour(Eth2BehaviourEvent::Eth2Ping(rr_event)) => {
                     handle_symmetric_rpc_event(

@@ -345,8 +345,27 @@ class Store:
             logger.debug(f"Failed to persist payload to LevelDB: {e}")
 
     def get_payload(self, root: bytes) -> Optional[object]:
-        """Get an execution payload envelope by root."""
-        return self._payload_cache.get(root)
+        """Get an execution payload envelope by root.
+
+        Falls back to LevelDB when the in-memory cache (128 entries) has
+        evicted the entry — otherwise the indexer / beacon API returns 404
+        for any slot more than ~128 blocks old.
+        """
+        cached = self._payload_cache.get(root)
+        if cached is not None:
+            return cached
+
+        try:
+            data = self._db.get(PREFIX_PAYLOAD + root)
+            if data:
+                from ..spec.types.gloas import SignedExecutionPayloadEnvelope
+                envelope = SignedExecutionPayloadEnvelope.decode_bytes(data)
+                self._payload_cache[root] = envelope
+                return envelope
+        except Exception as e:
+            logger.warning(f"Failed to load payload from LevelDB: {e}")
+
+        return None
 
     def save_bid(self, slot: int, bid: object) -> None:
         """Save an execution payload bid by slot."""

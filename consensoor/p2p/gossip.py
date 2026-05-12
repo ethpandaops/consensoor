@@ -271,6 +271,12 @@ class BeaconGossip:
         """
         self._host.set_status_provider(provider)
 
+    def push_status_snapshot(self, status: dict) -> None:
+        """Install a StatusMessage snapshot in the Rust binding so inbound
+        Status RPCs are answered immediately without crossing into Python.
+        Call this whenever head/finalized state changes."""
+        self._host.push_status_snapshot(status)
+
     def set_block_provider(self, provider: Callable[[int], Optional[tuple[bytes, bytes]]]) -> None:
         """Set the block provider callback for serving blocks via req/resp.
 

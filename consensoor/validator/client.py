@@ -3,7 +3,12 @@
 import logging
 from typing import Optional
 
-from ..spec.constants import SLOTS_PER_EPOCH, DOMAIN_BEACON_ATTESTER, DOMAIN_SYNC_COMMITTEE
+from ..spec.constants import (
+    SLOTS_PER_EPOCH,
+    DOMAIN_BEACON_ATTESTER,
+    DOMAIN_SYNC_COMMITTEE,
+    DOMAIN_PTC_ATTESTER,
+)
 from ..spec.state_transition.helpers.beacon_committee import (
     get_beacon_committee,
     get_committee_count_per_slot,
@@ -18,6 +23,10 @@ from ..spec.types import AttestationData
 from ..spec.types.phase0 import Phase0Attestation
 from ..spec.types.electra import Attestation as ElectraAttestation
 from ..spec.types.altair import SyncCommitteeMessage
+from ..spec.types.gloas import (
+    PayloadAttestationData,
+    PayloadAttestationMessage,
+)
 from ..spec.types.base import Checkpoint, Bitlist, Bitvector
 from ..spec.constants import MAX_VALIDATORS_PER_COMMITTEE, MAX_COMMITTEES_PER_SLOT
 
@@ -338,6 +347,52 @@ class ValidatorClient:
 
         except Exception as e:
             logger.error(f"Failed to produce sync committee message: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+
+    async def produce_payload_attestation_message(
+        self,
+        state,
+        slot: int,
+        validator_key: ValidatorKey,
+        beacon_block_root: bytes,
+        payload_present: bool,
+        blob_data_available: bool,
+    ) -> Optional[PayloadAttestationMessage]:
+        """Produce a PTC payload attestation message for one of our validators.
+
+        PTC members at slot M sign `PayloadAttestationData{beacon_block_root,
+        slot=M, payload_present, blob_data_available}` near the 75% slot mark
+        and gossip it. The proposer of slot M+1 includes the aggregate in
+        its block body (`block.body.payload_attestations`).
+
+        Domain is computed for the epoch of `slot` (the slot whose payload
+        is being voted on).
+        """
+        try:
+            if validator_key.validator_index is None:
+                return None
+
+            data = PayloadAttestationData(
+                beacon_block_root=beacon_block_root,
+                slot=slot,
+                payload_present=payload_present,
+                blob_data_available=blob_data_available,
+            )
+            epoch = compute_epoch_at_slot(slot)
+            domain = get_domain(state, DOMAIN_PTC_ATTESTER, epoch)
+            signing_root = compute_signing_root(data, domain)
+            signature = await bls_sign_async(validator_key.privkey, signing_root)
+
+            return PayloadAttestationMessage(
+                validator_index=validator_key.validator_index,
+                data=data,
+                signature=signature,
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to produce payload attestation message: {e}")
             import traceback
             traceback.print_exc()
             return None

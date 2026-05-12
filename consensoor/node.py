@@ -356,21 +356,14 @@ class BeaconNode:
         # `get_genesis_block(state) = SignedBeaconBlock(message=BeaconBlock(
         #     state_root=hash_tree_root(state)))`
         # — i.e. all body / header fields default and state_root = state hash.
-        # We MUST hash the synthetic empty block ourselves rather than reuse
-        # state.latest_block_header.body_root: kurtosis's eth-beacon-genesis
-        # stores the hash of an empty *body* there too, but if its dynssz
-        # schema disagrees with our remerkleable schema by a single field
-        # (e.g. PTC bitvector size, KZG commitment limits) the values
-        # diverge and our head_root won't match prysm's. Always compute
-        # head_root = hash_tree_root(BeaconBlock(state_root=..., body=defaults)).
-        genesis_state_root = hash_tree_root(self.state)
         self.head_slot = int(self.state.slot)
         self._genesis_time = int(self.state.genesis_time)
         header = self.state.latest_block_header  # used below for parent_root etc.
-        logger.info(f"Computed genesis state root: {genesis_state_root.hex()}")
 
-        # Build the synthetic genesis block (defaults) and use ITS hash for
-        # head_root — see comment above.
+        # Build the synthetic genesis BODY FIRST. We later use its hash both as
+        # the genesis block's body_root and as a patch for
+        # state.latest_block_header.body_root — see body_root reconciliation
+        # below.
         if detected_fork == "gloas":
             from .spec.types.gloas import (
                 BeaconBlockBody as GloasBeaconBlockBody,
@@ -407,17 +400,6 @@ class BeaconNode:
             genesis_body = GloasBeaconBlockBody(
                 signed_execution_payload_bid=genesis_signed_bid,
             )
-            genesis_block = GloasBeaconBlock(
-                slot=int(header.slot),
-                proposer_index=int(header.proposer_index),
-                parent_root=header.parent_root,
-                state_root=genesis_state_root,
-                body=genesis_body,
-            )
-            signed_genesis_block = SignedGloasBeaconBlock(
-                message=genesis_block,
-                signature=BLSSignature(b'\x00' * 96),
-            )
         else:
             genesis_body = ElectraBeaconBlockBody(
                 randao_reveal=BLSSignature(b'\x00' * 96),
@@ -434,6 +416,53 @@ class BeaconNode:
                 blob_kzg_commitments=[],
                 execution_requests=ExecutionRequests(),
             )
+
+        # Reconcile state.latest_block_header.body_root with our synthetic body
+        # BEFORE computing genesis_state_root.
+        #
+        # Why: process_slot for slot 0 (executed during any from-genesis state
+        # replay, including reorgs) computes
+        #   previous_block_root = hash_tree_root(state.latest_block_header)
+        # using whatever body_root is stored in the state. Peer-built blocks
+        # at slot 1 have parent_root == HTR(synthetic_genesis_block), which
+        # equals HTR(BeaconBlockHeader{..., body_root=HTR(synthetic_body)}).
+        # If eth-beacon-genesis wrote a different body_root into the state
+        # (e.g. the spec-default empty body, or a dynssz schema variant),
+        # those two roots diverge and process_block_header asserts on
+        # block 1: "Block parent root X doesn't match expected Y". Lighthouse
+        # avoids the divergence by patching the state in-memory before use;
+        # we do the same.
+        synthetic_body_root = hash_tree_root(genesis_body)
+        existing_body_root = bytes(self.state.latest_block_header.body_root)
+        if existing_body_root != synthetic_body_root:
+            logger.warning(
+                f"Patching genesis latest_block_header.body_root: "
+                f"state={existing_body_root.hex()[:16]} -> "
+                f"synthetic={synthetic_body_root.hex()[:16]} "
+                f"(eth-beacon-genesis body shape differs from our synthetic "
+                f"body; this realigns process_slot with peer genesis_block_root)"
+            )
+            self.state.latest_block_header.body_root = synthetic_body_root
+            # `header` was captured before the mutation; refresh so the
+            # genesis_block we build below sees the patched body_root.
+            header = self.state.latest_block_header
+
+        genesis_state_root = hash_tree_root(self.state)
+        logger.info(f"Computed genesis state root: {genesis_state_root.hex()}")
+
+        if detected_fork == "gloas":
+            genesis_block = GloasBeaconBlock(
+                slot=int(header.slot),
+                proposer_index=int(header.proposer_index),
+                parent_root=header.parent_root,
+                state_root=genesis_state_root,
+                body=genesis_body,
+            )
+            signed_genesis_block = SignedGloasBeaconBlock(
+                message=genesis_block,
+                signature=BLSSignature(b'\x00' * 96),
+            )
+        else:
             genesis_block = ElectraBeaconBlock(
                 slot=int(header.slot),
                 proposer_index=int(header.proposer_index),
@@ -662,6 +691,8 @@ class BeaconNode:
             await self.beacon_gossip.start()
             await self.beacon_gossip.activate_subscriptions()
 
+            self._push_status_snapshot()
+
             logger.info(
                 f"P2P gossipsub started: peer_id={self.beacon_gossip.peer_id}, "
                 f"fork_digest={self.beacon_gossip.fork_digest.hex()}"
@@ -673,6 +704,18 @@ class BeaconNode:
         except Exception as e:
             logger.error(f"Failed to start P2P: {e}")
             self.beacon_gossip = None
+
+    def _push_status_snapshot(self) -> None:
+        """Refresh the Rust binding's cached StatusMessage so inbound Status
+        RPCs are answered without crossing into Python. Call after any head
+        or finalized checkpoint change. Cheap — must not raise.
+        """
+        if self.beacon_gossip is None:
+            return
+        try:
+            self.beacon_gossip.push_status_snapshot(self._get_chain_status())
+        except Exception as e:
+            logger.warning(f"push_status_snapshot failed: {e}")
 
     def _get_chain_status(self) -> dict:
         """Get current chain status for P2P status messages.
@@ -1061,6 +1104,7 @@ class BeaconNode:
 
         last_slot_processed = -1
         last_attestation_slot = -1
+        last_ptc_slot = -1
 
         while self._running:
             try:
@@ -1075,6 +1119,8 @@ class BeaconNode:
 
                 # Get attestation timing based on active fork (Gloas has different timing)
                 attestation_offset = network_config.get_attestation_due_offset(current_epoch)
+                ptc_offset = network_config.get_payload_attestation_due_offset()
+                gloas_active = network_config.is_gloas_active(current_epoch)
 
                 # Phase 1: Slot start - propose blocks and update forkchoice
                 if current_slot > last_slot_processed:
@@ -1092,15 +1138,33 @@ class BeaconNode:
                     last_attestation_slot = current_slot
                     await self._produce_attestations(current_slot)
 
+                # Phase 3: PTC due time (Gloas) - produce payload attestations
+                # Vote on whether slot M's execution payload was revealed in
+                # time. Aggregates are bundled by the slot M+1 proposer.
+                if (
+                    gloas_active
+                    and current_slot > last_ptc_slot
+                    and time_into_slot >= ptc_offset
+                ):
+                    last_ptc_slot = current_slot
+                    await self._produce_payload_attestations(current_slot)
+
                 # Calculate sleep time - wake up for next event
-                if current_slot == last_attestation_slot:
-                    # Already attested this slot, sleep until next slot
+                attested_this_slot = current_slot == last_attestation_slot
+                ptc_done_this_slot = (not gloas_active) or current_slot == last_ptc_slot
+
+                if attested_this_slot and ptc_done_this_slot:
+                    # All slot duties done, sleep until next slot
                     next_slot_time = self._genesis_time + (current_slot + 1) * slot_duration
                     sleep_time = max(0.05, next_slot_time - time.time())
-                else:
-                    # Need to attest this slot, sleep until attestation due time
+                elif not attested_this_slot:
+                    # Next wakeup: attestation due time
                     attestation_time = slot_start_time + attestation_offset
                     sleep_time = max(0.05, attestation_time - time.time())
+                else:
+                    # Next wakeup: PTC due time
+                    ptc_time = slot_start_time + ptc_offset
+                    sleep_time = max(0.05, ptc_time - time.time())
 
                 await asyncio.sleep(sleep_time)
             except asyncio.CancelledError:
@@ -1264,7 +1328,14 @@ class BeaconNode:
                 "withdrawals": withdrawals_list,
                 "parentBeaconBlockRoot": "0x" + (self.head_root or b"\x00" * 32).hex(),
             }
-            if hasattr(self.state, "ptc_window"):
+            # Gate slotNumber on the NEXT slot's fork, not the current state's.
+            # The engine routes to FCU v4 by timestamp (see engine/client.py
+            # _get_fork_for_timestamp); if we keyed off `state.ptc_window`
+            # instead, we'd skip slotNumber whenever state lags behind the
+            # wall-clock fork epoch — geth then rejects with -38003
+            # "missing slot number".
+            gloas_fork_epoch = getattr(network_config, "gloas_fork_epoch", None)
+            if gloas_fork_epoch is not None and next_slot // SLOTS_PER_EPOCH() >= gloas_fork_epoch:
                 payload_attributes["slotNumber"] = hex(int(next_slot))
 
             response = await self.engine.forkchoice_updated(
@@ -1535,6 +1606,107 @@ class BeaconNode:
                 f"{sorted(produced_positions)} "
                 f"block_root={block_root_hex} "
                 f"pool_size={self.sync_committee_pool.size}"
+            )
+
+    async def _produce_payload_attestations(self, slot: int) -> None:
+        """Produce PTC payload attestations at the 75% slot mark (Gloas).
+
+        For each of our validators in the PTC for `slot`, sign a
+        PayloadAttestationMessage voting on whether the block at `slot` was
+        proposed in time and whether its execution payload envelope was
+        revealed before the deadline. The aggregated attestation is bundled
+        by the proposer of slot+1.
+
+        Self-feeds the local pool so a consensoor-proposed slot+1 doesn't
+        depend on gossip echo to include our own votes.
+        """
+        if not self.state or not self.validator_client or not self.beacon_gossip:
+            return
+        if not self._is_synced():
+            return
+
+        from .spec.state_transition.helpers.ptc import get_ptc
+        from .spec.types.gloas import PayloadAttestationMessage
+
+        try:
+            ptc = list(get_ptc(self.state, slot))
+        except Exception as e:
+            logger.warning(f"PTC computation failed for slot {slot}: {e}")
+            return
+        if not ptc:
+            return
+
+        our_indices = {
+            k.validator_index for k in self.validator_client.keys.values()
+            if k.validator_index is not None
+        }
+        our_in_ptc = [vi for vi in ptc if vi in our_indices]
+        if not our_in_ptc:
+            return
+
+        # The PTC for slot M votes on the block at slot M. If we don't have
+        # a block at slot M yet (skipped, late, or unreceived), abstain —
+        # an aggregate built around a wrong beacon_block_root will fail the
+        # process_payload_attestation assertion at inclusion time.
+        if int(self.head_slot) != int(slot) or self.head_root is None:
+            logger.debug(
+                f"PTC slot={slot}: abstaining, head_slot={self.head_slot} "
+                f"head_root={self.head_root.hex()[:16] if self.head_root else None} "
+                f"({len(our_in_ptc)} of our validators in PTC)"
+            )
+            return
+
+        beacon_block_root = self.head_root
+        payload_present = self.store.get_payload(beacon_block_root) is not None
+        # Conservative: only assert blob_data_available when we also have
+        # the envelope. A finer check would compare blob count to
+        # bid.blob_kzg_commitments — left for a follow-up.
+        blob_data_available = payload_present
+
+        produced: list[int] = []
+        for validator_index in our_in_ptc:
+            key = next(
+                (k for k in self.validator_client.keys.values()
+                 if k.validator_index == validator_index),
+                None,
+            )
+            if key is None:
+                continue
+            msg = await self.validator_client.produce_payload_attestation_message(
+                self.state,
+                slot,
+                key,
+                beacon_block_root,
+                payload_present,
+                blob_data_available,
+            )
+            if msg is None:
+                continue
+
+            # Self-feed: next consensoor proposer at slot+1 can include us
+            # without round-tripping our vote through gossip.
+            try:
+                self.payload_attestation_pool.add_message(msg, ptc)
+            except Exception as e:
+                logger.warning(f"PTC self-feed failed for vi={validator_index}: {e}")
+
+            try:
+                ssz_bytes = msg.encode_bytes()
+                await self.beacon_gossip.publish_payload_attestation_message(ssz_bytes)
+            except Exception as e:
+                logger.warning(
+                    f"PTC gossip publish failed for vi={validator_index}: {e}"
+                )
+
+            produced.append(int(validator_index))
+
+        if produced:
+            logger.info(
+                f"PTC votes: slot={slot} "
+                f"validators({len(produced)})={sorted(produced)} "
+                f"block_root={beacon_block_root.hex()[:16]} "
+                f"payload_present={payload_present} "
+                f"blob_data_available={blob_data_available}"
             )
 
     async def _broadcast_sync_committee_contributions(self, slot: int, state) -> None:
@@ -2121,6 +2293,7 @@ class BeaconNode:
             self.head_slot = slot
             self.head_root = block_root
             self.store.set_head(block_root)
+            self._push_status_snapshot()
 
             # Update metrics
             from .spec import constants
@@ -2392,6 +2565,7 @@ class BeaconNode:
                     self.head_slot = int(block.slot)
                     self.head_root = block_root
                     self.store.set_head(block_root)
+                    self._push_status_snapshot()
 
                     # Update metrics
                     from .spec import constants
@@ -2403,6 +2577,8 @@ class BeaconNode:
                         f"P2P: Adopted block as new head: slot={block.slot}, "
                         f"root={block_root.hex()[:16]}"
                     )
+
+                    self.attestation_pool.remove_included(list(block.body.attestations))
 
                     # For Gloas blocks: check if we have a pending envelope for phase 2
                     is_gloas_block = hasattr(block.body, "signed_execution_payload_bid")
@@ -2695,15 +2871,23 @@ class BeaconNode:
 
         from .spec.state_transition import state_transition
 
-        def _replay(state, signed_blocks):
-            for signed in signed_blocks:
-                state = state_transition(state, signed, False)
+        def _replay(state, indexed_blocks):
+            for idx, (root, signed) in enumerate(indexed_blocks):
+                try:
+                    state = state_transition(state, signed, False)
+                except Exception as exc:
+                    blk = signed.message if hasattr(signed, "message") else signed
+                    raise RuntimeError(
+                        f"reorg replay failed at chain idx {idx}/"
+                        f"{len(indexed_blocks)}: slot={blk.slot} "
+                        f"root={root.hex()[:16]} "
+                        f"parent_root={bytes(blk.parent_root).hex()[:16]} "
+                        f"state_slot_before={state.slot}: {exc}"
+                    ) from exc
             return state
 
         # Push the (potentially expensive) replay onto a worker thread.
-        new_state = await asyncio.to_thread(
-            _replay, new_state, [sb for _, sb in chain]
-        )
+        new_state = await asyncio.to_thread(_replay, new_state, chain)
 
         # Per spec, latest_block_header.state_root stays ZERO until the
         # next slot's process_slot fills it in. Do not mutate here.
@@ -2724,6 +2908,11 @@ class BeaconNode:
         self.head_slot = target_slot
         self.head_root = target_root
         self.store.set_head(target_root)
+        self._push_status_snapshot()
+
+        for _root, _signed in chain:
+            _blk = _signed.message if hasattr(_signed, "message") else _signed
+            self.attestation_pool.remove_included(list(_blk.body.attestations))
 
         from .spec import constants
         epoch = target_slot // constants.SLOTS_PER_EPOCH()
@@ -2924,56 +3113,80 @@ class BeaconNode:
             self._pending_envelopes[beacon_block_root] = signed_envelope
             return
 
-        # Verify beacon_block_root matches current state's latest block header.
-        # If state_root is still ZERO (normal at this point — process_slot for
-        # the next slot hasn't run), compute the would-be filled-in header
-        # WITHOUT mutating self.state (mutating breaks spec, see other notes).
-        header = self.state.latest_block_header
-        current_header_root = hash_tree_root(header)
-        if beacon_block_root != current_header_root and bytes(header.state_root) == b"\x00" * 32:
-            from .spec.types import BeaconBlockHeader
-            full_state_root = await self._on_state_thread(hash_tree_root, self.state)
-            filled_header = BeaconBlockHeader(
-                slot=header.slot,
-                proposer_index=header.proposer_index,
-                parent_root=header.parent_root,
-                state_root=full_state_root,
-                body_root=header.body_root,
-            )
-            current_header_root = hash_tree_root(filled_header)
-        if beacon_block_root != current_header_root:
-            logger.warning(
-                f"Envelope beacon_block_root {beacon_block_root.hex()[:16]} doesn't match "
-                f"state header root {current_header_root.hex()[:16]}, saving as pending"
-            )
-            self._pending_envelopes[beacon_block_root] = signed_envelope
-            return
+        # Re-check the slot + beacon_block_root match AND apply the envelope in
+        # one atomic step on the state worker thread. Doing the precheck on the
+        # main coroutine and then awaiting the apply is racy: between the
+        # checks and the apply, another coroutine (block adoption, reorg) can
+        # mutate self.state via the same state thread, advancing the slot and
+        # rewriting latest_block_header — at which point the envelope's
+        # beacon_block_root no longer matches and the spec assertion inside
+        # process_execution_payload_envelope blows up. Folding everything into
+        # one worker invocation keeps the precondition+mutation pair atomic
+        # against the asyncio scheduler.
+        from .spec.types import BeaconBlockHeader
+        from .spec.state_transition.block.execution_payload_envelope import (
+            process_execution_payload_envelope,
+        )
+
+        def _envelope_phase2(state, env, expected_slot, expected_root):
+            if int(state.slot) != expected_slot:
+                return ("slot_advanced", None, int(state.slot))
+            header = state.latest_block_header
+            if bytes(header.state_root) == b"\x00" * 32:
+                filled_state_root = hash_tree_root(state)
+                check_header = BeaconBlockHeader(
+                    slot=header.slot,
+                    proposer_index=header.proposer_index,
+                    parent_root=header.parent_root,
+                    state_root=filled_state_root,
+                    body_root=header.body_root,
+                )
+                actual_root = hash_tree_root(check_header)
+            else:
+                actual_root = hash_tree_root(header)
+            if expected_root != actual_root:
+                return ("root_mismatch", actual_root, None)
+            process_execution_payload_envelope(state, env, verify=False)
+            return ("applied", hash_tree_root(state), None)
 
         try:
-            from .spec.state_transition.block.execution_payload_envelope import (
-                process_execution_payload_envelope,
-            )
-
-            def _apply_envelope_and_root(state, env):
-                process_execution_payload_envelope(state, env, verify=False)
-                return hash_tree_root(state)
-
-            state_root = await self._on_state_thread(
-                _apply_envelope_and_root, self.state, signed_envelope
-            )
-            self.store.save_state(state_root, self.state)
-            if self.head_root:
-                self.store.save_state(self.head_root, self.state)
-
-            logger.info(
-                f"Phase 2 applied: slot={envelope_slot}, "
-                f"latest_block_hash={bytes(self.state.latest_block_hash).hex()[:16]}, "
-                f"state_root={state_root.hex()[:16]}"
+            result, payload, info = await self._on_state_thread(
+                _envelope_phase2,
+                self.state,
+                signed_envelope,
+                envelope_slot,
+                beacon_block_root,
             )
         except Exception as e:
             logger.error(f"Failed to apply envelope (phase 2) for slot {envelope_slot}: {e}")
             import traceback
             traceback.print_exc()
+            return
+
+        if result == "slot_advanced":
+            logger.info(
+                f"Envelope for slot {envelope_slot} but state advanced to slot {info} "
+                f"before apply, saving as pending"
+            )
+            self._pending_envelopes[beacon_block_root] = signed_envelope
+            return
+        if result == "root_mismatch":
+            logger.warning(
+                f"Envelope beacon_block_root {beacon_block_root.hex()[:16]} doesn't match "
+                f"state header root {payload.hex()[:16]}, saving as pending"
+            )
+            self._pending_envelopes[beacon_block_root] = signed_envelope
+            return
+
+        state_root = payload
+        self.store.save_state(state_root, self.state)
+        if self.head_root:
+            self.store.save_state(self.head_root, self.state)
+        logger.info(
+            f"Phase 2 applied: slot={envelope_slot}, "
+            f"latest_block_hash={bytes(self.state.latest_block_hash).hex()[:16]}, "
+            f"state_root={state_root.hex()[:16]}"
+        )
 
     async def _apply_minimal_block_update(self, block) -> None:
         """Apply minimal block updates when full state transition fails.

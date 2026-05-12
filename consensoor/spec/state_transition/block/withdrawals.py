@@ -477,26 +477,27 @@ def process_withdrawals(state: "BeaconState", payload=None) -> None:
         last_withdrawal = expected.withdrawals[-1]
         state.next_withdrawal_index = int(last_withdrawal.index) + 1
 
-    if is_gloas:
-        if len(state.validators) > 0:
-            state.next_withdrawal_validator_index = (
-                int(state.next_withdrawal_validator_index) + expected.processed_validators_sweep_count
-            ) % len(state.validators)
-    elif hasattr(state, "pending_partial_withdrawals"):
-        if len(state.validators) > 0:
-            state.next_withdrawal_validator_index = (
-                int(state.next_withdrawal_validator_index) + expected.processed_validators_sweep_count
-            ) % len(state.validators)
-    else:
+    # update_next_withdrawal_validator_index — Capella's spec formula is
+    # reused unchanged across Electra and Gloas: if the payload is full,
+    # resume from the last withdrawal's validator + 1; otherwise advance
+    # the sweep cursor by MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP (mod
+    # len(validators)). We previously advanced by
+    # `expected.processed_validators_sweep_count` for Electra/Gloas, which
+    # equals len(validators) when no validator was withdrawable — making
+    # the modulo always zero and freezing the cursor at 0. LH advances by
+    # 16384 % 768 = 256 per block on this devnet; that's the value we must
+    # match for state_root to agree.
+    if len(state.validators) > 0:
         if len(expected.withdrawals) == MAX_WITHDRAWALS_PER_PAYLOAD():
-            next_index = (
+            next_validator_index = (
                 int(expected.withdrawals[-1].validator_index) + 1
             ) % len(state.validators)
-            state.next_withdrawal_validator_index = next_index
-        elif len(state.validators) > 0:
-            state.next_withdrawal_validator_index = (
-                int(state.next_withdrawal_validator_index) + MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP()
+        else:
+            next_validator_index = (
+                int(state.next_withdrawal_validator_index)
+                + MAX_VALIDATORS_PER_WITHDRAWALS_SWEEP()
             ) % len(state.validators)
+        state.next_withdrawal_validator_index = next_validator_index
 
     if hasattr(state, "pending_partial_withdrawals") and expected.processed_partial_withdrawals_count > 0:
         state.pending_partial_withdrawals = list(
