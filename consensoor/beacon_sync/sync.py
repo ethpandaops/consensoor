@@ -95,39 +95,58 @@ class StateSyncManager:
                 await self._update_block_header(block_root)
 
     async def _update_block_header(self, block_root: str) -> None:
-        """Handle block header notification from upstream.
+        """Fetch the full SignedBeaconBlock for the given root and store it.
 
-        NOTE: We intentionally do NOT update state.latest_block_header here.
-        Piecemeal state updates (updating only the header without updating the
-        rest of the state) cause parent_root validation failures because
-        process_slot fills in state_root using hash_tree_root(state), and if
-        the state hasn't been fully updated, the computed state_root is wrong.
+        Without this, our store only has SSZ states from /eth/v2/debug/beacon/states
+        and never the actual SignedBeaconBlocks — so /eth/v2/beacon/blocks/{root}
+        returns 404, /eth/v1/beacon/headers/head's state_root falls back to the
+        zero placeholder, and external clients (dora, validators, peers) can't
+        retrieve any block data from us.
 
-        Instead, we rely on:
-        1. Full state sync at epoch boundaries (_sync_state_at_slot)
-        2. Full state transition when blocks arrive via P2P (_apply_block_to_state)
-
-        This function now only logs the header for debugging.
+        We DO NOT update state.latest_block_header here — that has to come from
+        a full state transition (process_block) or a full state sync.
         """
         if not self.node.state:
             return
 
         try:
-            header_data = await self.client.get_header(block_root)
-            header_msg = header_data.get("header", {}).get("message", {})
-
-            if not header_msg:
-                logger.warning(f"Empty header message for block {block_root[:18]}...")
-                return
-
-            slot = int(header_msg.get("slot", 0))
-            logger.debug(
-                f"Received header for block {block_root[:18]}...: slot={slot}, "
-                f"state_root={header_msg.get('state_root', '')[:18]}..."
-            )
-
+            ssz_bytes = await self.client.get_block(block_root)
         except Exception as e:
-            logger.warning(f"Failed to fetch block header {block_root[:18]}...: {e}")
+            logger.warning(f"Failed to fetch block {block_root[:18]}...: {e}")
+            return
+
+        signed_block = self._decode_signed_block(ssz_bytes)
+        if signed_block is None:
+            logger.warning(
+                f"Failed to decode signed block {block_root[:18]}... ({len(ssz_bytes)} bytes)"
+            )
+            return
+
+        try:
+            root_bytes = bytes.fromhex(block_root.replace("0x", ""))
+            self.node.store.save_block(root_bytes, signed_block)
+        except Exception as e:
+            logger.warning(f"Failed to save block {block_root[:18]}...: {e}")
+            return
+
+        slot = int(signed_block.message.slot)
+        logger.debug(
+            f"Stored signed block {block_root[:18]}...: slot={slot}, size={len(ssz_bytes)}B"
+        )
+
+    def _decode_signed_block(self, ssz_bytes: bytes):
+        """Try decoding the SSZ block bytes as each known fork type."""
+        from ..spec.types.gloas import SignedBeaconBlock as SignedGloas
+        from ..spec.types import SignedElectraBeaconBlock as SignedElectra
+
+        for cls, name in ((SignedGloas, "Gloas"), (SignedElectra, "Electra")):
+            try:
+                block = cls.decode_bytes(ssz_bytes)
+                logger.debug(f"Decoded SignedBeaconBlock as {name}")
+                return block
+            except Exception:
+                continue
+        return None
 
     async def _on_finalized_event(self, data: dict) -> None:
         """Handle a finalized checkpoint event."""
@@ -151,34 +170,40 @@ class StateSyncManager:
                 logger.error(f"Periodic sync error: {e}")
 
     async def _initial_sync(self) -> None:
-        """Perform initial sync on startup."""
+        """Perform initial sync on startup.
+
+        Try finalized first (lightweight checkpoint-sync endpoints typically
+        only serve finalized) and fall back to head for full beacon nodes.
+        """
         logger.info("Performing initial state sync...")
+        try:
+            await self._sync_state_at_slot("finalized")
+            return
+        except Exception as e:
+            logger.warning(
+                f"Initial sync at 'finalized' failed ({e}); trying 'head'"
+            )
         try:
             await self._sync_state_at_slot("head")
         except Exception as e:
             logger.error(f"Initial sync failed: {e}")
 
     async def _sync_state_at_slot(self, slot_or_id: Union[int, str]) -> None:
-        """Sync state at a specific slot or state ID."""
-        try:
-            state_id = str(slot_or_id)
-            logger.info(f"Fetching state at {state_id}...")
+        """Sync state at a specific slot or state ID. Raises on failure."""
+        state_id = str(slot_or_id)
+        logger.info(f"Fetching state at {state_id}...")
 
-            state_bytes = await self.client.get_state(state_id)
-            state = self._decode_state(state_bytes)
+        state_bytes = await self.client.get_state(state_id)
+        state = self._decode_state(state_bytes)
 
-            if state is None:
-                logger.error("Failed to decode state from upstream")
-                return
+        if state is None:
+            raise RuntimeError(f"Failed to decode state from upstream at {state_id}")
 
-            await self._apply_state(state)
-            logger.info(
-                f"State synced: slot={state.slot}, "
-                f"validators={len(state.validators)}"
-            )
-
-        except Exception as e:
-            logger.error(f"Failed to sync state at {slot_or_id}: {e}")
+        await self._apply_state(state)
+        logger.info(
+            f"State synced: slot={state.slot}, "
+            f"validators={len(state.validators)}"
+        )
 
     def _decode_state(self, state_bytes: bytes) -> Optional[AnyBeaconState]:
         """Decode state bytes, trying different fork types."""

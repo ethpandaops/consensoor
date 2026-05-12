@@ -153,6 +153,9 @@ from .fulu import (
     DataColumnSidecar,
     DataColumnsByRootIdentifier,
     MatrixEntry,
+    PartialDataColumnHeader,
+    PartialDataColumnSidecar,
+    PartialDataColumnPartsMetadata,
     FuluBeaconState,
 )
 
@@ -161,6 +164,7 @@ from .gloas import (
     BuilderIndex,
     PayloadStatus,
     ForkChoiceNode,
+    PartialDataColumnGroupID,
     Builder,
     BuilderPendingWithdrawal,
     BuilderPendingPayment,
@@ -168,6 +172,8 @@ from .gloas import (
     PayloadAttestation,
     PayloadAttestationMessage,
     IndexedPayloadAttestation,
+    BlockAccessList,
+    ExecutionPayload as GloasExecutionPayload,
     ExecutionPayloadBid,
     SignedExecutionPayloadBid,
     ExecutionPayloadEnvelope,
@@ -230,9 +236,10 @@ __all__ = [
     "ElectraBeaconState",
     # Fulu
     "Cell", "DataColumnSidecar", "DataColumnsByRootIdentifier", "MatrixEntry",
+    "PartialDataColumnHeader", "PartialDataColumnSidecar", "PartialDataColumnPartsMetadata",
     "FuluBeaconState",
     # Gloas
-    "BuilderIndex", "PayloadStatus", "ForkChoiceNode", "Builder",
+    "BuilderIndex", "PayloadStatus", "ForkChoiceNode", "PartialDataColumnGroupID", "Builder",
     "BuilderPendingPayment", "BuilderPendingWithdrawal",
     "PayloadAttestationData", "PayloadAttestation", "PayloadAttestationMessage",
     "IndexedPayloadAttestation",

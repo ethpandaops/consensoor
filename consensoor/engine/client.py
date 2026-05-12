@@ -240,12 +240,36 @@ class EngineAPIClient:
         payload_attributes: Optional[dict] = None,
     ) -> ForkchoiceUpdateResponse:
         """Update the forkchoice state (Deneb/Cancun - requires parentBeaconBlockRoot)."""
+        attrs = None
+        if payload_attributes:
+            attrs = {k: v for k, v in payload_attributes.items() if k != "slotNumber"}
+        params = [
+            forkchoice_state.to_dict(),
+            attrs,
+        ]
+
+        result = await self._call("engine_forkchoiceUpdatedV3", params)
+        return ForkchoiceUpdateResponse.from_dict(result)
+
+    async def forkchoice_updated_v4(
+        self,
+        forkchoice_state: ForkchoiceState,
+        payload_attributes: Optional[dict] = None,
+    ) -> ForkchoiceUpdateResponse:
+        """Update the forkchoice state (Amsterdam / Gloas).
+
+        Per `execution-apis/src/engine/amsterdam.md`, `PayloadAttributesV4`
+        is `PayloadAttributesV3` plus a required `slotNumber` field. Strip
+        nothing — pass attrs through verbatim. (Earlier revisions stripped
+        `slotNumber` based on a misread; that produced a `PayloadAttributesV3`
+        shape and geth replied -38003 "Invalid payload attributes".)
+        """
         params = [
             forkchoice_state.to_dict(),
             payload_attributes,
         ]
 
-        result = await self._call("engine_forkchoiceUpdatedV3", params)
+        result = await self._call("engine_forkchoiceUpdatedV4", params)
         return ForkchoiceUpdateResponse.from_dict(result)
 
     async def forkchoice_updated_v2(
@@ -295,7 +319,16 @@ class EngineAPIClient:
         fork = self._get_fork_for_timestamp(timestamp)
         logger.debug(f"forkchoice_updated: timestamp={timestamp}, fork={fork}")
 
-        if fork in ("gloas", "fulu", "electra", "deneb"):
+        if fork == "gloas":
+            # Self-build mode: WE are both proposer and builder, so we DO
+            # need a payload from the EL. forkchoiceUpdatedV4 with full
+            # PayloadAttributesV4 (incl. slotNumber) is the right call.
+            # Earlier revisions dropped attrs assuming "builder owns
+            # payload" — true for an external-builder PBS flow, but not for
+            # our self-build setup, and the drop meant we never received a
+            # payload_id and never proposed any block.
+            return await self.forkchoice_updated_v4(forkchoice_state, payload_attributes)
+        if fork in ("fulu", "electra", "deneb"):
             return await self.forkchoice_updated_v3(forkchoice_state, payload_attributes)
         elif fork == "capella":
             return await self.forkchoice_updated_v2(forkchoice_state, payload_attributes)
@@ -360,8 +393,9 @@ class EngineAPIClient:
         fork = self._get_fork_for_timestamp(timestamp)
         logger.info(f"get_payload: timestamp={timestamp}, fork={fork}, payload_id={payload_id.hex()}")
 
-        if fork in ("gloas", "fulu"):
-            # Fulu/Osaka uses V5
+        if fork == "gloas":
+            return await self.get_payload_v6(payload_id)
+        elif fork == "fulu":
             return await self.get_payload_v5(payload_id)
         elif fork == "electra":
             return await self.get_payload_v4(payload_id)
@@ -448,9 +482,11 @@ class EngineAPIClient:
             "engine_newPayloadV3",
             "engine_newPayloadV2",
             "engine_newPayloadV1",
+            "engine_forkchoiceUpdatedV4",
             "engine_forkchoiceUpdatedV3",
             "engine_forkchoiceUpdatedV2",
             "engine_forkchoiceUpdatedV1",
+            "engine_getPayloadV6",
             "engine_getPayloadV5",
             "engine_getPayloadV4",
             "engine_getPayloadV3",
@@ -524,6 +560,12 @@ class EngineAPIClient:
             result["blobGasUsed"] = hex(int(payload.blob_gas_used))
         if hasattr(payload, 'excess_blob_gas'):
             result["excessBlobGas"] = hex(int(payload.excess_blob_gas))
+        # Gloas/amsterdam fields — geth bal-devnet-6 rejects with
+        # "nil slotnumber post-amsterdam" if these are missing.
+        if hasattr(payload, 'slot_number'):
+            result["slotNumber"] = hex(int(payload.slot_number))
+        if hasattr(payload, 'block_access_list'):
+            result["blockAccessList"] = "0x" + bytes(payload.block_access_list).hex()
         return result
 
     async def __aenter__(self):

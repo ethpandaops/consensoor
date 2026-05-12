@@ -3,6 +3,7 @@
 Uses blspy (fast C/assembly) when available, falls back to py_ecc (pure Python).
 """
 
+import asyncio
 import hashlib
 import logging
 from typing import Sequence
@@ -188,3 +189,40 @@ def aggregate_pubkeys(pubkeys: Sequence[bytes]) -> bytes:
 # Aliases for consensus spec compatibility
 bls_verify = fast_aggregate_verify
 bls_aggregate_pubkeys = aggregate_pubkeys
+
+
+# Async wrappers — BLS sign/verify is CPU-bound and takes milliseconds to seconds.
+# Calling them directly from a coroutine wedges the asyncio loop, which kills
+# both the beacon HTTP server (kurtosis healthcheck) and the rust→python event
+# channels (libp2p ping handler, status answers, etc.). Slot-tick code paths in
+# the validator client must use these instead of the sync versions.
+async def sign_async(privkey: int, message: bytes) -> bytes:
+    return await asyncio.to_thread(sign, privkey, message)
+
+
+async def verify_async(pubkey: bytes, message: bytes, signature: bytes) -> bool:
+    return await asyncio.to_thread(verify, pubkey, message, signature)
+
+
+async def aggregate_signatures_async(signatures: Sequence[bytes]) -> bytes:
+    return await asyncio.to_thread(aggregate_signatures, signatures)
+
+
+async def verify_aggregate_async(
+    pubkeys: Sequence[bytes], messages: Sequence[bytes], signature: bytes
+) -> bool:
+    return await asyncio.to_thread(verify_aggregate, pubkeys, messages, signature)
+
+
+async def fast_aggregate_verify_async(
+    pubkeys: Sequence[bytes], message: bytes, signature: bytes
+) -> bool:
+    return await asyncio.to_thread(fast_aggregate_verify, pubkeys, message, signature)
+
+
+async def aggregate_pubkeys_async(pubkeys: Sequence[bytes]) -> bytes:
+    return await asyncio.to_thread(aggregate_pubkeys, pubkeys)
+
+
+bls_verify_async = fast_aggregate_verify_async
+bls_aggregate_pubkeys_async = aggregate_pubkeys_async

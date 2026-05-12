@@ -82,6 +82,7 @@ def get_execution_payload_type_for_fork(fork: str) -> Type:
     from consensoor.spec.types.bellatrix import ExecutionPayloadBellatrix
     from consensoor.spec.types.capella import ExecutionPayloadCapella
     from consensoor.spec.types import ExecutionPayload
+    from consensoor.spec.types.gloas import ExecutionPayload as GloasExecutionPayload
 
     payload_types = {
         "bellatrix": ExecutionPayloadBellatrix,
@@ -89,7 +90,7 @@ def get_execution_payload_type_for_fork(fork: str) -> Type:
         "deneb": ExecutionPayload,
         "electra": ExecutionPayload,
         "fulu": ExecutionPayload,
-        "gloas": ExecutionPayload,
+        "gloas": GloasExecutionPayload,
     }
     return payload_types.get(fork)
 
@@ -166,7 +167,11 @@ def get_ssz_type_by_name(fork: str, type_name: str) -> Optional[Type]:
         "LightClientFinalityUpdate", "LightClientOptimisticUpdate",
     }
     if type_name in light_client_types:
-        if fork in {"electra", "fulu", "gloas"}:
+        if fork == "gloas":
+            from consensoor.spec.types import gloas as gloas_mod
+            if hasattr(gloas_mod, type_name):
+                return getattr(gloas_mod, type_name)
+        if fork in {"electra", "fulu"}:
             electra_name = f"Electra{type_name}"
             if hasattr(types, electra_name):
                 return getattr(types, electra_name)
@@ -217,6 +222,16 @@ def get_ssz_type_by_name(fork: str, type_name: str) -> Optional[Type]:
         from consensoor.spec.types.gloas import DataColumnSidecar as GloasDataColumnSidecar
         return GloasDataColumnSidecar
 
+    # Gloas-specific overrides for types that exist in multiple forks
+    if fork == "gloas":
+        gloas_only_types = {
+            "ExecutionPayload": "ExecutionPayload",
+            "PartialDataColumnSidecar": "PartialDataColumnSidecar",
+        }
+        if type_name in gloas_only_types:
+            from consensoor.spec.types import gloas as gloas_mod
+            return getattr(gloas_mod, gloas_only_types[type_name], None)
+
     if hasattr(types, type_name):
         t = getattr(types, type_name)
         if fork != "gloas":
@@ -241,6 +256,7 @@ def get_operation_type_for_test(fork: str, op_name: str) -> Optional[Type]:
         "proposer_slashing": types.ProposerSlashing,
         "deposit": types.Deposit,
         "voluntary_exit": types.SignedVoluntaryExit,
+        "voluntary_exit_churn": types.SignedVoluntaryExit,
         "block_header": None,
         "bls_to_execution_change": types.SignedBLSToExecutionChange if hasattr(types, "SignedBLSToExecutionChange") else None,
         "sync_aggregate": types.SyncAggregate if hasattr(types, "SyncAggregate") else None,
@@ -250,6 +266,7 @@ def get_operation_type_for_test(fork: str, op_name: str) -> Optional[Type]:
         "withdrawal_request": types.WithdrawalRequest if hasattr(types, "WithdrawalRequest") else None,
         "consolidation_request": types.ConsolidationRequest if hasattr(types, "ConsolidationRequest") else None,
         "execution_payload_bid": None,  # Uses block.ssz_snappy, special handling
+        "parent_execution_payload": None,  # Uses block.ssz_snappy, special handling
         "payload_attestation": types.PayloadAttestation if hasattr(types, "PayloadAttestation") else None,
     }
     return op_type_map.get(op_name)
@@ -268,6 +285,7 @@ def get_operation_processor(op_name: str) -> Optional[Callable]:
         process_withdrawal_request,
         process_consolidation_request,
         process_execution_payload_bid,
+        process_parent_execution_payload,
         process_payload_attestation,
     )
     from consensoor.spec.state_transition.block import (
@@ -283,6 +301,7 @@ def get_operation_processor(op_name: str) -> Optional[Callable]:
         "proposer_slashing": process_proposer_slashing,
         "deposit": process_deposit,
         "voluntary_exit": process_voluntary_exit,
+        "voluntary_exit_churn": process_voluntary_exit,
         "block_header": process_block_header,
         "bls_to_execution_change": process_bls_to_execution_change,
         "sync_aggregate": process_sync_aggregate,
@@ -292,6 +311,7 @@ def get_operation_processor(op_name: str) -> Optional[Callable]:
         "withdrawal_request": process_withdrawal_request,
         "consolidation_request": process_consolidation_request,
         "execution_payload_bid": process_execution_payload_bid,
+        "parent_execution_payload": process_parent_execution_payload,
         "payload_attestation": process_payload_attestation,
     }
     return processors.get(op_name)
@@ -319,6 +339,8 @@ def get_epoch_processor(function_name: str) -> Optional[Callable]:
         process_builder_pending_payments,
     )
 
+    from consensoor.spec.state_transition.epoch.ptc_window import process_ptc_window
+
     processors = {
         "justification_and_finalization": process_justification_and_finalization,
         "inactivity_updates": process_inactivity_updates,
@@ -335,9 +357,11 @@ def get_epoch_processor(function_name: str) -> Optional[Callable]:
         "historical_roots_update": process_historical_summaries_update,
         "historical_summaries_update": process_historical_summaries_update,
         "pending_deposits": process_pending_deposits,
+        "pending_deposits_churn": process_pending_deposits,
         "pending_consolidations": process_pending_consolidations,
         "proposer_lookahead": process_proposer_lookahead,
         "builder_pending_payments": process_builder_pending_payments,
+        "ptc_window": process_ptc_window,
     }
     return processors.get(function_name)
 
@@ -697,6 +721,7 @@ class TestOperations:
         if not op_file.exists():
             alt_names = {
                 "voluntary_exit": "voluntary_exit.ssz_snappy",
+                "voluntary_exit_churn": "voluntary_exit.ssz_snappy",
                 "bls_to_execution_change": "address_change.ssz_snappy",
             }
             if op_name in alt_names:
@@ -712,7 +737,7 @@ class TestOperations:
                 if not block_file.exists():
                     pytest.skip(f"Block file not found for {case_id}")
                 operation = load_ssz_snappy(block_file, block_type)
-            elif op_name in ("execution_payload", "withdrawals", "execution_payload_bid"):
+            elif op_name in ("execution_payload", "withdrawals", "execution_payload_bid", "parent_execution_payload"):
                 # These have special handling below - operation loaded differently
                 operation = None
             else:
@@ -766,6 +791,11 @@ class TestOperations:
                     processor(state_copy, payload)
             elif op_name == "execution_payload_bid":
                 # Load unsigned block and extract signed_execution_payload_bid from body
+                block_type = get_unsigned_block_type_for_fork(fork)
+                block_file = case_path / "block.ssz_snappy"
+                block = load_ssz_snappy(block_file, block_type)
+                processor(state_copy, block)
+            elif op_name == "parent_execution_payload":
                 block_type = get_unsigned_block_type_for_fork(fork)
                 block_file = case_path / "block.ssz_snappy"
                 block = load_ssz_snappy(block_file, block_type)

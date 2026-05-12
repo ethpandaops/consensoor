@@ -2,7 +2,7 @@
 
 from .base import (
     Container, Vector, List,
-    Bitvector, ByteVector,
+    Bitvector, Bitlist, ByteVector,
     uint64,
     Bytes32, BLSPubkey,
     Slot, Epoch, ValidatorIndex, Gwei, Root,
@@ -62,6 +62,24 @@ class MatrixEntry(Container):
     kzg_proof: KZGProof
     column_index: uint64
     row_index: uint64
+
+
+class PartialDataColumnHeader(Container):
+    kzg_commitments: List[KZGCommitment, MAX_BLOB_COMMITMENTS_PER_BLOCK]
+    signed_block_header: SignedBeaconBlockHeader
+    kzg_commitments_inclusion_proof: Vector[Bytes32, KZG_COMMITMENTS_INCLUSION_PROOF_DEPTH_ELECTRA]
+
+
+class PartialDataColumnSidecar(Container):
+    cells_present_bitmap: Bitlist[MAX_BLOB_COMMITMENTS_PER_BLOCK]
+    partial_column: List[Cell, MAX_BLOB_COMMITMENTS_PER_BLOCK]
+    kzg_proofs: List[KZGProof, MAX_BLOB_COMMITMENTS_PER_BLOCK]
+    header: List[PartialDataColumnHeader, 1]
+
+
+class PartialDataColumnPartsMetadata(Container):
+    available: Bitlist[MAX_BLOB_COMMITMENTS_PER_BLOCK]
+    requests: Bitlist[MAX_BLOB_COMMITMENTS_PER_BLOCK]
 
 
 def proposer_lookahead_length() -> int:

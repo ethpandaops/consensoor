@@ -199,7 +199,11 @@ def EPOCHS_PER_SYNC_COMMITTEE_PERIOD() -> int:
 TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE: Final[int] = 16
 SYNC_COMMITTEE_SUBNET_COUNT: Final[int] = 4
 MIN_SYNC_COMMITTEE_PARTICIPANTS: Final[int] = 1
-UPDATE_TIMEOUT: Final[int] = 64
+
+
+def UPDATE_TIMEOUT() -> int:
+    """SLOTS_PER_EPOCH * EPOCHS_PER_SYNC_COMMITTEE_PERIOD (mainnet=8192, minimal=64)."""
+    return SLOTS_PER_EPOCH() * EPOCHS_PER_SYNC_COMMITTEE_PERIOD()
 
 INACTIVITY_PENALTY_QUOTIENT_ALTAIR: Final[int] = 3 * 2**24  # 50331648
 MIN_SLASHING_PENALTY_QUOTIENT_ALTAIR: Final[int] = 64
@@ -256,15 +260,33 @@ EXECUTION_PAYLOAD_DEPTH: Final[int] = 4
 MAX_BLOB_COMMITMENTS_PER_BLOCK: Final[int] = 4096
 FIELD_ELEMENTS_PER_BLOB: Final[int] = 4096
 KZG_COMMITMENT_INCLUSION_PROOF_DEPTH: Final[int] = 17
-MAX_BLOBS_PER_BLOCK: Final[int] = 6
-BLOB_SIDECAR_SUBNET_COUNT: Final[int] = 6
-MAX_REQUEST_BLOCKS_DENEB: Final[int] = 128
-MIN_EPOCHS_FOR_BLOB_SIDECARS_REQUESTS: Final[int] = 4096
-MAX_REQUEST_BLOB_SIDECARS: Final[int] = 768
 
 
-def MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT() -> int:
-    return 8 if _config.preset == "mainnet" else 4
+def MAX_BLOBS_PER_BLOCK() -> int:
+    from .network_config import get_config
+    return get_config().max_blobs_per_block
+
+
+def BLOB_SIDECAR_SUBNET_COUNT() -> int:
+    from .network_config import get_config
+    return get_config().blob_sidecar_subnet_count
+
+
+def MAX_REQUEST_BLOCKS_DENEB() -> int:
+    from .network_config import get_config
+    return get_config().max_request_blocks_deneb
+
+
+def MIN_EPOCHS_FOR_BLOB_SIDECARS_REQUESTS() -> int:
+    from .network_config import get_config
+    return get_config().min_epochs_for_blob_sidecars_requests
+
+
+def MAX_REQUEST_BLOB_SIDECARS() -> int:
+    from .network_config import get_config
+    cfg = get_config()
+    return cfg.max_request_blocks_deneb * cfg.max_blobs_per_block
+
 
 # =============================================================================
 # Electra
@@ -310,15 +332,33 @@ FINALIZED_ROOT_DEPTH_ELECTRA: Final[int] = 7
 CURRENT_SYNC_COMMITTEE_DEPTH_ELECTRA: Final[int] = 6
 NEXT_SYNC_COMMITTEE_DEPTH_ELECTRA: Final[int] = 6
 
+# Gloas LightClient (uses execution_block_hash and gloas execution branch depth = floor(log2(832)) = 9)
+EXECUTION_BLOCK_HASH_DEPTH_GLOAS: Final[int] = 9
+
 def MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA() -> int:
-    return 128 * 10**9 if _config.preset == "mainnet" else 64 * 10**9
+    from .network_config import get_config
+    return get_config().min_per_epoch_churn_limit_electra
 
 
 def MAX_PER_EPOCH_ACTIVATION_EXIT_CHURN_LIMIT() -> int:
-    return 256 * 10**9 if _config.preset == "mainnet" else 128 * 10**9
-MAX_BLOBS_PER_BLOCK_ELECTRA: Final[int] = 9
-BLOB_SIDECAR_SUBNET_COUNT_ELECTRA: Final[int] = 9
-MAX_REQUEST_BLOB_SIDECARS_ELECTRA: Final[int] = 1152
+    from .network_config import get_config
+    return get_config().max_per_epoch_activation_exit_churn_limit
+
+
+def MAX_BLOBS_PER_BLOCK_ELECTRA() -> int:
+    from .network_config import get_config
+    return get_config().max_blobs_per_block_electra
+
+
+def BLOB_SIDECAR_SUBNET_COUNT_ELECTRA() -> int:
+    from .network_config import get_config
+    return get_config().blob_sidecar_subnet_count_electra
+
+
+def MAX_REQUEST_BLOB_SIDECARS_ELECTRA() -> int:
+    from .network_config import get_config
+    cfg = get_config()
+    return cfg.max_request_blocks_deneb * cfg.max_blobs_per_block_electra
 
 COMPOUNDING_WITHDRAWAL_PREFIX: Final[int] = 0x02
 
@@ -335,14 +375,42 @@ FIELD_ELEMENTS_PER_CELL: Final[int] = 64
 FIELD_ELEMENTS_PER_EXT_BLOB: Final[int] = 8192
 CELLS_PER_EXT_BLOB: Final[int] = 128
 NUMBER_OF_COLUMNS: Final[int] = 128
-NUMBER_OF_CUSTODY_GROUPS: Final[int] = 128
-DATA_COLUMN_SIDECAR_SUBNET_COUNT: Final[int] = 128
 MAX_REQUEST_DATA_COLUMN_SIDECARS: Final[int] = 16384
-SAMPLES_PER_SLOT: Final[int] = 8
-CUSTODY_REQUIREMENT: Final[int] = 4
-VALIDATOR_CUSTODY_REQUIREMENT: Final[int] = 8
-BALANCE_PER_ADDITIONAL_CUSTODY_GROUP: Final[int] = 32 * 10**9
-MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS: Final[int] = 4096
+
+
+def NUMBER_OF_CUSTODY_GROUPS() -> int:
+    from .network_config import get_config
+    return get_config().number_of_custody_groups
+
+
+def DATA_COLUMN_SIDECAR_SUBNET_COUNT() -> int:
+    from .network_config import get_config
+    return get_config().data_column_sidecar_subnet_count
+
+
+def SAMPLES_PER_SLOT() -> int:
+    from .network_config import get_config
+    return get_config().samples_per_slot
+
+
+def CUSTODY_REQUIREMENT() -> int:
+    from .network_config import get_config
+    return get_config().custody_requirement
+
+
+def VALIDATOR_CUSTODY_REQUIREMENT() -> int:
+    from .network_config import get_config
+    return get_config().validator_custody_requirement
+
+
+def BALANCE_PER_ADDITIONAL_CUSTODY_GROUP() -> int:
+    from .network_config import get_config
+    return get_config().balance_per_additional_custody_group
+
+
+def MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS() -> int:
+    from .network_config import get_config
+    return get_config().min_epochs_for_data_column_sidecars_requests
 
 # =============================================================================
 # Gloas (ePBS - Enshrined Proposer-Builder Separation)
@@ -350,13 +418,16 @@ MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS: Final[int] = 4096
 
 
 def PTC_SIZE() -> int:
-    return 512 if _config.preset == "mainnet" else 2
+    return 512 if _config.preset == "mainnet" else 16
 
 
 MAX_PAYLOAD_ATTESTATIONS: Final[int] = 4
 BUILDER_REGISTRY_LIMIT: Final[int] = 2**40
 BUILDER_PENDING_WITHDRAWALS_LIMIT: Final[int] = 2**20
-MAX_BUILDERS_PER_WITHDRAWALS_SWEEP: Final[int] = 2**14
+
+
+def MAX_BUILDERS_PER_WITHDRAWALS_SWEEP() -> int:
+    return 2**14 if _config.preset == "mainnet" else 16
 BUILDER_INDEX_FLAG: Final[int] = 2**40
 BUILDER_INDEX_SELF_BUILD: Final[int] = 2**64 - 1
 BUILDER_PAYMENT_THRESHOLD_NUMERATOR: Final[int] = 6
@@ -368,37 +439,90 @@ DOMAIN_PROPOSER_PREFERENCES: Final[bytes] = b"\x0d\x00\x00\x00"
 
 BUILDER_WITHDRAWAL_PREFIX: Final[bytes] = b"\x03"
 
+
+# Gloas churn limits (EIP-8061): split exit and activation churn limits
+def CHURN_LIMIT_QUOTIENT_GLOAS() -> int:
+    from .network_config import get_config
+    return get_config().churn_limit_quotient_gloas
+
+
+def MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS() -> int:
+    from .network_config import get_config
+    return get_config().max_per_epoch_activation_churn_limit_gloas
+
+
+def CONSOLIDATION_CHURN_LIMIT_QUOTIENT() -> int:
+    from .network_config import get_config
+    return get_config().consolidation_churn_limit_quotient
+
+
+def MIN_BUILDER_WITHDRAWABILITY_DELAY() -> int:
+    from .network_config import get_config
+    return get_config().min_builder_withdrawability_delay
+
 # =============================================================================
 # Networking Constants
 # =============================================================================
 
-MAX_PAYLOAD_SIZE: Final[int] = 10 * 2**20  # 10485760
-MAX_REQUEST_BLOCKS: Final[int] = 1024
-EPOCHS_PER_SUBNET_SUBSCRIPTION: Final[int] = 256
-ATTESTATION_PROPAGATION_SLOT_RANGE: Final[int] = 32
-MAXIMUM_GOSSIP_CLOCK_DISPARITY: Final[int] = 500
-MESSAGE_DOMAIN_INVALID_SNAPPY: Final[bytes] = b"\x00\x00\x00\x00"
-MESSAGE_DOMAIN_VALID_SNAPPY: Final[bytes] = b"\x01\x00\x00\x00"
-SUBNETS_PER_NODE: Final[int] = 2
-ATTESTATION_SUBNET_COUNT: Final[int] = 64
-ATTESTATION_SUBNET_EXTRA_BITS: Final[int] = 0
 ATTESTATION_SUBNET_PREFIX_BITS: Final[int] = 6
+
+
+def MAX_PAYLOAD_SIZE() -> int:
+    from .network_config import get_config
+    return get_config().max_payload_size
+
+
+def MAX_REQUEST_BLOCKS() -> int:
+    from .network_config import get_config
+    return get_config().max_request_blocks
+
+
+def EPOCHS_PER_SUBNET_SUBSCRIPTION() -> int:
+    from .network_config import get_config
+    return get_config().epochs_per_subnet_subscription
+
+
+def ATTESTATION_PROPAGATION_SLOT_RANGE() -> int:
+    from .network_config import get_config
+    return get_config().attestation_propagation_slot_range
+
+
+def MAXIMUM_GOSSIP_CLOCK_DISPARITY() -> int:
+    from .network_config import get_config
+    return get_config().maximum_gossip_clock_disparity
+
+
+def MESSAGE_DOMAIN_INVALID_SNAPPY() -> bytes:
+    from .network_config import get_config
+    return get_config().message_domain_invalid_snappy
+
+
+def MESSAGE_DOMAIN_VALID_SNAPPY() -> bytes:
+    from .network_config import get_config
+    return get_config().message_domain_valid_snappy
+
+
+def SUBNETS_PER_NODE() -> int:
+    from .network_config import get_config
+    return get_config().subnets_per_node
+
+
+def ATTESTATION_SUBNET_COUNT() -> int:
+    from .network_config import get_config
+    return get_config().attestation_subnet_count
+
+
+def ATTESTATION_SUBNET_EXTRA_BITS() -> int:
+    from .network_config import get_config
+    return get_config().attestation_subnet_extra_bits
+
 
 def MIN_EPOCHS_FOR_BLOCK_REQUESTS() -> int:
     return 33024 if _config.preset == "mainnet" else 272
 
 
 def MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT() -> int:
-    return 8 if _config.preset == "mainnet" else 4
+    from .network_config import get_config
+    return get_config().max_per_epoch_activation_churn_limit
 
 
-def REORG_HEAD_WEIGHT_THRESHOLD() -> int:
-    return 20 if _config.preset == "mainnet" else 0
-
-
-def REORG_PARENT_WEIGHT_THRESHOLD() -> int:
-    return 160 if _config.preset == "mainnet" else 0
-
-
-def REORG_MAX_EPOCHS_SINCE_FINALIZATION() -> int:
-    return 2 if _config.preset == "mainnet" else 0

@@ -34,3 +34,6 @@ py-libp2p-local/
 test-results/
 py-libp2p-local/
 .enclave-files/
+tests/spec-tests-mainnet/
+tests/spec-tests-nightly/
+.claude/

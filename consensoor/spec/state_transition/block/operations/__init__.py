@@ -9,7 +9,13 @@ from .bls_change import process_bls_to_execution_change
 from .deposit_request import process_deposit_request
 from .withdrawal_request import process_withdrawal_request
 from .consolidation_request import process_consolidation_request
-from .gloas import process_execution_payload_bid, process_payload_attestation
+from .gloas import (
+    process_execution_payload_bid,
+    process_payload_attestation,
+    process_parent_execution_payload,
+    apply_parent_execution_payload,
+    settle_builder_payment,
+)
 
 __all__ = [
     "process_proposer_slashing",
@@ -25,4 +31,7 @@ __all__ = [
     "process_consolidation_request",
     "process_execution_payload_bid",
     "process_payload_attestation",
+    "process_parent_execution_payload",
+    "apply_parent_execution_payload",
+    "settle_builder_payment",
 ]

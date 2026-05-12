@@ -1,0 +1,28 @@
+# consensoor against the public glamsterdam-devnet-3 checkpoint URL only.
+# Bootstraps state from the public ethpandaops endpoint, then keeps up via
+# the rust libp2p binding (auto-bootstrap from the same URL's identity if
+# any) and HTTP polling for /eth/v2/beacon/blocks/finalized.
+participants:
+  - el_type: geth
+    el_image: ethpandaops/geth:bal-devnet-6
+    cl_type: consensoor
+    cl_image: ethpandaops/consensoor:main
+    count: 1
+    validator_count: 0
+    cl_extra_params:
+      - "--checkpoint-sync-url=https://beacon.glamsterdam-devnet-3.ethpandaops.io"
+
+network_params:
+  network: glamsterdam-devnet-3
+
+additional_services:
+  - dora
+
+snooper_enabled: true
+global_log_level: debug
+
+port_publisher:
+  cl:
+    enabled: true
+  el:
+    enabled: true

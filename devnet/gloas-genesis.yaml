@@ -1,0 +1,27 @@
+participants:
+  - el_type: geth
+    el_image: ethpandaops/geth:bal-devnet-6
+    cl_type: lighthouse
+    cl_image: ethpandaops/lighthouse:glamsterdam-devnet-3
+    count: 3
+  - el_type: geth
+    el_image: ethpandaops/geth:bal-devnet-6
+    cl_type: consensoor
+    cl_image: consensoor:latest
+network_params:
+  gloas_fork_epoch: 0
+  preset: mainnet
+
+additional_services:
+  - dora
+
+dora_params:
+  image: ethpandaops/dora:master
+snooper_enabled: true
+global_log_level: trace
+
+port_publisher:
+  cl:
+    enabled: true
+  additional_services:
+    enabled: true

@@ -129,6 +129,7 @@ class BlockBuilder:
         proposer_key: "ValidatorKey",
         execution_payload_dict: dict,
         blobs_bundle: dict | None = None,
+        execution_requests: list | None = None,
     ) -> Optional[AnySignedBeaconBlock]:
         """Build a complete signed beacon block."""
         import time as time_mod
@@ -220,7 +221,7 @@ class BlockBuilder:
         if fork == "gloas":
             # GLOAS (ePBS): Build execution payload bid for self-build mode
             execution_payload_bid = self._build_execution_payload_bid(
-                temp_state, slot, execution_payload_dict, blobs_bundle
+                temp_state, slot, execution_payload_dict, blobs_bundle, execution_requests
             )
             # Self-build uses G2 point-at-infinity signature (no actual signing needed)
             g2_point_at_infinity = b"\xc0" + b"\x00" * 95
@@ -431,6 +432,17 @@ class BlockBuilder:
         base_fields["blob_gas_used"] = uint64(hex_to_int(payload_dict.get("blobGasUsed", "0x0")))
         base_fields["excess_blob_gas"] = uint64(hex_to_int(payload_dict.get("excessBlobGas", "0x0")))
 
+        if fork == "gloas":
+            # Gloas adds block_access_list (EIP-7928) and slot_number (EIP-7843).
+            from ..spec.types.gloas import (
+                ExecutionPayload as GloasExecutionPayload,
+                BlockAccessList,
+            )
+            bal_hex = payload_dict.get("blockAccessList") or "0x"
+            base_fields["block_access_list"] = BlockAccessList(hex_to_bytes(bal_hex))
+            base_fields["slot_number"] = uint64(hex_to_int(payload_dict.get("slotNumber", "0x0")))
+            return GloasExecutionPayload(**base_fields)
+
         return ExecutionPayload(**base_fields)
 
     def _build_block_body(self, state, randao_reveal: BLSSignature, execution_payload, fork: str, attestations=None):
@@ -568,6 +580,7 @@ class BlockBuilder:
         slot: int,
         execution_payload_dict: dict,
         blobs_bundle: dict | None = None,
+        execution_requests: list | None = None,
     ) -> ExecutionPayloadBid:
         """Build an ExecutionPayloadBid for self-build mode (ePBS).
 
@@ -575,6 +588,11 @@ class BlockBuilder:
         The builder_index is set to BUILDER_INDEX_SELF_BUILD (2^64 - 1).
         """
         from ..spec.types.base import uint64
+        from ..spec.types.electra import (
+            DepositRequest,
+            WithdrawalRequest,
+            ConsolidationRequest,
+        )
 
         def hex_to_bytes(h: str) -> bytes:
             return bytes.fromhex(h.replace("0x", ""))
@@ -596,6 +614,31 @@ class BlockBuilder:
             for c in blobs_bundle.get("commitments", []):
                 kzg_commitments.append(KZGCommitment(hex_to_bytes(c)))
 
+        # Bid commits to hash_tree_root(envelope.execution_requests). The
+        # envelope is built from the same EL request list, so build the
+        # ExecutionRequests container here and hash it. Lighthouse asserts
+        # bid.execution_requests_root == hash_tree_root(envelope.execution_requests).
+        exec_requests_obj = ExecutionRequests(
+            deposits=[],
+            withdrawals=[],
+            consolidations=[],
+        )
+        for req_hex in execution_requests or []:
+            if not isinstance(req_hex, str):
+                continue
+            req_bytes = hex_to_bytes(req_hex)
+            if not req_bytes:
+                continue
+            req_type = req_bytes[0]
+            req_data = req_bytes[1:]
+            if req_type == 0x00:
+                exec_requests_obj.deposits.append(DepositRequest.decode_bytes(req_data))
+            elif req_type == 0x01:
+                exec_requests_obj.withdrawals.append(WithdrawalRequest.decode_bytes(req_data))
+            elif req_type == 0x02:
+                exec_requests_obj.consolidations.append(ConsolidationRequest.decode_bytes(req_data))
+        execution_requests_root = hash_tree_root(exec_requests_obj)
+
         bid = ExecutionPayloadBid(
             parent_block_hash=Hash32(parent_block_hash),
             parent_block_root=Root(parent_block_root),
@@ -608,6 +651,7 @@ class BlockBuilder:
             value=Gwei(0),
             execution_payment=Gwei(0),
             blob_kzg_commitments=kzg_commitments,
+            execution_requests_root=Root(execution_requests_root),
         )
 
         logger.debug(
@@ -651,9 +695,17 @@ class BlockBuilder:
         if attestations:
             logger.info(f"Including {len(attestations)} attestations in GLOAS block body")
 
-        # TODO: Get payload attestations from PTC pool
-        # For now, empty payload_attestations since we're doing self-build
-        payload_attestations = []
+        # Aggregate PTC votes for the parent slot. Empty list is allowed
+        # by spec but starves PTC reward distribution; whenever we have
+        # gossip-collected PayloadAttestationMessages they get folded in.
+        parent_slot = max(0, int(state.slot) - 1)
+        try:
+            payload_attestations = self.node.payload_attestation_pool.get_aggregates_for_slot(
+                parent_slot
+            )
+        except Exception as e:
+            logger.warning(f"PTC aggregate fetch failed: {e}")
+            payload_attestations = []
 
         return GloasBeaconBlockBody(
             randao_reveal=randao_reveal,

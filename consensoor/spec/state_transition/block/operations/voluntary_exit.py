@@ -39,8 +39,49 @@ def process_voluntary_exit(
     """
     voluntary_exit = signed_voluntary_exit.message
     validator_index = int(voluntary_exit.validator_index)
-    validator = state.validators[validator_index]
     current_epoch = get_current_epoch(state)
+    config = get_config()
+
+    # Compute domain (Deneb+ uses CAPELLA_FORK_VERSION; pre-Deneb uses exit epoch)
+    current_fork_version = bytes(state.fork.current_version)
+    is_deneb_or_later = current_fork_version >= config.deneb_fork_version
+    is_electra_or_later = current_fork_version >= config.electra_fork_version
+    is_gloas_or_later = current_fork_version >= config.gloas_fork_version
+
+    # Exits must specify an epoch when they become valid; they are not valid before then
+    assert current_epoch >= int(voluntary_exit.epoch), (
+        "Exit epoch has not been reached"
+    )
+
+    # [New in Gloas:EIP7732] Check if this is a builder exit
+    if is_gloas_or_later:
+        from ...helpers.predicates import is_builder_index, is_active_builder
+        from ...helpers.misc import convert_validator_index_to_builder_index
+        from ...helpers.accessors import get_pending_balance_to_withdraw_for_builder
+        from ...helpers.mutators import initiate_builder_exit
+
+        if is_builder_index(validator_index):
+            builder_index = convert_validator_index_to_builder_index(validator_index)
+            assert is_active_builder(state, builder_index), "Builder is not active"
+            assert get_pending_balance_to_withdraw_for_builder(state, builder_index) == 0, (
+                "Builder has pending withdrawals"
+            )
+            pubkey = state.builders[builder_index].pubkey
+            domain = compute_domain(
+                DOMAIN_VOLUNTARY_EXIT,
+                config.capella_fork_version,
+                bytes(state.genesis_validators_root),
+            )
+            signing_root = compute_signing_root(voluntary_exit, domain)
+            assert bls_verify(
+                [bytes(pubkey)],
+                signing_root,
+                bytes(signed_voluntary_exit.signature),
+            ), "Invalid builder voluntary exit signature"
+            initiate_builder_exit(state, builder_index)
+            return
+
+    validator = state.validators[validator_index]
 
     # Verify the validator is active
     assert is_active_validator(validator, current_epoch), (
@@ -52,21 +93,10 @@ def process_voluntary_exit(
         "Validator has already initiated exit"
     )
 
-    # Verify exit epoch has passed
-    assert current_epoch >= int(voluntary_exit.epoch), (
-        "Exit epoch has not been reached"
-    )
-
     # Verify the validator has been active long enough
     assert current_epoch >= int(validator.activation_epoch) + SHARD_COMMITTEE_PERIOD(), (
         "Validator has not been active long enough"
     )
-
-    # Fork detection for EIP-7044 (Deneb) and EIP-7251 (Electra)
-    config = get_config()
-    current_fork_version = bytes(state.fork.current_version)
-    is_deneb_or_later = current_fork_version >= config.deneb_fork_version
-    is_electra_or_later = current_fork_version >= config.electra_fork_version
 
     # EIP-7251: Only exit validator if it has no pending withdrawals in the queue
     if is_electra_or_later:

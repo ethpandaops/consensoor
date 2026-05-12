@@ -186,7 +186,7 @@ def get_builders_sweep_withdrawals(
     from ..helpers.misc import convert_builder_index_to_validator_index
 
     epoch = get_current_epoch(state)
-    builders_limit = min(len(state.builders), MAX_BUILDERS_PER_WITHDRAWALS_SWEEP)
+    builders_limit = min(len(state.builders), MAX_BUILDERS_PER_WITHDRAWALS_SWEEP())
     withdrawals_limit = MAX_WITHDRAWALS_PER_PAYLOAD() - 1
     processed_count = 0
     withdrawals: List[Withdrawal] = []
@@ -426,14 +426,9 @@ def process_withdrawals(state: "BeaconState", payload=None) -> None:
     Raises:
         AssertionError: If withdrawals don't match expected
     """
-    if hasattr(state, "execution_payload_availability"):
-        latest_bid_slot = int(state.latest_execution_payload_bid.slot)
-        slot_index = latest_bid_slot % SLOTS_PER_HISTORICAL_ROOT()
-        if latest_bid_slot != 0 and state.execution_payload_availability[slot_index] == 0:
-            return
-
+    # Gloas: return early if parent block is empty
     if hasattr(state, "payload_expected_withdrawals"):
-        if bytes(state.latest_execution_payload_bid.block_hash) != bytes(state.latest_block_hash):
+        if bytes(state.latest_block_hash) != bytes(state.latest_execution_payload_bid.block_hash):
             return
 
     expected = get_expected_withdrawals(state)

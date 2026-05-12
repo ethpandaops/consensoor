@@ -3,6 +3,8 @@
 import asyncio
 import json
 import logging
+import queue
+import threading
 from typing import Optional
 from aiohttp import web
 
@@ -28,6 +30,15 @@ class BeaconAPI:
         self._last_head_root: Optional[bytes] = None
         self._last_finalized_epoch: int = 0
         self._event_emitter_task: Optional[asyncio.Task] = None
+        self._event_drainer_task: Optional[asyncio.Task] = None
+        # The HTTP server runs on its own thread + asyncio loop so the kurtosis
+        # healthcheck and other API consumers stay responsive even when the
+        # main loop is busy with state-transition / signing / engine RPCs.
+        self._api_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._api_thread: Optional[threading.Thread] = None
+        # Cross-loop event hand-off: emit_* methods are called from the main
+        # loop and push events here; a coroutine on the API loop drains them.
+        self._cross_loop_events: "queue.Queue[dict]" = queue.Queue()
         self._setup_routes()
 
     def _setup_routes(self):
@@ -60,24 +71,77 @@ class BeaconAPI:
         self.app.router.add_get("/eth/v1/events", self.get_events)
 
     async def start(self):
-        """Start the API server."""
+        """Start the API server on its own thread + event loop."""
+        ready = threading.Event()
+        startup_error: list[BaseException] = []
+
+        def _run_api_loop():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            self._api_loop = loop
+            try:
+                loop.run_until_complete(self._setup_on_api_loop())
+            except BaseException as e:
+                startup_error.append(e)
+                ready.set()
+                return
+            ready.set()
+            try:
+                loop.run_forever()
+            finally:
+                try:
+                    loop.run_until_complete(self._teardown_on_api_loop())
+                finally:
+                    loop.close()
+
+        self._api_thread = threading.Thread(
+            target=_run_api_loop, name="beacon-api", daemon=True
+        )
+        self._api_thread.start()
+        ready.wait()
+        if startup_error:
+            raise startup_error[0]
+        logger.info(f"Beacon API listening on {self.host}:{self.port}")
+
+    async def _setup_on_api_loop(self) -> None:
+        """Set up the aiohttp app + background tasks on the API loop."""
         self.runner = web.AppRunner(self.app)
         await self.runner.setup()
         site = web.TCPSite(self.runner, self.host, self.port)
         await site.start()
         self._event_emitter_task = asyncio.create_task(self._emit_events_loop())
-        logger.info(f"Beacon API listening on {self.host}:{self.port}")
+        self._event_drainer_task = asyncio.create_task(self._drain_cross_loop_events())
+
+    async def _teardown_on_api_loop(self) -> None:
+        for task in (self._event_emitter_task, self._event_drainer_task):
+            if task is not None:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+        if self.runner is not None:
+            await self.runner.cleanup()
 
     async def stop(self):
-        """Stop the API server."""
-        if self._event_emitter_task:
-            self._event_emitter_task.cancel()
+        """Stop the API server and join its thread."""
+        loop = self._api_loop
+        if loop is not None and loop.is_running():
+            loop.call_soon_threadsafe(loop.stop)
+        if self._api_thread is not None:
+            self._api_thread.join(timeout=5.0)
+
+    async def _drain_cross_loop_events(self) -> None:
+        """Pull events posted from other threads and broadcast them on this loop."""
+        while True:
             try:
-                await self._event_emitter_task
+                event = await asyncio.to_thread(self._cross_loop_events.get)
             except asyncio.CancelledError:
-                pass
-        if self.runner:
-            await self.runner.cleanup()
+                break
+            try:
+                await self._broadcast_event(event)
+            except Exception as e:
+                logger.error(f"Error broadcasting cross-loop event: {e}")
 
     async def get_health(self, request: web.Request) -> web.Response:
         """GET /eth/v1/node/health"""
@@ -114,15 +178,41 @@ class BeaconAPI:
         local_ip = get_local_ip()
         listen_port = self.node.config.listen_port
 
+        host = self.node.beacon_gossip._host if self.node.beacon_gossip else None
         if self.node.beacon_gossip and self.node.beacon_gossip.peer_id:
             peer_id = self.node.beacon_gossip.peer_id
-            enr = self.node.beacon_gossip._host.enr or ""
-            multiaddr = self.node.beacon_gossip._host.multiaddr
-            p2p_addresses = [multiaddr] if multiaddr else []
+            enr = host.enr or "" if host else ""
+            multiaddr = host.multiaddr if host else None
         else:
             peer_id = generate_peer_id(f"consensoor-{local_ip}-{self.port}")
             enr = ""
-            p2p_addresses = [f"/ip4/{local_ip}/tcp/{listen_port}/p2p/{peer_id}"]
+            multiaddr = None
+
+        # Kurtosis extracts p2p_addresses[0] during service bring-up, so always
+        # return a usable multiaddr — fall back to a synthesised one when the
+        # rust libp2p host hasn't published its listen addrs yet.
+        if not multiaddr:
+            multiaddr = f"/ip4/{local_ip}/tcp/{listen_port}/p2p/{peer_id}"
+        p2p_addresses = [multiaddr]
+
+        # MetaData v3 mirrors what we advertise on the `/eth2/.../meta_data/3`
+        # RPC. Pull the live values out of the P2P host so dora and other
+        # monitors see the current seq_number and the post-bump
+        # custody_group_count instead of the static "1" + hardcoded attnets.
+        if host is not None:
+            meta = {
+                "seq_number": str(host._our_metadata_seq),
+                "attnets": "0x" + host.config.attnets.hex(),
+                "syncnets": "0x" + host.config.syncnets.hex(),
+                "custody_group_count": str(host.config.custody_group_count),
+            }
+        else:
+            meta = {
+                "seq_number": "0",
+                "attnets": "0xffffffffffffffff",
+                "syncnets": "0x0f",
+                "custody_group_count": "4",
+            }
 
         return web.json_response({
             "data": {
@@ -132,11 +222,7 @@ class BeaconAPI:
                 "discovery_addresses": [
                     f"/ip4/{local_ip}/udp/{listen_port}/p2p/{peer_id}"
                 ],
-                "metadata": {
-                    "seq_number": "1",
-                    "attnets": "0xffffffffffffffff",
-                    "syncnets": "0x0f",
-                }
+                "metadata": meta,
             }
         })
 
@@ -148,7 +234,7 @@ class BeaconAPI:
         if self.node.beacon_gossip and hasattr(self.node.beacon_gossip, '_host'):
             p2p_host = self.node.beacon_gossip._host
             if p2p_host and hasattr(p2p_host, 'connected_peers'):
-                for peer_info in p2p_host.connected_peers:
+                for peer_info in p2p_host.connected_peers():
                     peer_id = peer_info.get("peer_id", "")
                     addrs = peer_info.get("addrs", [])
                     direction = peer_info.get("direction", "unknown")
@@ -1286,20 +1372,24 @@ class BeaconAPI:
                 logger.warning("Event queue full for subscriber, dropping event")
 
     async def emit_execution_payload_available(self, slot: int, block_root: bytes) -> None:
-        """Emit execution_payload_available SSE event (ePBS)."""
-        event = {
+        """Emit execution_payload_available SSE event (ePBS).
+
+        Called from the main loop; we hand the event to the API loop via a
+        thread-safe queue so we never touch its asyncio.Queue subscribers
+        directly from the wrong loop.
+        """
+        self._cross_loop_events.put({
             "event": "execution_payload_available",
             "data": {
                 "slot": str(slot),
                 "block_root": "0x" + block_root.hex(),
             },
-        }
-        await self._broadcast_event(event)
+        })
 
     async def emit_execution_payload_bid(self, signed_bid) -> None:
         """Emit execution_payload_bid SSE event (ePBS)."""
         bid = signed_bid.message
-        event = {
+        self._cross_loop_events.put({
             "event": "execution_payload_bid",
             "data": {
                 "message": {
@@ -1317,5 +1407,4 @@ class BeaconAPI:
                 },
                 "signature": "0x" + bytes(signed_bid.signature).hex(),
             },
-        }
-        await self._broadcast_event(event)
+        })

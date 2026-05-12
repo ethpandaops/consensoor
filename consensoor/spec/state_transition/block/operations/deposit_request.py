@@ -84,13 +84,32 @@ def process_deposit_request(
 
     # Gloas: handle deposits differently (no deposit_requests_start_index update)
     if _is_gloas_state(state):
+        from .deposit import is_valid_deposit_signature as _check_signature
+
+        def is_pending_validator(pubkey) -> bool:
+            for pd in state.pending_deposits:
+                if pd.pubkey != pubkey:
+                    continue
+                if _check_signature(
+                    bytes(pd.pubkey),
+                    bytes(pd.withdrawal_credentials),
+                    int(pd.amount),
+                    bytes(pd.signature),
+                ):
+                    return True
+            return False
+
         builder_pubkeys = [b.pubkey for b in state.builders]
         validator_pubkeys = [v.pubkey for v in state.validators]
         is_builder = deposit_request.pubkey in builder_pubkeys
         is_validator = deposit_request.pubkey in validator_pubkeys
         is_builder_prefix = is_builder_withdrawal_credential(bytes(deposit_request.withdrawal_credentials))
 
-        if is_builder or (is_builder_prefix and not is_validator):
+        if is_builder or (
+            is_builder_prefix
+            and not is_validator
+            and not is_pending_validator(deposit_request.pubkey)
+        ):
             apply_deposit_for_builder(
                 deposit_request.pubkey,
                 deposit_request.withdrawal_credentials,
