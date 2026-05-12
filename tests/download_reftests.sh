@@ -49,7 +49,7 @@ if [[ "${spec_version}" == nightly* ]]; then
   done
 
   repo="${CONSENSUS_SPECS_REPO:-ethereum/consensus-specs}"
-  workflow="${CONSENSUS_SPECS_WORKFLOW:-nightly-reftests.yml}"
+  workflow="${CONSENSUS_SPECS_WORKFLOW:-tests.yml}"
   branch="${CONSENSUS_SPECS_BRANCH:-master}"
   api="https://api.github.com"
   auth_header="Authorization: token ${GITHUB_TOKEN}"
@@ -112,15 +112,7 @@ if [[ "${spec_version}" != nightly* ]]; then
 fi
 
 for preset in ${presets}; do
-  case "${preset}" in
-    minimal) artifact_name="Minimal Test Configuration" ;;
-    mainnet) artifact_name="Mainnet Test Configuration" ;;
-    general) artifact_name="General Test Configuration" ;;
-    *)
-      echo "Unsupported preset: ${preset} (expected: minimal|mainnet|general)"
-      exit 1
-      ;;
-  esac
+  artifact_name="${preset}.tar.gz"
 
   artifact_url="$(curl -s -H "${auth_header}" \
     "${api}/repos/${repo}/actions/runs/${run_id}/artifacts" | \
@@ -132,21 +124,13 @@ for preset in ${presets}; do
     exit 1
   fi
 
-  zip_path="${spec_tests_dir}/${preset}.zip"
+  tar_path="${spec_tests_dir}/${preset}.tar.gz"
 
   echo "Downloading artifact: ${artifact_name} (run ${run_id})"
   curl --progress-bar --location --show-error --retry 3 --retry-all-errors --fail \
     -H "${auth_header}" -H "Accept: application/vnd.github+json" \
-    --output "${zip_path}" "${artifact_url}"
+    --output "${tar_path}" "${artifact_url}"
 
-  unzip -qo "${zip_path}" -d "${spec_tests_dir}"
-  rm -f "${zip_path}"
-
-  tar_path="${spec_tests_dir}/${preset}.tar.gz"
-  if [[ ! -f "${tar_path}" ]]; then
-    echo "Expected ${tar_path} after download, but it was not found"
-    exit 1
-  fi
   if [[ ! -d "${spec_tests_dir}/tests/${preset}" ]]; then
     echo "Extracting ${preset}..."
     tar -xzf "${tar_path}" -C "${spec_tests_dir}"
