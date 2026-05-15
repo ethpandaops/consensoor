@@ -5,12 +5,11 @@ Lightweight Python consensus layer client for local testing and prototyping.
 ## Features
 
 - Implements Gloas consensus spec (EIP-7732 ePBS)
-- libp2p-based P2P networking with gossipsub
+- Native Rust libp2p stack (`consensoor-p2p-rs`) — TCP+Noise+Yamux/Mplex, gossipsub, identify, ping, req/resp; replaces py-libp2p, which was too slow and unreliable under the GIL to keep up with gossip mesh management on a live devnet
 - ENR generation with eth2 field for network identification
-- State synchronization from upstream beacon node (checkpoint sync)
-- Engine API client for execution layer integration
-- Validator key loading (EIP-2335 keystores)
-- Block production when assigned as proposer
+- State synchronization from upstream beacon node (checkpoint sync) plus gossipsub block sync from peers
+- Engine API client with binary SSZ-over-REST transport (execution-apis [#764](https://github.com/ethereum/execution-apis/pull/764)) — auto-negotiated via `engine_exchangeCapabilities`, used by default when the EL advertises support; JSON-RPC is the fallback
+- Validator key loading (EIP-2335 keystores), attestation/sync-committee/payload-attestation pools, block production when assigned as proposer
 - Supports both mainnet and minimal presets
 - Auto-fetches upstream config from ethereum/consensus-specs if not provided
 - Designed for Kurtosis local devnets
@@ -33,8 +32,8 @@ Lightweight Python consensus layer client for local testing and prototyping.
 | `blspy` | Fast BLS12-381 cryptography (C/assembly, 100x faster than py_ecc) |
 | `plyvel` | LevelDB bindings for state/block storage |
 | `remerkleable` | SSZ serialization and Merkleization |
-| `libp2p` | P2P networking with gossipsub |
-| `aiohttp` | Async HTTP for Engine API and Beacon API |
+| `consensoor_p2p` | In-tree Rust libp2p binding (`consensoor-p2p-rs`); pyo3 wheel built with maturin, ships TCP+Noise+Yamux/Mplex, gossipsub, identify, ping and req/resp configured to Lighthouse's defaults |
+| `aiohttp` | Async HTTP for Engine API (JSON-RPC + SSZ-REST) and Beacon API |
 
 ## Installation
 
@@ -42,7 +41,12 @@ Lightweight Python consensus layer client for local testing and prototyping.
 uv venv --python 3.12
 source .venv/bin/activate
 uv pip install -e ".[dev]"
+
+# Build & install the Rust p2p extension into the active venv
+cd consensoor-p2p-rs && python3 -m maturin develop --release && cd ..
 ```
+
+The Docker build does both wheels in a multi-stage image — see [Docker](#docker).
 
 ## Usage
 
@@ -122,69 +126,77 @@ The EL client info is obtained via `engine_getClientVersionV1`. If unavailable, 
 
 ```
 consensoor/
-├── spec/               # Consensus spec implementation
-│   ├── types/          # SSZ containers (BeaconState, BeaconBlock, etc.)
-│   ├── constants.py    # Preset values organized by fork
-│   └── network_config.py   # Runtime config from YAML or upstream
-├── crypto/             # BLS signatures (blspy), hashing
-│   └── crypto.py       # BLS sign/verify, hash_tree_root
-├── p2p/                # libp2p networking
-│   ├── host.py         # P2P host with ENR generation
-│   ├── gossip.py       # Beacon gossip topics
-│   └── encoding.py     # Message encoding (snappy)
-├── network/            # UDP gossip layer (legacy)
-│   └── gossip.py       # Simple UDP gossip for local testing
-├── engine/             # Engine API client
-│   ├── types.py        # Payload types and responses
-│   └── client.py       # JSON-RPC client
-├── store/              # State and block storage (LevelDB)
-│   └── store.py        # LevelDB-backed persistent store
-├── metrics/            # Prometheus metrics
-│   └── metrics.py      # Metric definitions and helpers
-├── validator/          # Validator duties
-│   ├── types.py        # ValidatorKey, ProposerDuty, etc.
-│   ├── shuffling.py    # Proposer selection algorithms
-│   ├── keystore.py     # EIP-2335 keystore loading
-│   └── client.py       # ValidatorClient
-├── builder/            # Block building
-├── beacon_api/         # Beacon API HTTP server
-│   ├── server.py       # HTTP routes
-│   ├── spec.py         # /eth/v1/config/spec builder
-│   └── utils.py        # Helper functions
-├── beacon_sync/        # State synchronization
-│   ├── client.py       # Remote beacon client (SSE)
-│   └── sync.py         # State sync manager
-├── version.py          # Version info and graffiti builder
-├── node.py             # Main orchestration
-├── config.py           # Node configuration
-└── cli.py              # CLI entry point
+├── spec/                       # Consensus spec implementation
+│   ├── types/                  # SSZ containers per fork (phase0…gloas)
+│   ├── state_transition/       # Block / epoch processing, fork upgrades
+│   ├── constants.py            # Preset values organized by fork
+│   └── network_config.py       # Runtime config from YAML or upstream
+├── ssz/                        # In-tree SSZ helpers
+├── crypto/                     # BLS signatures (blspy), hashing
+├── p2p/                        # Thin Python shim over the Rust libp2p stack
+│   ├── host.py                 # Wraps consensoor_p2p.Network (Rust)
+│   ├── gossip.py               # Beacon gossip topics + handlers
+│   └── encoding.py             # Snappy-framed req/resp encoding
+├── engine/                     # Engine API client (JSON-RPC + SSZ-REST)
+│   ├── client.py               # Versioned methods, capability negotiation
+│   ├── ssz_types.py            # SSZ containers from execution-apis #764
+│   └── types.py                # Dataclasses returned to callers
+├── store/                      # LevelDB-backed persistent state/block store
+├── metrics/                    # Prometheus metrics
+├── validator/                  # Validator duties, keystores, shuffling
+├── builder/                    # Block building (incl. ePBS payload bids)
+├── beacon_api/                 # Beacon API HTTP server
+│   ├── server.py               # HTTP routes
+│   ├── spec.py                 # /eth/v1/config/spec builder
+│   └── utils.py
+├── beacon_sync/                # SSE+REST sync from an upstream beacon node
+├── attestation_pool.py         # Unaggregated/aggregate attestation pool
+├── sync_committee_pool.py      # Sync committee messages + contributions
+├── payload_attestation_pool.py # PTC (Gloas) payload-attestation pool
+├── version.py                  # Version info and graffiti builder
+├── node.py                     # Main orchestration
+├── config.py                   # Node configuration
+└── cli.py                      # CLI entry point
+
+consensoor-p2p-rs/              # Rust crate (pyo3/maturin) — see its README
+└── src/                        # libp2p host, gossipsub, req/resp wired like Lighthouse
 
 tests/
-├── spec/               # Consensus spec tests
-│   ├── conftest.py     # Pytest fixtures
-│   └── test_spec_runner.py  # Test runner for all forks
-└── spec-tests/         # Downloaded spec tests (gitignored)
+├── spec/                       # Consensus spec tests
+│   ├── conftest.py             # Pytest fixtures
+│   └── test_spec_runner.py     # Spec + fork-choice compliance runner
+└── spec-tests/                 # Downloaded spec tests (gitignored)
 ```
 
 ## P2P Networking
 
-Consensoor uses libp2p with gossipsub for P2P networking:
+P2P runs on a native Rust libp2p host (`consensoor-p2p-rs`) exposed to Python via pyo3. The transport stack is configured the same way Lighthouse configures `lighthouse_network`: TCP + Noise + Yamux (with Mplex as required by `consensus-specs/specs/phase0/p2p-interface.md`), gossipsub with the Eth2 message-id rules, identify, ping, and request/response.
 
-- ENR includes `eth2` field for network identification
-- Supports bootnode discovery via ENR
-- Subscribes to beacon block and aggregate attestation topics
-- Message encoding uses snappy framing format
-- Dynamic fork digest calculation with blob parameters
-- Req/resp protocol support (Status, Ping, Metadata)
+**Why a Rust binding instead of pure Python?** py-libp2p was the original implementation, but on a live devnet it could not keep up: gossipsub mesh management (GRAFT/PRUNE bookkeeping, message-cache scans) stalled under the GIL, peers timed out the Status/Metadata exchanges and the mesh fell apart within a couple of slots. The Rust host runs on a tokio runtime entirely outside the GIL and only crosses into Python to hand decoded messages up to the node; the slow path is gone.
+
+- ENR includes the `eth2` field for network identification, with dynamic fork digest calculation (blob parameters folded in for Fulu+)
+- Bootnode discovery via ENR
+- Subscribes to beacon block and aggregate attestation topics, plus payload-attestation topics on Gloas
+- Snappy framing format on req/resp; gossipsub uses snappy-block compression
+- Req/resp protocol support (Status, Ping, Metadata v2, BeaconBlocksByRange/Root, BlobSidecars, DataColumnSidecars)
+- Cached `StatusMessage` is mirrored into the Rust binding so the host can answer inbound `/eth2/beacon_chain/req/status/1/` without round-tripping into Python
 
 ## State Synchronization
 
-When `--checkpoint-sync-url` is provided, consensoor syncs state from an upstream beacon node:
+Consensoor has two paths into a running network:
 
-- Subscribes to SSE events for block and finality notifications
-- Periodically syncs state at epoch boundaries
-- Updates randao_mixes, validators, checkpoints from upstream
-- Enables accurate proposer calculation via synced state
+**Checkpoint sync (initial state)** — when `--checkpoint-sync-url` is provided, the node fetches a recent state SSZ from an upstream beacon node, subscribes to its SSE event stream, and re-syncs state at epoch boundaries (`randao_mixes`, validators, checkpoints). This is what gets the node to a usable head before peering up.
+
+**Gossipsub block sync (steady state)** — once peered, the node receives `beacon_block` messages over the Rust libp2p host, verifies and applies them through the state-transition functions, and updates the EL via `engine_newPayload` + `engine_forkchoiceUpdated`. Per project policy this is the default sync path; full beacon-API checkpoint-sync replay is intentionally not used in steady state.
+
+## Engine API
+
+Two transports, negotiated automatically on startup via JSON-RPC `engine_exchangeCapabilities`:
+
+- **Binary SSZ over REST** (default when available, per execution-apis [#764](https://github.com/ethereum/execution-apis/pull/764)) — requests/responses are raw SSZ over `application/octet-stream` on the existing 8551 port. The CL advertises strings like `"POST /engine/v4/payloads"` alongside its JSON-RPC method names; for any endpoint the EL also advertises in that form, the CL switches to binary. Eliminates hex-encoding, JSON parsing and the SSZ↔JSON round-trip that the CL already pays internally.
+- **JSON-RPC** — used at all times for `engine_exchangeCapabilities` itself, and as the fallback for any endpoint where SSZ was not negotiated.
+
+The implementation covers `engine_newPayloadV{1-5}`, `engine_getPayloadV{1-6}`, `engine_forkchoiceUpdatedV{1-4}`, `engine_getBlobsV{1-3}`, `engine_getClientVersionV1` and `engine_exchangeCapabilities`. Nullable JSON fields are encoded as `List[T, 1]` in SSZ per the spec.
 
 ## Spec Tests
 
@@ -249,6 +261,7 @@ Implements subset of standard Beacon API:
 - `GET /eth/v2/beacon/blocks/{block_id}`
 - `GET /eth/v1/beacon/blocks/{block_id}/root`
 - `GET /eth/v1/beacon/blob_sidecars/{block_id}`
+- `GET /eth/v1/beacon/execution_payload_envelope/{block_id}` (Gloas)
 - `GET /eth/v1/beacon/states/{state_id}/root`
 - `GET /eth/v1/beacon/states/{state_id}/fork`
 - `GET /eth/v1/beacon/states/{state_id}/finality_checkpoints`
@@ -322,12 +335,11 @@ Consensoor implements the builder role with:
 
 This is a prototype for local testing. Not intended for production use.
 
-- No full fork choice implementation
-- Simplified state transition
+- Simplified, not-fully-spec-compliant fork choice
+- State transition is implemented for all forks but has known divergence cases (see `CLAUDE.md` for the `debug_state_diff.py` workflow)
 - No slashing protection
-- Falls back to py_ecc (slow) if blspy unavailable
-- No proper sync protocol (relies on checkpoint sync)
-- Limited validator/builder logic
+- Falls back to py_ecc (slow) if blspy is unavailable
+- Validator/builder logic is intentionally minimal — enough to propose and attest on a devnet, not enough to operate on mainnet
 
 ## License
 
