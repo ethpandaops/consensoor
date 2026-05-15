@@ -27,6 +27,34 @@ logger = logging.getLogger(__name__)
 MessageHandler = Callable[[bytes, str], Awaitable[None]]
 
 
+# Per-PR #606 PeerScoreReason penalty applied to a peer's running score
+# when an event is recorded. Numbers are deliberately small and roughly
+# proportional to severity — they're a placeholder for a real scoring
+# policy, not a production-grade peer manager. Range is consistent with
+# lighthouse-style scoring (baseline 0, worse peers go more negative);
+# the spec calls these implementation-defined and not cross-client
+# comparable. Unknown reasons fall through to -1.0.
+_PEER_SCORE_PENALTY: dict[str, float] = {
+    "gossip_invalid_block": -10.0,
+    "gossip_invalid_attestation": -5.0,
+    "gossip_invalid_blob_sidecar": -5.0,
+    "gossip_invalid_data_column_sidecar": -5.0,
+    "rpc_invalid_request": -5.0,
+    "rpc_invalid_response": -5.0,
+    "rpc_rate_limited": -1.0,
+    "rpc_timeout": -3.0,
+    "rpc_io_error": -3.0,
+    "rpc_bad_blocks_by_range": -7.0,
+    "rpc_bad_blocks_by_root": -7.0,
+    "sync_bad_batch": -10.0,
+    # Fork mismatch → disconnect; flag aggressively even though we
+    # don't validate Status fork_digest yet.
+    "status_unviable_fork": -100.0,
+    "behaviour_penalty": -5.0,
+    "unknown": -1.0,
+}
+
+
 def get_local_ip() -> str:
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -371,6 +399,20 @@ class P2PHost:
                 logger.debug(f"Status response from {ev.peer[:24]}...: {ev.message}")
             elif ev.kind == "failure":
                 logger.debug(f"Status RPC failure with {ev.peer[:24]}...: {ev.error}")
+                # PR #606 PeerScoreReason classification from libp2p
+                # request-response error Display strings. We see things
+                # like "Timeout", "Io(...)", "ConnectionClosed",
+                # "UnsupportedProtocols", "DialFailure". Only the first
+                # two map cleanly to spec enum values — everything else
+                # is bucketed as rpc_invalid_response.
+                err_str = (ev.error or "").lower()
+                if "timeout" in err_str:
+                    reason = "rpc_timeout"
+                elif "io" in err_str:
+                    reason = "rpc_io_error"
+                else:
+                    reason = "rpc_invalid_response"
+                self.record_peer_score_event(ev.peer, reason)
 
     def _ping_loop(self) -> None:
         import consensoor_p2p as cp
@@ -428,16 +470,81 @@ class P2PHost:
             return 0
 
     def connected_peers(self) -> list[dict]:
-        """Return currently-connected peers as Beacon-API-shaped dicts."""
+        """Return currently-connected peers as Beacon-API-shaped dicts.
+
+        Includes per-peer fields needed by `/eth/v1/node/peers`
+        (beacon-APIs PR #606): base64 `enr` (empty if discv5 never
+        surfaced one), libp2p identify `agent_version` (empty until
+        handshake), client-native `score` (None until something records
+        one), and `downscore_reasons` (empty list until events recorded).
+        """
         if self._network is None:
             return []
+        # Prefer the richer accessor that ships all PR #606 fields; fall
+        # back to the legacy direction-only one if the binding hasn't
+        # been rebuilt yet (e.g. dev cycle where the .so is stale).
         try:
+            # Default score to 0.0 (lighthouse-style baseline) for every
+            # connected peer that hasn't been penalized yet — keeps the
+            # field visible in `/eth/v1/node/peers` instead of being
+            # omitted under the "field is None" gate.
             return [
-                {"peer_id": pid, "addrs": [], "direction": direction}
-                for pid, direction in self._network.connected_peers_with_direction()
+                {
+                    "peer_id": pid,
+                    "addrs": [],
+                    "direction": direction,
+                    "enr": enr,
+                    "agent_version": agent,
+                    "score": 0.0 if score is None else score,
+                    "downscore_reasons": list(downscore_reasons or []),
+                }
+                for pid, direction, enr, agent, score, downscore_reasons
+                in self._network.connected_peers_with_meta()
             ]
+        except AttributeError:
+            try:
+                return [
+                    {
+                        "peer_id": pid,
+                        "addrs": [],
+                        "direction": direction,
+                        "enr": "",
+                        "agent_version": "",
+                        "score": 0.0,
+                        "downscore_reasons": [],
+                    }
+                    for pid, direction in self._network.connected_peers_with_direction()
+                ]
+            except Exception:
+                return []
         except Exception:
             return []
+
+    def set_peer_score(self, peer_id: str, score: float) -> None:
+        """Record the client-native score for `peer_id` (beacon-APIs
+        PR #606 `score` field). Plumbing only — consensoor doesn't
+        compute scores today; this exists so a future scoring policy
+        can write through to the beacon API without further binding work."""
+        if self._network is None:
+            return
+        try:
+            self._network.set_peer_score(peer_id, float(score))
+        except (AttributeError, Exception):
+            pass
+
+    def record_peer_score_event(self, peer_id: str, reason: str) -> None:
+        """Push a PR #606 `PeerScoreReason` onto the peer's downscore-
+        reasons ring buffer AND apply the corresponding penalty from
+        `_PEER_SCORE_PENALTY` to the peer's running score (atomic on
+        the Rust side). Unknown reasons get -1.0. The spec tolerates
+        unknown values for `reason`, so no enum validation here."""
+        if self._network is None:
+            return
+        delta = _PEER_SCORE_PENALTY.get(reason, -1.0)
+        try:
+            self._network.record_peer_score_event(peer_id, str(reason), float(delta))
+        except (AttributeError, Exception):
+            pass
 
     @property
     def enr(self) -> Optional[str]:

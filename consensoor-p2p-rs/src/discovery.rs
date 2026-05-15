@@ -30,15 +30,16 @@ const FIND_NODE_INTERVAL: Duration = Duration::from_secs(10);
 /// Spawn the discv5 service. Returns once the service has started; the
 /// background discovery loop keeps running on the caller's tokio runtime.
 ///
-/// `discovered_tx` is sent a list of `Multiaddr`s (one per newly-seen ENR)
-/// after every `find_node` query — the swarm task receives those and issues
-/// a libp2p `Dial` for each.
+/// `discovered_tx` is sent one `(PeerId, base64 ENR string, Multiaddr)`
+/// tuple per newly-seen ENR after every `find_node` query — the swarm task
+/// receives those, remembers the ENR keyed by peer id (so we can surface
+/// it via `/eth/v1/node/peers`), and issues a libp2p `Dial` for each.
 pub async fn spawn_discovery(
     local_enr: Enr,
     enr_key: CombinedKey,
     udp_port: u16,
     bootnodes: Vec<Enr>,
-    discovered_tx: Sender<Multiaddr>,
+    discovered_tx: Sender<(PeerId, String, Multiaddr)>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listen_config = ListenConfig::Ipv4 {
         ip: "0.0.0.0".parse()?,
@@ -50,11 +51,22 @@ pub async fn spawn_discovery(
         dyn std::error::Error + Send + Sync,
     > { Box::from(e.to_string()) })?;
 
-    for enr in bootnodes {
+    // Echo bootnode ENRs back so the swarm task can stash them keyed by
+    // peer id. Without this, the very first peer we connect to has no
+    // ENR surfaced via /eth/v1/node/peers — find_node only yields ENRs
+    // we didn't already know about.
+    for enr in &bootnodes {
         let id = enr.node_id();
         match discv5.add_enr(enr.clone()) {
             Ok(_) => tracing::info!("discv5: added bootnode {id}"),
             Err(e) => tracing::warn!("discv5: add_enr {id} failed: {e}"),
+        }
+        if let Some((peer_id, addr)) = enr_to_peer_id_and_multiaddr(enr) {
+            let enr_b64 = enr.to_base64();
+            if discovered_tx.send((peer_id, enr_b64, addr)).await.is_err() {
+                tracing::debug!("discv5: discovered_tx closed during bootstrap");
+                return Ok(());
+            }
         }
     }
 
@@ -81,10 +93,11 @@ pub async fn spawn_discovery(
                         enrs.len()
                     );
                     for enr in enrs {
-                        if let Some(addr) = enr_to_libp2p_multiaddr(&enr) {
+                        if let Some((peer_id, addr)) = enr_to_peer_id_and_multiaddr(&enr) {
+                            let enr_b64 = enr.to_base64();
                             // Best-effort send; if the receiver is dropped
                             // (swarm shut down), break the loop.
-                            if discovered_tx.send(addr).await.is_err() {
+                            if discovered_tx.send((peer_id, enr_b64, addr)).await.is_err() {
                                 tracing::debug!("discv5: discovered_tx closed, stopping");
                                 return;
                             }
@@ -101,12 +114,12 @@ pub async fn spawn_discovery(
     Ok(())
 }
 
-/// Convert an Eth2 ENR to the libp2p multiaddr we'd dial.
+/// Convert an Eth2 ENR to the (PeerId, libp2p multiaddr) pair we'd dial.
 ///
 /// The ENR's `secp256k1` field gives us the libp2p PeerId; ip4/ip6 + tcp4/
 /// tcp6 give us the transport. Returns None for ENRs without a usable
 /// (ip, tcp) pair (e.g. UDP-only peers, or legacy ENRs without `secp256k1`).
-pub fn enr_to_libp2p_multiaddr(enr: &Enr) -> Option<Multiaddr> {
+pub fn enr_to_peer_id_and_multiaddr(enr: &Enr) -> Option<(PeerId, Multiaddr)> {
     let tcp_port = enr.tcp4().or_else(|| enr.tcp6())?;
     let ip = if let Some(v4) = enr.ip4() {
         Protocol::Ip4(v4)
@@ -133,5 +146,5 @@ pub fn enr_to_libp2p_multiaddr(enr: &Enr) -> Option<Multiaddr> {
     addr.push(ip);
     addr.push(Protocol::Tcp(tcp_port));
     addr.push(Protocol::P2p(peer_id));
-    Some(addr)
+    Some((peer_id, addr))
 }

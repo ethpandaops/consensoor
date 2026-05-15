@@ -27,6 +27,12 @@ libp2p = { version = "0.55", features = [
     "websocket",
     "dns",
 ] }
+# mplex is required by consensus-specs/specs/phase0/p2p-interface.md:197 —
+# "Clients MUST support mplex and MAY support yamux. If both are supported by
+# the client, yamux MUST take precedence during negotiation." Lodestar
+# (js-libp2p) and nimbus (nim-libp2p) refuse to fall back when we don't
+# advertise mplex, so without this we silently fail to peer with them.
+libp2p-mplex = "0.43"
 futures = "0.3"
 async-channel = "2.3"
 parking_lot = "0.12"

@@ -227,10 +227,18 @@ class BeaconAPI:
         })
 
     async def get_peers(self, request: web.Request) -> web.Response:
-        """GET /eth/v1/node/peers"""
+        """GET /eth/v1/node/peers
+
+        Emits the base `Peer` schema plus the additive PR #606 fields
+        we track: `agent_version`, `score`, `downscore_reasons`. All
+        three are spec-OPTIONAL and omitted when empty/unknown rather
+        than emitted as nulls. `disconnect_reason` is also defined by
+        PR #606 but is gated by the spec to `disconnected`/`disconnecting`
+        peers only — this endpoint currently lists only `connected`
+        peers, so it never applies here.
+        """
         peers = []
 
-        # Get actual connected peers from P2P host
         if self.node.beacon_gossip and hasattr(self.node.beacon_gossip, '_host'):
             p2p_host = self.node.beacon_gossip._host
             if p2p_host and hasattr(p2p_host, 'connected_peers'):
@@ -238,13 +246,24 @@ class BeaconAPI:
                     peer_id = peer_info.get("peer_id", "")
                     addrs = peer_info.get("addrs", [])
                     direction = peer_info.get("direction", "unknown")
-                    peers.append({
+                    enr = peer_info.get("enr", "") or ""
+                    agent_version = peer_info.get("agent_version", "") or ""
+                    score = peer_info.get("score")
+                    downscore_reasons = peer_info.get("downscore_reasons") or []
+                    entry = {
                         "peer_id": peer_id,
-                        "enr": "",
+                        "enr": enr,
                         "last_seen_p2p_address": addrs[0] if addrs else "",
                         "state": "connected",
                         "direction": direction,
-                    })
+                    }
+                    if agent_version:
+                        entry["agent_version"] = agent_version
+                    if score is not None:
+                        entry["score"] = score
+                    if downscore_reasons:
+                        entry["downscore_reasons"] = downscore_reasons
+                    peers.append(entry)
 
         return web.json_response({
             "data": peers,

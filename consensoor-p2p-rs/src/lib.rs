@@ -21,10 +21,18 @@ use pyo3::prelude::*;
 
 #[pymodule]
 fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    // Default filter: info+ globally, but libp2p_gossipsub gets bumped
+    // to error+ because its WARN-level chatter is dominated by benign
+    // "Not publishing a message that has already been published" lines
+    // (one per local validator * subnet, every slot). Operators can
+    // still override with RUST_LOG=libp2p_gossipsub=warn if they need
+    // to see those during debugging.
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("info,libp2p_gossipsub=error")
+                }),
         )
         .with_target(false)
         .try_init()

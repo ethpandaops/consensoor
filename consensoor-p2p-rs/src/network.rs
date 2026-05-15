@@ -1,6 +1,6 @@
 //! Tokio-driven libp2p host that consensoor drives from Python.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +32,18 @@ use crate::rpc::{
 };
 
 const ETH2_AGENT_VERSION: &str = "consensoor/0.1.0";
+
+/// Per-peer ring buffer cap for `downscore_reasons` (PR #606). 16 entries
+/// is enough to surface the last few minutes of score-affecting events
+/// for a misbehaving peer without unbounded memory growth.
+const PEER_DOWNSCORE_REASONS_CAP: usize = 16;
+
+/// Bounds on the `score` field surfaced via `/eth/v1/node/peers`
+/// (PR #606). Matches lighthouse/lodestar/grandine's `[-100, +100]`
+/// range — every score-write path clamps so the API never reports
+/// out-of-range numbers, no matter how many events accumulate.
+const PEER_SCORE_MIN: f64 = -100.0;
+const PEER_SCORE_MAX: f64 = 100.0;
 
 // Eth2 P2P spec (consensus-specs phase0/p2p-interface.md) + lighthouse
 // reference impl (`lighthouse_network::service::Behaviour`):
@@ -251,6 +263,26 @@ pub struct Network {
     local_peer_id: String,
     listen_addrs: Arc<Mutex<Vec<String>>>,
     connected_peers: Arc<Mutex<HashMap<String, &'static str>>>,
+    /// peer_id_str → base64 `enr:...` string, populated from discv5
+    /// discoveries (including bootnodes). Surfaced via
+    /// `/eth/v1/node/peers` (beacon-APIs).
+    peer_enrs: Arc<Mutex<HashMap<String, String>>>,
+    /// peer_id_str → libp2p identify agent_version string. Populated
+    /// when the remote peer completes the identify handshake. Optional
+    /// field per beacon-APIs PR #606.
+    peer_agent_versions: Arc<Mutex<HashMap<String, String>>>,
+    /// peer_id_str → client-native peer score (PR #606 `score` field).
+    /// Pure plumbing: nothing writes to this map from inside the swarm
+    /// today (gossipsub scoring is intentionally off — see the comment
+    /// where we build the gossipsub behaviour). Python wires `set_peer_score`
+    /// when/if it tracks per-peer scores.
+    peer_scores: Arc<Mutex<HashMap<String, f64>>>,
+    /// peer_id_str → bounded ring buffer of recent PR #606
+    /// `PeerScoreReason` values. Most-recent event first; capped at
+    /// `PEER_DOWNSCORE_REASONS_CAP`. Strings aren't validated against
+    /// the spec enum here — the spec says consumers SHOULD tolerate
+    /// unknown values, so we surface whatever Python pushes verbatim.
+    peer_downscore_reasons: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
     /// secp256k1 key for ENR signing (cloned from the libp2p keypair).
     enr_key: Arc<CombinedKey>,
     /// The latest signed local ENR. Replaced on update_enr_*.
@@ -346,6 +378,15 @@ impl Network {
         let listen_addrs_clone = listen_addrs.clone();
         let connected_peers = Arc::new(Mutex::new(HashMap::<String, &'static str>::new()));
         let connected_peers_clone = connected_peers.clone();
+        let peer_enrs = Arc::new(Mutex::new(HashMap::<String, String>::new()));
+        let peer_enrs_clone = peer_enrs.clone();
+        let peer_agent_versions = Arc::new(Mutex::new(HashMap::<String, String>::new()));
+        let peer_agent_versions_clone = peer_agent_versions.clone();
+        let peer_scores = Arc::new(Mutex::new(HashMap::<String, f64>::new()));
+        let peer_scores_clone = peer_scores.clone();
+        let peer_downscore_reasons =
+            Arc::new(Mutex::new(HashMap::<String, VecDeque<String>>::new()));
+        let peer_downscore_reasons_clone = peer_downscore_reasons.clone();
 
         let cached_status: Arc<Mutex<Option<StatusMessage>>> = Arc::new(Mutex::new(None));
         let cached_status_swarm = cached_status.clone();
@@ -367,6 +408,10 @@ impl Network {
                 by_range_tx,
                 listen_addrs_clone,
                 connected_peers_clone,
+                peer_enrs_clone,
+                peer_agent_versions_clone,
+                peer_scores_clone,
+                peer_downscore_reasons_clone,
                 discv5_local_enr,
                 discv5_enr_key,
                 bootnode_enrs,
@@ -391,6 +436,10 @@ impl Network {
             local_peer_id: local_peer_id_str,
             listen_addrs,
             connected_peers,
+            peer_enrs,
+            peer_agent_versions,
+            peer_scores,
+            peer_downscore_reasons,
             enr_key: Arc::new(enr_key),
             local_enr: Arc::new(Mutex::new(initial_enr)),
             enr_seq: Arc::new(Mutex::new(1)),
@@ -466,6 +515,85 @@ impl Network {
             .iter()
             .map(|(peer_id, direction)| (peer_id.clone(), (*direction).to_string()))
             .collect()
+    }
+
+    /// Like `connected_peers_with_direction`, but also returns the per-peer
+    /// metadata used by `/eth/v1/node/peers` (beacon-APIs PR #606):
+    ///
+    /// `(peer_id, direction, enr, agent_version, score, downscore_reasons)`
+    ///
+    /// - `enr`: base64 ENR; empty when discv5 never surfaced one.
+    /// - `agent_version`: libp2p identify string; empty until handshake.
+    /// - `score`: client-native score; `None` when nothing recorded one.
+    /// - `downscore_reasons`: ring buffer, most-recent first; empty when
+    ///   no events recorded.
+    pub fn connected_peers_with_meta(
+        &self,
+    ) -> Vec<(String, String, String, String, Option<f64>, Vec<String>)> {
+        let enrs = self.peer_enrs.lock();
+        let agents = self.peer_agent_versions.lock();
+        let scores = self.peer_scores.lock();
+        let reasons = self.peer_downscore_reasons.lock();
+        self.connected_peers
+            .lock()
+            .iter()
+            .map(|(peer_id, direction)| {
+                let downscore = reasons
+                    .get(peer_id)
+                    .map(|q| q.iter().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                (
+                    peer_id.clone(),
+                    (*direction).to_string(),
+                    enrs.get(peer_id).cloned().unwrap_or_default(),
+                    agents.get(peer_id).cloned().unwrap_or_default(),
+                    scores.get(peer_id).copied(),
+                    downscore,
+                )
+            })
+            .collect()
+    }
+
+    /// Look up the cached base64 ENR for a connected peer by its string
+    /// PeerId. Returns `None` if discv5 never surfaced an ENR for this
+    /// peer (e.g. inbound connections from peers we didn't discover).
+    pub fn peer_enr(&self, peer_id: &str) -> Option<String> {
+        self.peer_enrs.lock().get(peer_id).cloned()
+    }
+
+    /// Overwrite the client-native score for `peer_id`. Surfaced as the
+    /// PR #606 `score` field. Pure plumbing — gossipsub scoring is off,
+    /// so nothing inside the binding calls this today; the Python layer
+    /// owns score policy. The value is clamped to
+    /// `[PEER_SCORE_MIN, PEER_SCORE_MAX]`.
+    pub fn set_peer_score(&self, peer_id: &str, score: f64) {
+        self.peer_scores
+            .lock()
+            .insert(peer_id.to_string(), score.clamp(PEER_SCORE_MIN, PEER_SCORE_MAX));
+    }
+
+    /// Push a PR #606 `PeerScoreReason` enum value into the per-peer ring
+    /// buffer (most-recent first, capped at `PEER_DOWNSCORE_REASONS_CAP`)
+    /// and atomically apply `score_delta` to the peer's running score
+    /// (defaults to 0.0 — pass a negative number to penalize). `reason`
+    /// isn't validated against the enum: the spec tells consumers to
+    /// tolerate unknown values, and clients with finer-grained internal
+    /// tags are expected to do their own mapping.
+    #[pyo3(signature = (peer_id, reason, score_delta = 0.0))]
+    pub fn record_peer_score_event(&self, peer_id: &str, reason: String, score_delta: f64) {
+        {
+            let mut map = self.peer_downscore_reasons.lock();
+            let q = map.entry(peer_id.to_string()).or_default();
+            q.push_front(reason);
+            while q.len() > PEER_DOWNSCORE_REASONS_CAP {
+                q.pop_back();
+            }
+        }
+        if score_delta != 0.0 {
+            let mut scores = self.peer_scores.lock();
+            let entry = scores.entry(peer_id.to_string()).or_insert(0.0);
+            *entry = (*entry + score_delta).clamp(PEER_SCORE_MIN, PEER_SCORE_MAX);
+        }
     }
 
     pub fn peer_id(&self) -> String {
@@ -758,6 +886,10 @@ async fn run_swarm(
     by_range_tx: Sender<BlocksByRangeEvent>,
     listen_addrs: Arc<Mutex<Vec<String>>>,
     connected_peers: Arc<Mutex<HashMap<String, &'static str>>>,
+    peer_enrs: Arc<Mutex<HashMap<String, String>>>,
+    peer_agent_versions: Arc<Mutex<HashMap<String, String>>>,
+    peer_scores: Arc<Mutex<HashMap<String, f64>>>,
+    peer_downscore_reasons: Arc<Mutex<HashMap<String, VecDeque<String>>>>,
     discv5_local_enr: Enr<CombinedKey>,
     discv5_enr_key: CombinedKey,
     bootnode_enrs: Vec<Enr<CombinedKey>>,
@@ -766,10 +898,20 @@ async fn run_swarm(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let local_peer_id = key.public().to_peer_id();
 
+    // Offer both yamux and mplex per consensus-specs phase0/p2p-interface.md:
+    // mplex is MUST-support, yamux is MAY-support but MUST take precedence
+    // when both are advertised. SelectUpgrade negotiates the first variant
+    // the peer accepts, so listing yamux first matches the precedence rule
+    // for peers that also support both (lighthouse, prysm, teku, grandine).
+    // Peers that ONLY know mplex (lodestar js-libp2p, nimbus nim-libp2p)
+    // fall through and negotiate mplex.
     let transport = tcp::tokio::Transport::default()
         .upgrade(upgrade::Version::V1)
         .authenticate(noise::Config::new(&key)?)
-        .multiplex(yamux::Config::default())
+        .multiplex(upgrade::SelectUpgrade::new(
+            yamux::Config::default(),
+            libp2p_mplex::Config::default(),
+        ))
         .boxed();
 
     // Eth2 gossipsub configuration per consensus-specs phase0/p2p-interface.md
@@ -872,10 +1014,12 @@ async fn run_swarm(
         }
     }
 
-    // Spawn discv5 alongside libp2p. As it discovers ENRs, it pushes the
-    // libp2p multiaddr we'd dial onto `discovered_rx`, which we drain in
-    // the main select! loop and feed to swarm.dial().
-    let (discovered_tx, discovered_rx) = bounded::<Multiaddr>(64);
+    // Spawn discv5 alongside libp2p. As it discovers ENRs, it pushes a
+    // `(PeerId, base64 ENR, Multiaddr)` triple onto `discovered_rx`, which
+    // we drain in the main select! loop: we stash the ENR keyed by peer
+    // id (for the beacon API) and feed the multiaddr to swarm.dial().
+    let (discovered_tx, discovered_rx) =
+        bounded::<(libp2p::PeerId, String, Multiaddr)>(64);
     if let Err(e) = crate::discovery::spawn_discovery(
         discv5_local_enr,
         discv5_enr_key,
@@ -912,19 +1056,16 @@ async fn run_swarm(
             // Drain peers discovered by discv5 and dial them via libp2p.
             // Skip peers we already dialed (or that match our local id).
             disc = discovered_rx.recv() => match disc {
-                Ok(addr) => {
-                    use libp2p::multiaddr::Protocol;
-                    let pid = addr.iter().find_map(|p| match p {
-                        Protocol::P2p(id) => Some(id),
-                        _ => None,
-                    });
-                    if let Some(pid) = pid {
-                        if pid == local_peer_id {
-                            continue;
-                        }
-                        if !dialed_via_discovery.insert(pid) {
-                            continue;
-                        }
+                Ok((peer_id, enr_b64, addr)) => {
+                    if peer_id == local_peer_id {
+                        continue;
+                    }
+                    // Cache the ENR keyed by peer id regardless of whether
+                    // we end up redialing — beacon API consumers want it
+                    // surfaced for existing connections too.
+                    peer_enrs.lock().insert(peer_id.to_string(), enr_b64);
+                    if !dialed_via_discovery.insert(peer_id) {
+                        continue;
                     }
                     if let Err(e) = swarm.dial(addr.clone()) {
                         tracing::debug!("discv5-dial failed for {addr}: {e}");
@@ -952,8 +1093,33 @@ async fn run_swarm(
                 SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
                     if num_established == 0 {
                         tracing::info!("connection closed with {peer_id} cause={cause:?}");
-                        connected_peers.lock().remove(&peer_id.to_string());
+                        let pid_str = peer_id.to_string();
+                        connected_peers.lock().remove(&pid_str);
+                        // agent_version is a per-connection identify exchange
+                        // result, so drop it here. ENR persists in case the
+                        // same peer reconnects before discv5 re-discovers it.
+                        peer_agent_versions.lock().remove(&pid_str);
+                        // PR #606 scoring state is tied to the current
+                        // connection (the spec ring buffer is "within the
+                        // client's recent-history window") — drop it on
+                        // disconnect. /eth/v1/node/peers only lists
+                        // connected peers anyway, so retention buys nothing.
+                        peer_scores.lock().remove(&pid_str);
+                        peer_downscore_reasons.lock().remove(&pid_str);
                     }
+                }
+                SwarmEvent::Behaviour(Eth2BehaviourEvent::Identify(identify::Event::Received {
+                    peer_id,
+                    info,
+                    ..
+                })) => {
+                    tracing::debug!(
+                        "identify received from {peer_id}: agent={}",
+                        info.agent_version
+                    );
+                    peer_agent_versions
+                        .lock()
+                        .insert(peer_id.to_string(), info.agent_version);
                 }
                 SwarmEvent::Behaviour(Eth2BehaviourEvent::Gossipsub(gossipsub::Event::Message {
                     propagation_source,
@@ -1109,7 +1275,18 @@ async fn run_swarm(
                         }
                     };
                     if let Err(e) = swarm.behaviour_mut().gossipsub.publish(t, compressed) {
-                        tracing::warn!("publish failed: {e}");
+                        // `Duplicate` is benign — we already gossiped this exact
+                        // message (same SHA-256 message id) within the dedup
+                        // window, so libp2p declined to re-broadcast. In the
+                        // proposer path we republish the local block alongside
+                        // the gossip mesh receipt, which hits this every slot.
+                        // Demote to debug so it doesn't drown real failures.
+                        match e {
+                            libp2p::gossipsub::PublishError::Duplicate => {
+                                tracing::debug!("publish skipped (duplicate)");
+                            }
+                            _ => tracing::warn!("publish failed: {e}"),
+                        }
                     }
                 }
                 Ok(Command::Dial(addr)) => {

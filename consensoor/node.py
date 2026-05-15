@@ -187,6 +187,7 @@ class BeaconNode:
         self._block_sync_task: Optional[asyncio.Task] = None
         self._current_payload_id: Optional[bytes] = None
         self._current_payload_beacon_root: Optional[bytes] = None  # Store head_root used in forkchoiceUpdated
+        self._current_payload_slot: Optional[int] = None  # The slot the current payload_id is being built for
         self._fork_digest_override: Optional[bytes] = None  # For devnets with custom fork digests
         self._pending_envelopes: dict[bytes, Any] = {}  # beacon_block_root -> signed_envelope
 
@@ -988,13 +989,14 @@ class BeaconNode:
             network_config = get_config()
             timestamp = self._genesis_time + slot * (network_config.slot_duration_ms // 1000)
 
-            # Get the current head block hash
-            if hasattr(self.state, "latest_block_hash"):
-                head_block_hash = bytes(self.state.latest_block_hash)
-            else:
-                head_block_hash = bytes(
-                    self.state.latest_execution_payload_header.block_hash
-                )
+            # Get the current head block hash. In Gloas the EL chain tip is
+            # the most recently installed bid's payload (already imported via
+            # newPayload during block apply / envelope receive). state.latest_block_hash
+            # lags by one slot because process_parent_execution_payload only
+            # promotes it when the NEXT bid chains in — using it here makes
+            # fcU point at a head behind the EL's view, so geth returns VALID
+            # without issuing a payload_id.
+            head_block_hash = self._gloas_el_head_hash()
 
             forkchoice_state = ForkchoiceState(
                 head_block_hash=head_block_hash,
@@ -1075,17 +1077,20 @@ class BeaconNode:
                 self._current_payload_id = response.payload_id
                 # Store the beacon root used in this forkchoiceUpdated for later use in newPayloadV5
                 self._current_payload_beacon_root = self.head_root or b"\x00" * 32
+                self._current_payload_slot = int(slot)
             else:
                 logger.warning(
                     f"Failed to get payload_id for slot {slot}: status={response.payload_status.status}"
                 )
                 self._current_payload_id = None
                 self._current_payload_beacon_root = None
+                self._current_payload_slot = None
 
         except Exception as e:
             logger.error(f"Failed to request payload for slot {slot}: {e}")
             self._current_payload_id = None
             self._current_payload_beacon_root = None
+            self._current_payload_slot = None
 
     async def _slot_ticker(self) -> None:
         """Tick every slot and process duties with proper intra-slot timing.
@@ -1247,13 +1252,9 @@ class BeaconNode:
             return
 
         try:
-            # Get the latest block hash
-            if hasattr(self.state, "latest_block_hash"):
-                head_block_hash = bytes(self.state.latest_block_hash)
-            else:
-                head_block_hash = bytes(
-                    self.state.latest_execution_payload_header.block_hash
-                )
+            # See _gloas_el_head_hash docstring for why we prefer the bid's
+            # block_hash over state.latest_block_hash on Gloas.
+            head_block_hash = self._gloas_el_head_hash()
 
             finalized_hash = self._resolve_finalized_block_hash() or b"\x00" * 32
             finalized_epoch = int(self.state.finalized_checkpoint.epoch)
@@ -1347,6 +1348,7 @@ class BeaconNode:
                 self._current_payload_id = response.payload_id
                 # Store the beacon root used in this forkchoiceUpdated for later use in newPayloadV5
                 self._current_payload_beacon_root = self.head_root or b"\x00" * 32
+                self._current_payload_slot = int(next_slot)
             else:
                 logger.warning(
                     f"No payload_id returned for slot {next_slot}: status={response.payload_status.status}, "
@@ -1354,6 +1356,7 @@ class BeaconNode:
                 )
                 self._current_payload_id = None
                 self._current_payload_beacon_root = None
+                self._current_payload_slot = None
 
         except Exception as e:
             logger.error(f"Failed to update forkchoice for slot {slot}: {e}")
@@ -2052,12 +2055,35 @@ class BeaconNode:
             network_config = get_config()
             timestamp = self._genesis_time + slot * (network_config.slot_duration_ms // 1000)
 
-            # Always request a fresh payload to ensure RANDAO matches current state.
-            # The previous slot's forkchoice may have prepared a payload with stale state.
-            logger.info(f"Requesting fresh payload for slot {slot}")
-            await self._request_payload_for_slot(slot)
+            # Prefer the already-prepared payload from the prep-fcU at the
+            # previous slot's end — geth has been filling it with txs for
+            # the whole slot duration, so it's full. Requesting a "fresh"
+            # payload here resets geth's build job and getPayload returns
+            # within milliseconds with 0 txs (which is what was happening).
+            # Only fall back to a fresh build if the prep is missing, was
+            # built for a different slot, or the head has shifted since
+            # then (e.g. a reorg made the prep extend a stale parent).
+            current_head_root = self.head_root or b"\x00" * 32
+            prep_is_valid = (
+                self._current_payload_id is not None
+                and self._current_payload_slot == int(slot)
+                and self._current_payload_beacon_root == current_head_root
+            )
+            if prep_is_valid:
+                logger.info(
+                    f"Reusing prepared payload_id for slot {slot}: "
+                    f"{self._current_payload_id.hex()}"
+                )
+            else:
+                logger.info(
+                    f"Requesting fresh payload for slot {slot} "
+                    f"(prep_slot={self._current_payload_slot}, "
+                    f"prep_head={self._current_payload_beacon_root.hex()[:16] if self._current_payload_beacon_root else 'None'}, "
+                    f"head={current_head_root.hex()[:16]})"
+                )
+                await self._request_payload_for_slot(slot)
             if not self._current_payload_id:
-                logger.warning("Cannot produce block: failed to get payload_id")
+                logger.error("Cannot produce block: failed to get payload_id")
                 return
 
             payload_response = await self.engine.get_payload(self._current_payload_id, timestamp=timestamp)
@@ -2447,6 +2473,26 @@ class BeaconNode:
         except Exception as e:
             logger.warning(f"Block sync via req/resp failed: {e}")
 
+    def _record_peer_event(self, peer_id: str, reason: str) -> None:
+        """Push a PR #606 PeerScoreReason for a misbehaving peer.
+
+        Defensive: skip the `"req/resp"` synthetic peer used by sync
+        (it's a literal, not a base58 PeerId) and any other empty/
+        falsy id. Never let recording errors leak into the calling
+        handler — scoring is observability, not policy.
+        """
+        if not peer_id or peer_id == "req/resp":
+            return
+        if not self.beacon_gossip:
+            return
+        host = getattr(self.beacon_gossip, "_host", None)
+        if host is None:
+            return
+        try:
+            host.record_peer_score_event(peer_id, reason)
+        except Exception:
+            pass
+
     async def _on_p2p_block(self, data: bytes, from_peer: str) -> None:
         """Handle a beacon block received via libp2p gossipsub."""
         try:
@@ -2520,7 +2566,7 @@ class BeaconNode:
                         try:
                             await self._reorg_to(block_root, signed_block)
                         except Exception as e:
-                            logger.warning(f"P2P: Reorg to slot={block.slot} failed: {e}")
+                            logger.error(f"P2P: Reorg to slot={block.slot} failed: {e}")
                             import traceback
                             traceback.print_exc()
                         return
@@ -2546,6 +2592,13 @@ class BeaconNode:
                     logger.debug(f"P2P: Calling _apply_block_to_state for slot={block.slot}")
                     await self._apply_block_to_state(block, block_root, signed_block)
                     logger.debug(f"P2P: _apply_block_to_state succeeded for slot={block.slot}")
+
+                    # Push the execution payload to our EL. For Gloas blocks
+                    # the envelope path does this; pre-Gloas blocks need it
+                    # here or geth never sees the canonical chain past our
+                    # own proposals — and the first Gloas slot then can't
+                    # extend the unknown parent.
+                    await self._notify_el_of_received_block(block)
 
                     # Do NOT mutate latest_block_header.state_root — see comment
                     # in _produce_and_broadcast_block; same spec-divergence trap.
@@ -2593,6 +2646,7 @@ class BeaconNode:
                         f"P2P: Failed to apply block slot={block.slot}: {e}. "
                         f"Keeping head at {old_head.hex()[:16] if old_head else 'None'}"
                     )
+                    self._record_peer_event(from_peer, "gossip_invalid_block")
                     import traceback
                     traceback.print_exc()
             else:
@@ -2600,6 +2654,7 @@ class BeaconNode:
 
         except Exception as e:
             logger.error(f"Error processing P2P block: {e}")
+            self._record_peer_event(from_peer, "gossip_invalid_block")
 
     async def _on_p2p_aggregate(self, data: bytes, from_peer: str) -> None:
         """Handle an aggregate attestation received via libp2p gossipsub."""
@@ -2620,6 +2675,7 @@ class BeaconNode:
                     attestation = signed_aggregate.message.aggregate
                 except Exception as e:
                     logger.error(f"Failed to decode aggregate as any known format: {e}")
+                    self._record_peer_event(from_peer, "gossip_invalid_attestation")
                     return
 
             slot = int(attestation.data.slot)
@@ -2741,6 +2797,7 @@ class BeaconNode:
 
         except Exception as e:
             logger.error(f"Error processing P2P blob sidecar: {e}")
+            self._record_peer_event(from_peer, "gossip_invalid_blob_sidecar")
 
     def _store_received_blob_sidecar(self, block_root: bytes, slot: int, sidecar) -> None:
         """Store a received blob sidecar in the store."""
@@ -2931,7 +2988,7 @@ class BeaconNode:
         try:
             await self._update_forkchoice()
         except Exception as e:
-            logger.warning(f"Reorg: forkchoice_updated after reorg failed: {e}")
+            logger.error(f"Reorg: forkchoice_updated after reorg failed: {e}")
 
     async def _apply_block_to_state(self, block, block_root: bytes, signed_block=None) -> None:
         """Apply a received block to the local state using full state transition.
@@ -2954,13 +3011,13 @@ class BeaconNode:
 
         from_slot = int(self.state.slot)
         target_slot = int(block.slot)
-        # `block` and `state` shape determines the active fork — Gloas blocks
-        # carry signed_execution_payload_bid in the body, others have
-        # execution_payload directly.
-        is_gloas = hasattr(block.body, "signed_execution_payload_bid")
-        fork = "gloas" if is_gloas else (
-            "post_capella" if hasattr(block.body, "execution_payload") else "pre_merge"
-        )
+        # The active fork name is config-driven (slot → epoch → fork
+        # schedule). Don't infer from block structure: hasattr() only tells
+        # us how SSZ was decoded, not what fork the spec thinks we're on —
+        # an Electra/Fulu block at slot 17 in a mainnet-preset network with
+        # gloas_fork_epoch=1 was getting labelled "post_capella" or even
+        # mis-labelled "gloas" depending on which body type was hit.
+        fork = get_config().fork_name_at_slot(int(block.slot))
 
         # State transition is heavy sync compute (process_slots fast-forwards
         # one epoch boundary at a time, process_block runs full block ops).
@@ -3019,6 +3076,118 @@ class BeaconNode:
             f"[STATE_TX] fork={fork} from_slot={from_slot} to_slot={target_slot} "
             f"advance={slot_advance} elapsed_ms={elapsed_ms:.0f} (no_sig_verify)"
         )
+
+    async def _notify_el_of_received_block(self, block) -> None:
+        """Submit a received non-Gloas block's execution payload to the EL.
+
+        Gloas blocks deliver the payload separately via the envelope gossip
+        topic; that path already calls newPayload via
+        _validate_execution_payload. Pre-Gloas blocks carry the payload
+        inline in block.body.execution_payload, but consensoor's
+        state-transition spec stub doesn't call the engine (the assertion
+        relies on `execution_valid=True`). Without an explicit newPayload
+        call here, geth's chain falls behind: it only knows the payloads
+        consensoor itself produced. Then when the first Gloas slot arrives
+        and we call newPayloadV5(payload, parent=slot_N-1_block_hash),
+        geth either says SYNCING (missing parent) or — once parents catch
+        up via the EL's own sync — still can't form the canonical head.
+        """
+        if not self.engine:
+            return
+        body = block.body
+        if hasattr(body, "signed_execution_payload_bid"):
+            return  # Gloas — envelope path handles newPayload
+        if not hasattr(body, "execution_payload"):
+            return  # pre-Bellatrix block, no payload to submit
+
+        execution_payload = body.execution_payload
+
+        versioned_hashes = []
+        if hasattr(body, "blob_kzg_commitments"):
+            from hashlib import sha256
+            for commitment in body.blob_kzg_commitments:
+                commitment_bytes = bytes(commitment)
+                versioned_hashes.append(b"\x01" + sha256(commitment_bytes).digest()[1:])
+
+        execution_requests_hex = self._encode_execution_requests(
+            getattr(body, "execution_requests", None)
+        )
+
+        parent_beacon_root = bytes(block.parent_root)
+
+        try:
+            status = await self.engine.new_payload(
+                execution_payload,
+                versioned_hashes,
+                parent_beacon_root,
+                execution_requests_hex,
+                timestamp=int(execution_payload.timestamp),
+            )
+        except Exception as e:
+            logger.warning(
+                f"newPayload for received block slot={int(block.slot)} raised: {e}"
+            )
+            return
+
+        if status.status == PayloadStatusEnum.SYNCING:
+            logger.info(
+                f"newPayload for received block slot={int(block.slot)} "
+                f"block_hash={bytes(execution_payload.block_hash).hex()[:16]}: "
+                f"EL syncing"
+            )
+        elif status.status != PayloadStatusEnum.VALID and status.status != PayloadStatusEnum.ACCEPTED:
+            logger.error(
+                f"newPayload for received block slot={int(block.slot)} "
+                f"block_hash={bytes(execution_payload.block_hash).hex()[:16]}: "
+                f"status={status.status}"
+            )
+
+    @staticmethod
+    def _encode_execution_requests(execution_requests) -> list[str]:
+        """Encode SSZ ExecutionRequests as EIP-7685 hex strings for the EL.
+
+        Geth's newPayloadV4/V5 expects one hex entry per request type,
+        each `<type_byte><concatenated_ssz_request_data>`. Empty types
+        are omitted entirely.
+        """
+        if execution_requests is None:
+            return []
+
+        def _concat(items) -> bytes:
+            out = b""
+            for item in items:
+                if hasattr(item, "encode_bytes"):
+                    out += bytes(item.encode_bytes())
+                else:
+                    out += bytes(item)
+            return out
+
+        result: list[str] = []
+        for type_byte, attr in ((0x00, "deposits"), (0x01, "withdrawals"), (0x02, "consolidations")):
+            data = _concat(getattr(execution_requests, attr, ()) or ())
+            if data:
+                result.append("0x" + bytes([type_byte]).hex() + data.hex())
+        return result
+
+    def _gloas_el_head_hash(self) -> bytes:
+        """Return the EL block_hash that fcU should target as the head.
+
+        On Gloas, the EL chain tip after a block is processed is the bid's
+        block_hash — that's the payload we just imported via newPayload
+        (either ourselves during proposal, or via the envelope receive path).
+        `state.latest_block_hash` lags by one slot because Phase 2 only
+        promotes it when the NEXT bid chains in; using it for the prep-fcU
+        sends geth a head that's behind its own view, so geth answers VALID
+        without issuing a payload_id. We prefer the bid's block_hash and
+        fall back to latest_block_hash, then the legacy header.
+        """
+        if hasattr(self.state, "latest_execution_payload_bid"):
+            bid_hash = bytes(self.state.latest_execution_payload_bid.block_hash)
+            if bid_hash != b"\x00" * 32:
+                return bid_hash
+        if hasattr(self.state, "latest_block_hash"):
+            return bytes(self.state.latest_block_hash)
+        return bytes(self.state.latest_execution_payload_header.block_hash)
 
     def _resolve_finalized_block_hash(self) -> Optional[bytes]:
         """Get the EL block_hash of the finalized beacon block, or None.
@@ -3294,8 +3463,14 @@ class BeaconNode:
             if status.status == PayloadStatusEnum.VALID:
                 logger.info("Execution payload validated")
                 return True
+            elif status.status == PayloadStatusEnum.SYNCING:
+                logger.info(f"Payload validation deferred (EL syncing): {status.status}")
+                return False
             else:
-                logger.warning(f"Payload validation failed: {status.status}")
+                # INVALID / ACCEPTED-with-error / unknown — the EL rejected
+                # this payload outright. Surface at ERROR so it filters out
+                # of the noisy WARNING bucket.
+                logger.error(f"Payload validation failed: {status.status}")
                 return False
 
         except Exception as e:
@@ -3308,10 +3483,12 @@ class BeaconNode:
             return
 
         try:
-            # Get the latest block hash and timestamp based on state type
-            # Gloas has latest_block_hash, Fulu/Electra use execution payload header
-            if hasattr(self.state, "latest_block_hash"):
-                head_block_hash = bytes(self.state.latest_block_hash)
+            # Get the latest block hash and timestamp based on state type.
+            # Gloas: use latest_execution_payload_bid.block_hash (the most
+            # recent payload imported into the EL) — see _gloas_el_head_hash.
+            # Fulu/Electra: use the execution payload header.
+            if hasattr(self.state, "latest_execution_payload_bid"):
+                head_block_hash = self._gloas_el_head_hash()
                 timestamp = int(self.state.latest_execution_payload_header.timestamp) if hasattr(self.state, "latest_execution_payload_header") else int(time.time())
             else:
                 head_block_hash = bytes(
