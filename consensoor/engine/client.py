@@ -52,12 +52,15 @@ def _epoch_to_timestamp(epoch: int, config) -> int:
 class EngineAPIClient:
     """Client for Ethereum Engine API."""
 
-    def __init__(self, url: str, jwt_secret: bytes):
+    def __init__(self, url: str, jwt_secret: bytes, force_json: bool = False):
         self.url = url.rstrip("/")
         self.jwt_secret = jwt_secret
         self._session: Optional[aiohttp.ClientSession] = None
         self._request_id = 0
         self._genesis_time: Optional[int] = None
+        # When True, never advertise or use SSZ-over-REST transport — every
+        # Engine API call goes via JSON-RPC. Useful for visual debugging.
+        self._force_json = force_json
         # SSZ REST endpoints (e.g. "POST /engine/v4/payloads") the EL has
         # advertised via engine_exchangeCapabilities. Populated lazily on
         # the first capabilities exchange; empty means JSON-RPC for all calls.
@@ -81,6 +84,8 @@ class EngineAPIClient:
 
     def _ssz_supported(self, endpoint: str) -> bool:
         """Whether the EL has advertised the given SSZ REST endpoint."""
+        if self._force_json:
+            return False
         return endpoint in self._ssz_endpoints
 
     async def _ssz_request(
@@ -661,7 +666,7 @@ class EngineAPIClient:
         with what the EL returns determines which calls use binary transport;
         all others fall back to JSON-RPC.
         """
-        capabilities = [
+        json_rpc_capabilities = [
             "engine_newPayloadV5",
             "engine_newPayloadV4",
             "engine_newPayloadV3",
@@ -677,8 +682,14 @@ class EngineAPIClient:
             "engine_getPayloadV3",
             "engine_getPayloadV2",
             "engine_getPayloadV1",
-        ] + ssz.SSZ_CAPABILITIES
+        ]
+        capabilities = json_rpc_capabilities if self._force_json else json_rpc_capabilities + ssz.SSZ_CAPABILITIES
         result = await self._call("engine_exchangeCapabilities", [capabilities])
+
+        if self._force_json:
+            self._ssz_endpoints = set()
+            logger.info("Engine SSZ transport disabled by --engine-force-json; using JSON-RPC for all calls")
+            return result
 
         el_caps = result if isinstance(result, list) else []
         offered = set(ssz.SSZ_CAPABILITIES)

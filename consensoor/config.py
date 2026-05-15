@@ -25,6 +25,7 @@ class Config:
     log_level: str = "INFO"
     checkpoint_sync_url: str = ""
     supernode: bool = False
+    engine_force_json: bool = False
     _el_client_info: Optional[dict] = field(default=None, repr=False)
 
     @property
