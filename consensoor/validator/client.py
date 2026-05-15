@@ -296,17 +296,29 @@ class ValidatorClient:
             return None
 
     async def produce_sync_committee_message(
-        self, state, slot: int, validator_key: ValidatorKey
+        self,
+        state,
+        slot: int,
+        validator_key: ValidatorKey,
+        head_block_root: Optional[bytes] = None,
     ) -> Optional[SyncCommitteeMessage]:
         """Produce a sync committee message for a validator.
 
-        Sync committee members sign the block root from the previous slot
-        at the start of each slot.
+        Sync committee members sign the head block root at the start of each
+        slot. The caller MUST pass the head block's actual root via
+        `head_block_root`: at slot start, state.slot is still slot-1 and
+        process_slot for slot-1 hasn't run yet, so
+        state.block_roots[(slot-1) % HIST] is stale (or zero) and would
+        produce a different signing root than the block builder later uses.
+        Using the tracked head root keeps validator + builder in sync.
 
         Args:
             state: Beacon state
             slot: Current slot
             validator_key: The validator's key
+            head_block_root: The current head block root (= block at slot-1
+                with its state_root filled in). Required for correct
+                signing.
 
         Returns:
             SyncCommitteeMessage or None if production fails
@@ -320,7 +332,9 @@ class ValidatorClient:
             state_slot = int(state.slot)
             from ..spec.constants import SLOTS_PER_HISTORICAL_ROOT
 
-            if previous_slot < state_slot:
+            if head_block_root is not None and head_block_root != b"\x00" * 32:
+                beacon_block_root = head_block_root
+            elif previous_slot < state_slot:
                 beacon_block_root = get_block_root_at_slot(state, previous_slot)
             else:
                 block_root_entry = bytes(state.block_roots[previous_slot % SLOTS_PER_HISTORICAL_ROOT()])

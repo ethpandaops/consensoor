@@ -188,6 +188,12 @@ class BeaconNode:
         self._current_payload_id: Optional[bytes] = None
         self._current_payload_beacon_root: Optional[bytes] = None  # Store head_root used in forkchoiceUpdated
         self._current_payload_slot: Optional[int] = None  # The slot the current payload_id is being built for
+        # If _sync_missing_blocks asked peers for slots in (head_slot, current_slot)
+        # and they all returned empty, those slots are confirmed empty and we
+        # can safely propose at current_slot on top of the existing head.
+        # Without this signal _is_synced() blocks every proposer slot whose
+        # n-1 was missed by another client.
+        self._sync_empty_confirmed_for_slot: Optional[int] = None
         self._fork_digest_override: Optional[bytes] = None  # For devnets with custom fork digests
         self._pending_envelopes: dict[bytes, Any] = {}  # beacon_block_root -> signed_envelope
 
@@ -1371,11 +1377,15 @@ class BeaconNode:
         if not self.state:
             return
 
-        if not self._is_synced():
-            logger.debug(
-                f"Skip proposal for slot {slot} — not synced (head={self.head_slot})"
-            )
-            return
+        # We deliberately do NOT gate proposal on _is_synced() the way
+        # attestation does. If our head is older than current_slot-1 it's
+        # almost always because intervening slots were missed by other
+        # clients; refusing to propose there compounds the gap (every
+        # missed n-1 ripples into a missed n for us). The correct behavior
+        # is to build on whatever we believe is the latest head — empty
+        # slots will be skipped via process_slots in the builder. If we're
+        # genuinely behind (peers have a block we didn't import), the
+        # block we publish will simply be orphaned; no peer penalty.
 
         # Check proposer duty using current state — proposer_lookahead allows O(1)
         # lookup without needing state advanced to the exact slot. Only fall back to
@@ -1442,7 +1452,14 @@ class BeaconNode:
         except Exception:
             return False
         current_slot = int((time.time() - self._genesis_time) // slot_duration)
-        return self.head_slot >= current_slot - 1
+        if self.head_slot >= current_slot - 1:
+            return True
+        # Empty intervening slots are not "being behind". If we just asked
+        # peers for blocks across the gap at this slot and they all returned
+        # nothing, the gap is genuinely empty and our head IS the canonical
+        # head — don't skip our proposer duty just because the previous
+        # validator missed theirs.
+        return self._sync_empty_confirmed_for_slot == current_slot
 
     async def _produce_attestations(self, slot: int) -> None:
         """Produce attestations for validators with duties at this slot.
@@ -2469,6 +2486,13 @@ class BeaconNode:
         try:
             blocks = await self.beacon_gossip.request_blocks_by_range(start_slot, count)
             if not blocks:
+                # Every peer returned no chunks for [start_slot, start_slot+count-1].
+                # Those slots are genuinely empty (no proposer produced a block).
+                # Mark current_slot as "gap confirmed empty" so _is_synced lets us
+                # propose on top of the existing head instead of skipping our duty
+                # because someone earlier in the round-robin missed theirs.
+                if start_slot + count - 1 >= current_slot - 1:
+                    self._sync_empty_confirmed_for_slot = current_slot
                 logger.warning(f"No blocks received from req/resp request")
                 return
 
@@ -3481,7 +3505,14 @@ class BeaconNode:
 
         try:
             versioned_hashes = []
-            parent_beacon_root = bytes(envelope.beacon_block_root)
+            # EIP-4788: parentBeaconBlockRoot is the PARENT beacon block's
+            # root, not the current envelope's beacon_block_root. The bug
+            # was sending envelope.beacon_block_root, which is the block
+            # containing this envelope's bid — geth folded that into the
+            # header hash, computed a different blockhash than the one we
+            # claimed, and returned INVALID. Use the parent ref the
+            # envelope carries explicitly.
+            parent_beacon_root = bytes(envelope.parent_beacon_block_root)
             execution_requests = []
 
             status = await self.engine.new_payload(

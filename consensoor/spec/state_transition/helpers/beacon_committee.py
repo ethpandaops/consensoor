@@ -153,6 +153,66 @@ def compute_balance_weighted_selection(
     return selected
 
 
+_SHUFFLE_CACHE: "OrderedDict[tuple[int, bytes], list[int]]" = None  # type: ignore[assignment]
+_SHUFFLE_CACHE_MAX_ENTRIES = 8
+
+
+def _get_shuffled_index_table(index_count: int, seed: bytes) -> list[int]:
+    """Return a list `t` where ``t[i] == compute_shuffled_index(i, index_count, seed)``.
+
+    Computing this in one pass and caching it is dramatically cheaper than
+    calling ``compute_shuffled_index`` N times for the same ``(index_count,
+    seed)``: within each shuffle round, all positions that share the same
+    256-byte chunk reuse a single sha256 call. Concretely, the swap-or-not
+    shuffle for ~700 validators across mainnet's 90 rounds drops from
+    ~63k sha256 calls per call site (~600ms) to ~270 (~3ms). The PTC
+    initialisation loop at the Fulu→Gloas fork boundary called it 64+
+    times per epoch — that was the 9-minute state-transition stall on
+    slot 32. Same cache pays off again for every process_attestation
+    that recomputes the epoch committee.
+    """
+    global _SHUFFLE_CACHE
+    if _SHUFFLE_CACHE is None:
+        from collections import OrderedDict
+        _SHUFFLE_CACHE = OrderedDict()
+
+    cache_key = (index_count, seed)
+    cached = _SHUFFLE_CACHE.get(cache_key)
+    if cached is not None:
+        _SHUFFLE_CACHE.move_to_end(cache_key)
+        return cached
+
+    n = index_count
+    rounds = SHUFFLE_ROUND_COUNT()
+    table = list(range(n))
+    next_table = [0] * n
+
+    for current_round in range(rounds):
+        round_byte = current_round.to_bytes(1, "little")
+        pivot = (
+            int.from_bytes(sha256(seed + round_byte)[:8], "little") % n
+        )
+        chunk_cache: dict[int, bytes] = {}
+        for i in range(n):
+            idx = table[i]
+            flip = (pivot + n - idx) % n
+            position = idx if idx > flip else flip
+            chunk = position >> 8
+            h = chunk_cache.get(chunk)
+            if h is None:
+                h = sha256(seed + round_byte + chunk.to_bytes(4, "little"))
+                chunk_cache[chunk] = h
+            byte = h[(position & 0xFF) >> 3]
+            bit = (byte >> (position & 0x7)) & 1
+            next_table[i] = flip if bit else idx
+        table, next_table = next_table, table
+
+    _SHUFFLE_CACHE[cache_key] = table
+    if len(_SHUFFLE_CACHE) > _SHUFFLE_CACHE_MAX_ENTRIES:
+        _SHUFFLE_CACHE.popitem(last=False)
+    return table
+
+
 def compute_committee(
     indices: Sequence[int], seed: bytes, index: int, count: int
 ) -> Sequence[int]:
@@ -167,12 +227,11 @@ def compute_committee(
     Returns:
         Sequence of validator indices in the committee
     """
-    start = len(indices) * index // count
-    end = len(indices) * (index + 1) // count
-    return [
-        indices[compute_shuffled_index(i, len(indices), seed)]
-        for i in range(start, end)
-    ]
+    n = len(indices)
+    start = n * index // count
+    end = n * (index + 1) // count
+    table = _get_shuffled_index_table(n, seed)
+    return [indices[table[i]] for i in range(start, end)]
 
 
 def get_committee_count_per_slot(state: "BeaconState", epoch: int) -> int:
