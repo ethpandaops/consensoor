@@ -143,6 +143,13 @@ def cli():
     help="Run as supernode (custody all 128 data column groups for PeerDAS/Fulu)",
     envvar="CONSENSOOR_SUPERNODE",
 )
+@click.option(
+    "--engine-force-json",
+    is_flag=True,
+    default=False,
+    help="Force JSON-RPC for all Engine API calls, even if the EL advertises SSZ-over-REST. Useful for debugging.",
+    envvar="CONSENSOOR_ENGINE_FORCE_JSON",
+)
 def run(
     engine_api_url: str,
     jwt_secret: Optional[str],
@@ -162,6 +169,7 @@ def run(
     checkpoint_sync_url: Optional[str],
     bootnodes: tuple[str, ...],
     supernode: bool,
+    engine_force_json: bool,
 ):
     """Run the consensus layer node."""
     setup_logging(log_level)
@@ -193,6 +201,7 @@ def run(
         log_level=log_level,
         checkpoint_sync_url=checkpoint_sync_url or "",
         supernode=supernode,
+        engine_force_json=engine_force_json,
     )
 
     logger.info("Starting consensoor")
@@ -200,6 +209,8 @@ def run(
     logger.info(f"  Supernode: {supernode}")
     logger.info(f"  Data dir: {data_dir}")
     logger.info(f"  Engine API: {engine_api_url}")
+    if engine_force_json:
+        logger.info("  Engine transport: JSON-RPC forced (--engine-force-json)")
     logger.info(f"  P2P: {p2p_host}:{p2p_port}")
     logger.info(f"  Beacon API: port {beacon_api_port}")
     logger.info(f"  Metrics: port {metrics_port}")

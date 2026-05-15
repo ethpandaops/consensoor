@@ -579,6 +579,7 @@ class BeaconNode:
         self.engine = EngineAPIClient(
             url=self.config.engine_api_url,
             jwt_secret=self.config.jwt_secret,
+            force_json=self.config.engine_force_json,
         )
         self.engine.set_genesis_time(self._genesis_time)
 
