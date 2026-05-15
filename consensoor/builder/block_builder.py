@@ -498,15 +498,19 @@ class BlockBuilder:
         from ..spec.state_transition.helpers.accessors import get_block_root_at_slot
 
         current_slot = int(state.slot)
-        # SyncAggregate: messages produced at slot N sign block at slot N-1
-        # Block at slot N includes the sync aggregate from messages produced at slot N
-        sync_aggregate_slot = current_slot
-        # Filter pool to messages signing the same head root our state will
-        # verify against — `process_sync_aggregate` BLS-checks the aggregate
-        # against `get_block_root_at_slot(state, slot-1)`. Without this, any
-        # peer on another fork pollutes the pool and the aggregate gets
-        # zeroed out by `_validate_sync_aggregate`.
+        # Per altair/validator.md, sync-committee members assigned to block at
+        # slot N broadcast their SyncCommitteeMessage at real-time slot N-1
+        # (message.slot = N-1, signing head at slot N-1). Proposer at slot N
+        # therefore aggregates from pool[N-1], not pool[N]. Querying pool[N]
+        # only returns our own validators' messages just produced this slot —
+        # peer aggregators' contributions for slot N don't arrive until the
+        # 2/3 mark, well after the proposer fires.
         previous_slot = max(current_slot, 1) - 1
+        sync_aggregate_slot = previous_slot
+        # `process_sync_aggregate` BLS-checks the aggregate against
+        # `get_block_root_at_slot(state, slot-1)`, so filter the pool to
+        # messages signing that exact root — peers on a fork pollute the
+        # pool and the aggregate gets zeroed out by `_validate_sync_aggregate`.
         expected_block_root = bytes(get_block_root_at_slot(state, previous_slot))
         sync_aggregate = self.node.sync_committee_pool.get_sync_aggregate(
             sync_aggregate_slot, expected_block_root=expected_block_root
@@ -737,8 +741,11 @@ class BlockBuilder:
         from ..spec.state_transition.helpers.accessors import get_block_root_at_slot
 
         current_slot = int(state.slot)
-        sync_aggregate_slot = current_slot
+        # See _build_block_body for spec rationale: messages assigned to slot N
+        # are broadcast at real-time slot N-1, so the proposer aggregates from
+        # pool[N-1].
         previous_slot = max(current_slot, 1) - 1
+        sync_aggregate_slot = previous_slot
         expected_block_root = bytes(get_block_root_at_slot(state, previous_slot))
         sync_aggregate = self.node.sync_committee_pool.get_sync_aggregate(
             sync_aggregate_slot, expected_block_root=expected_block_root
@@ -747,8 +754,8 @@ class BlockBuilder:
         sig_bytes = bytes(sync_aggregate.sync_committee_signature)
         g2_infinity = b'\xc0' + b'\x00' * 95
         logger.info(
-            f"Sync aggregate for GLOAS block at slot {current_slot} "
-            f"(expected_root={expected_block_root.hex()[:16]}): "
+            f"Sync aggregate for GLOAS block at slot {current_slot} (using messages from slot {sync_aggregate_slot}, "
+            f"expected_root={expected_block_root.hex()[:16]}): "
             f"{participant_count}/{SYNC_COMMITTEE_SIZE()} participants, sig_is_infinity={sig_bytes == g2_infinity}"
         )
 

@@ -10,12 +10,39 @@ import click
 from .config import Config
 
 
+_LEVEL_COLORS = {
+    "DEBUG": "\033[34m",     # blue
+    "INFO": "\033[32m",      # green
+    "WARNING": "\033[33m",   # yellow
+    "ERROR": "\033[31m",     # red
+    "CRITICAL": "\033[1;31m",  # bold red
+}
+_COLOR_RESET = "\033[0m"
+
+
+class _ColorFormatter(logging.Formatter):
+    """Formatter that colors the level name to match Rust tracing output."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        color = _LEVEL_COLORS.get(record.levelname, "")
+        if color:
+            record.levelname = f"{color}{record.levelname}{_COLOR_RESET}"
+        return super().format(record)
+
+
 def setup_logging(level: str) -> None:
     """Set up logging configuration."""
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        _ColorFormatter(
+            fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+    )
     logging.basicConfig(
         level=getattr(logging, level.upper()),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=[handler],
+        force=True,
     )
     if level.upper() != "DEBUG":
         logging.getLogger("aiohttp.access").setLevel(logging.WARNING)

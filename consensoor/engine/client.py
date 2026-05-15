@@ -1,5 +1,6 @@
 """Engine API client for communication with execution layer."""
 
+import json
 import logging
 import time
 from typing import Optional, Any
@@ -156,7 +157,26 @@ class EngineAPIClient:
             async with session.post(
                 self.url, json=payload, headers=headers
             ) as response:
-                data = await response.json()
+                raw = await response.read()
+                text = raw.decode("utf-8", errors="replace")
+
+                if response.status != 200:
+                    error_type = str(response.status)
+                    logger.error(
+                        f"Engine API {method} HTTP {response.status}: {text[:500]}"
+                    )
+                    raise EngineAPIError(response.status, text[:500])
+
+                try:
+                    data = json.loads(text)
+                except json.JSONDecodeError:
+                    error_type = "invalid_json"
+                    content_type = response.headers.get("Content-Type", "")
+                    logger.error(
+                        f"Engine API {method} returned non-JSON body "
+                        f"(content-type={content_type!r}): {text[:500]}"
+                    )
+                    raise EngineAPIError(-1, f"Invalid JSON response: {text[:500]}")
 
                 if "error" in data:
                     error = data["error"]
