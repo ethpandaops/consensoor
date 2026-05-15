@@ -306,7 +306,9 @@ class BlockBuilder:
             logger.debug(f"state_root hash_tree_root took {(t1-t0)*1000:.1f}ms")
             logger.debug(f"State root computed successfully")
         except Exception as e:
-            logger.warning(f"Failed to compute state_root: {e}, using zero")
+            # Zero state_root means the block we're about to publish is
+            # spec-invalid — every peer will reject it. Surface this loudly.
+            logger.error(f"Failed to compute state_root: {e}, using zero")
             import traceback
             traceback.print_exc()
             state_root = b"\x00" * 32
@@ -512,7 +514,7 @@ class BlockBuilder:
             sync_aggregate = self._validate_sync_aggregate(state, sync_aggregate)
             new_count = sum(1 for b in sync_aggregate.sync_committee_bits if b)
             if new_count != participant_count:
-                logger.info(f"Sync aggregate failed validation, using empty aggregate")
+                logger.warning("Sync aggregate failed validation, using empty aggregate")
 
         if attestations:
             logger.info(f"Including {len(attestations)} attestations in block body")
@@ -736,7 +738,7 @@ class BlockBuilder:
             sync_aggregate = self._validate_sync_aggregate(state, sync_aggregate)
             new_count = sum(1 for b in sync_aggregate.sync_committee_bits if b)
             if new_count != participant_count:
-                logger.info(f"Sync aggregate failed validation, using empty aggregate")
+                logger.warning("Sync aggregate failed validation, using empty aggregate")
 
         if attestations:
             logger.info(f"Including {len(attestations)} attestations in GLOAS block body")

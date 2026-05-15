@@ -297,6 +297,37 @@ class NetworkConfig:
         """Check if Gloas (ePBS) fork is active at the given epoch."""
         return epoch >= self.gloas_fork_epoch
 
+    def fork_name_at_epoch(self, epoch: int) -> str:
+        """Return the spec fork name active at the given epoch.
+
+        Walks the config-declared fork schedule (genesis/altair/.../gloas)
+        and returns the name of the most recent fork whose activation
+        epoch is <= `epoch`. Use this anywhere we need to know which fork
+        we're on without inspecting block/state structure — the structure
+        check only tells us how SSZ was decoded, not what the spec
+        thinks the active fork is.
+        """
+        if epoch >= self.gloas_fork_epoch:
+            return "gloas"
+        if epoch >= self.fulu_fork_epoch:
+            return "fulu"
+        if epoch >= self.electra_fork_epoch:
+            return "electra"
+        if epoch >= self.deneb_fork_epoch:
+            return "deneb"
+        if epoch >= self.capella_fork_epoch:
+            return "capella"
+        if epoch >= self.bellatrix_fork_epoch:
+            return "bellatrix"
+        if epoch >= self.altair_fork_epoch:
+            return "altair"
+        return "phase0"
+
+    def fork_name_at_slot(self, slot: int) -> str:
+        """Return the spec fork name active at the given slot."""
+        from .constants import SLOTS_PER_EPOCH
+        return self.fork_name_at_epoch(slot // SLOTS_PER_EPOCH())
+
     def get_attestation_due_offset(self, epoch: int) -> float:
         """Get attestation due time offset in seconds for the given epoch.
 
