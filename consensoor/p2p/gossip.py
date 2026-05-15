@@ -13,6 +13,7 @@ from .host import P2PHost, P2PConfig
 from .encoding import (
     get_topic_name,
     get_blob_sidecar_topic,
+    get_sync_committee_subnet_topic,
     encode_message,
     decode_message,
     compute_fork_digest,
@@ -23,10 +24,12 @@ from .encoding import (
     ATTESTER_SLASHING_TOPIC,
     BLS_TO_EXECUTION_CHANGE_TOPIC,
     SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_TOPIC,
+    SYNC_COMMITTEE_SUBNET_TOPIC_PREFIX,
     BLOB_SIDECAR_TOPIC_PREFIX,
     EXECUTION_PAYLOAD_TOPIC,
     PAYLOAD_ATTESTATION_MESSAGE_TOPIC,
 )
+from ..spec.constants import SYNC_COMMITTEE_SUBNET_COUNT
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +158,13 @@ class BeaconGossip:
         """Subscribe to sync committee contribution and proof messages."""
         self._handlers[SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_TOPIC] = handler
 
+    def subscribe_sync_committee_messages(self, handler: MessageHandler) -> None:
+        """Subscribe to individual SyncCommitteeMessage gossip on all subnets.
+
+        Handler receives (decoded_ssz_bytes, from_peer, subnet_id).
+        """
+        self._sync_committee_message_handler = handler
+
     def subscribe_execution_payloads(self, handler: MessageHandler) -> None:
         """Subscribe to execution payload envelope messages (GLOAS/ePBS)."""
         self._handlers[EXECUTION_PAYLOAD_TOPIC] = handler
@@ -196,6 +206,19 @@ class BeaconGossip:
                     blob_subnet_count += 1
             subscribed_topics.append(f"blob_sidecar (6 subnets)")
 
+        # Subscribe to sync committee subnets (one per subcommittee).
+        # Aggregators must be in the mesh for these subnets to collect
+        # individual SyncCommitteeMessages from peers.
+        if getattr(self, "_sync_committee_message_handler", None) is not None:
+            for fork_digest in self._all_fork_digests:
+                for subnet_id in range(SYNC_COMMITTEE_SUBNET_COUNT):
+                    wrapped_handler = self._wrap_subnet_handler(
+                        self._sync_committee_message_handler, subnet_id
+                    )
+                    topic = get_sync_committee_subnet_topic(subnet_id, fork_digest)
+                    await self._host.subscribe(topic, wrapped_handler)
+            subscribed_topics.append(f"sync_committee ({SYNC_COMMITTEE_SUBNET_COUNT} subnets)")
+
         fork_count = len(self._all_fork_digests)
         logger.info(f"Subscribed to gossip topics: {subscribed_topics} ({fork_count} fork digests)")
 
@@ -207,6 +230,17 @@ class BeaconGossip:
                 await handler(decoded, from_peer)
             except Exception as e:
                 logger.error(f"Error decoding message: {e}")
+
+        return wrapped
+
+    def _wrap_subnet_handler(self, handler: Callable, subnet_id: int) -> MessageHandler:
+        """Wrap a subnet-aware handler so subnet_id is bound per topic."""
+        async def wrapped(data: bytes, from_peer: str) -> None:
+            try:
+                decoded = decode_message(data)
+                await handler(decoded, from_peer, subnet_id)
+            except Exception as e:
+                logger.error(f"Error decoding subnet message (subnet={subnet_id}): {e}")
 
         return wrapped
 
@@ -250,6 +284,12 @@ class BeaconGossip:
         """Publish a sync committee contribution and proof."""
         topic = get_topic_name(SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_TOPIC, self.fork_digest)
         encoded = encode_message(contribution_ssz)
+        await self._host.publish(topic, encoded)
+
+    async def publish_sync_committee_message(self, subnet_id: int, message_ssz: bytes) -> None:
+        """Publish a SyncCommitteeMessage on a specific sync_committee_{subnet_id} subnet."""
+        topic = get_sync_committee_subnet_topic(subnet_id, self.fork_digest)
+        encoded = encode_message(message_ssz)
         await self._host.publish(topic, encoded)
 
     async def publish_execution_payload(self, payload_ssz: bytes) -> None:

@@ -61,6 +61,7 @@ PROPOSER_SLASHING_TOPIC = "proposer_slashing"
 ATTESTER_SLASHING_TOPIC = "attester_slashing"
 BLS_TO_EXECUTION_CHANGE_TOPIC = "bls_to_execution_change"
 SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_TOPIC = "sync_committee_contribution_and_proof"
+SYNC_COMMITTEE_SUBNET_TOPIC_PREFIX = "sync_committee_"  # sync_committee_{subnet_id}
 BLOB_SIDECAR_TOPIC_PREFIX = "blob_sidecar_"  # blob_sidecar_{subnet_id}
 BEACON_ATTESTATION_TOPIC_PREFIX = "beacon_attestation_"  # beacon_attestation_{subnet_id}
 EXECUTION_PAYLOAD_TOPIC = "execution_payload"  # GLOAS/ePBS execution payload envelope
@@ -73,6 +74,18 @@ def get_blob_sidecar_topic(subnet_id: int, fork_digest: bytes, encoding: str = "
     Format: /eth2/{fork_digest}/blob_sidecar_{subnet_id}/{encoding}
     """
     return f"/eth2/{fork_digest.hex()}/{BLOB_SIDECAR_TOPIC_PREFIX}{subnet_id}/{encoding}"
+
+
+def get_sync_committee_subnet_topic(subnet_id: int, fork_digest: bytes, encoding: str = "ssz_snappy") -> str:
+    """Get the full topic name for a sync committee subnet.
+
+    Format: /eth2/{fork_digest}/sync_committee_{subnet_id}/{encoding}
+
+    Per Altair `specs/altair/validator.md`, each sync committee member
+    publishes their SyncCommitteeMessage on the subnet whose id matches
+    their `subcommittee_index = position // (SYNC_COMMITTEE_SIZE / SYNC_COMMITTEE_SUBNET_COUNT)`.
+    """
+    return f"/eth2/{fork_digest.hex()}/{SYNC_COMMITTEE_SUBNET_TOPIC_PREFIX}{subnet_id}/{encoding}"
 
 
 def get_attestation_subnet_topic(subnet_id: int, fork_digest: bytes, encoding: str = "ssz_snappy") -> str:

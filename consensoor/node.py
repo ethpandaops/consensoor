@@ -180,6 +180,15 @@ class BeaconNode:
         self.payload_attestation_pool = PayloadAttestationPool()
         self._attester_duties: dict[int, list] = {}  # epoch -> duties
         self._sync_committee_duties: dict[int, list] = {}  # validator_index -> committee positions
+        # Cache of validator_index -> list[position] for ALL validators in the
+        # current sync committee. Used to map incoming SyncCommitteeMessages
+        # from subnets to pool positions. Refreshed at each epoch boundary.
+        self._sync_committee_index_to_positions: dict[int, list[int]] = {}
+        # Debounced log buffer for inbound SyncCommitteeMessages — keyed by
+        # (slot, peer, subnet), flushed via a single short-lived task so we
+        # emit one aggregated line per group instead of one per message.
+        self._sync_msg_log_buffer: dict[tuple[int, str, int], list[int]] = {}
+        self._sync_msg_log_task: Optional[asyncio.Task] = None
 
         self._running = False
         self._genesis_time: int = 0
@@ -690,6 +699,7 @@ class BeaconNode:
             self.beacon_gossip.subscribe_blocks(self._on_p2p_block)
             self.beacon_gossip.subscribe_aggregates(self._on_p2p_aggregate)
             self.beacon_gossip.subscribe_sync_committee_contributions(self._on_p2p_sync_committee_contribution)
+            self.beacon_gossip.subscribe_sync_committee_messages(self._on_p2p_sync_committee_message)
             self.beacon_gossip.subscribe_blob_sidecars(self._on_p2p_blob_sidecar)
             self.beacon_gossip.subscribe_execution_payloads(self._on_p2p_execution_payload)
             self.beacon_gossip.subscribe_payload_attestation_messages(self._on_p2p_payload_attestation_message)
@@ -1556,11 +1566,25 @@ class BeaconNode:
             return
 
         self._sync_committee_duties.clear()
+        self._sync_committee_index_to_positions.clear()
 
         committee_pubkeys = list(self.state.current_sync_committee.pubkeys)
 
+        # Build the full pubkey -> validator_index map once so subnet ingest
+        # can resolve foreign messages without scanning validator state every
+        # time. Falls back to None for any unknown pubkey (shouldn't happen
+        # for a well-synced node).
+        pubkey_to_index: dict[bytes, int] = {}
+        for vi, v in enumerate(self.state.validators):
+            pubkey_to_index[bytes(v.pubkey)] = vi
+
         for position, pubkey in enumerate(committee_pubkeys):
             pubkey_bytes = bytes(pubkey)
+
+            global_index = pubkey_to_index.get(pubkey_bytes)
+            if global_index is not None:
+                self._sync_committee_index_to_positions.setdefault(global_index, []).append(position)
+
             if self.validator_client.has_key(pubkey_bytes):
                 validator_index = self.validator_client.get_validator_index(pubkey_bytes)
                 if validator_index is not None:
@@ -1600,6 +1624,10 @@ class BeaconNode:
         # Avoids expensive deep copy + process_slots that blocks the event loop.
         state_for_signing = self.state
 
+        from .spec.constants import SYNC_COMMITTEE_SIZE, SYNC_COMMITTEE_SUBNET_COUNT
+        sync_committee_size = SYNC_COMMITTEE_SIZE()
+        subcommittee_size = sync_committee_size // SYNC_COMMITTEE_SUBNET_COUNT
+
         produced_validators: list[int] = []
         produced_positions: list[int] = []
         block_root_hex: Optional[str] = None
@@ -1608,7 +1636,6 @@ class BeaconNode:
                 if key.validator_index == validator_index:
                     message = await self.validator_client.produce_sync_committee_message(
                         state_for_signing, slot, key,
-                        head_block_root=self.head_root,
                     )
                     if message:
                         produced_validators.append(int(validator_index))
@@ -1617,6 +1644,24 @@ class BeaconNode:
                             produced_positions.append(int(position))
                         if block_root_hex is None:
                             block_root_hex = bytes(message.beacon_block_root).hex()[:16]
+
+                        # Per altair/validator.md: each member publishes its
+                        # SyncCommitteeMessage on every subnet whose subcommittee
+                        # contains one of its positions. A single validator can
+                        # occupy multiple subcommittees if duplicated.
+                        if self.beacon_gossip is not None:
+                            subnets = {p // subcommittee_size for p in positions}
+                            try:
+                                ssz_bytes = bytes(message.encode_bytes())
+                                for subnet_id in subnets:
+                                    await self.beacon_gossip.publish_sync_committee_message(
+                                        subnet_id, ssz_bytes
+                                    )
+                            except Exception as e:
+                                logger.warning(
+                                    f"Failed to publish SyncCommitteeMessage "
+                                    f"validator={validator_index}: {e}"
+                                )
                     break
 
         if produced_validators:
@@ -2451,6 +2496,42 @@ class BeaconNode:
                 logger.error(f"Block sync loop error: {e}", exc_info=True)
             await asyncio.sleep(poll)
 
+    async def _backfill_for_reorg(self, target_slot: int) -> None:
+        """Fetch a recent slot window via blocks-by-range to fill a reorg gap.
+
+        Called when `_reorg_to` walks past everything we've stored. Best
+        effort — failures are logged and swallowed, the periodic sync loop
+        will keep trying. Throttled to one concurrent backfill via
+        `_reorg_backfill_lock`.
+        """
+        if not self.beacon_gossip:
+            return
+        lock = getattr(self, "_reorg_backfill_lock", None)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._reorg_backfill_lock = lock
+        if lock.locked():
+            return
+        async with lock:
+            count = 64
+            start_slot = max(1, target_slot - count + 1)
+            logger.info(
+                f"reorg backfill: requesting slots {start_slot}..{start_slot + count - 1}"
+            )
+            try:
+                blocks = await self.beacon_gossip.request_blocks_by_range(start_slot, count)
+            except Exception as e:
+                logger.warning(f"reorg backfill request failed: {e}")
+                return
+            if not blocks:
+                logger.warning("reorg backfill returned no blocks")
+                return
+            for block_ssz in blocks:
+                try:
+                    await self._on_p2p_block(block_ssz, "req/resp")
+                except Exception as e:
+                    logger.warning(f"reorg backfill: error processing block: {e}")
+
     async def _sync_missing_blocks(self, current_slot: int) -> None:
         """Sync missing blocks via req/resp if we're behind.
 
@@ -2748,6 +2829,70 @@ class BeaconNode:
         except Exception as e:
             logger.error(f"Error processing P2P aggregate: {e}")
 
+    async def _on_p2p_sync_committee_message(
+        self, data: bytes, from_peer: str, subnet_id: int
+    ) -> None:
+        """Handle an individual SyncCommitteeMessage from a subnet topic.
+
+        Resolves the sender's validator_index to its sync-committee position(s)
+        via the cached map and inserts one entry per position. Positions
+        outside this subnet's subcommittee are skipped — a duplicated
+        validator publishes the same message on each subnet it covers.
+        """
+        try:
+            from .spec.types.altair import SyncCommitteeMessage
+            from .spec.constants import SYNC_COMMITTEE_SIZE, SYNC_COMMITTEE_SUBNET_COUNT
+
+            message = SyncCommitteeMessage.decode_bytes(data)
+            validator_index = int(message.validator_index)
+
+            positions = self._sync_committee_index_to_positions.get(validator_index)
+            if not positions:
+                # Either we don't know this validator yet (state not built) or
+                # they aren't in the current sync committee. Drop silently —
+                # over-validating here would also drop legitimate fork-boundary
+                # messages we can't yet place.
+                return
+
+            subcommittee_size = SYNC_COMMITTEE_SIZE() // SYNC_COMMITTEE_SUBNET_COUNT
+            added_any = False
+            for position in positions:
+                if position // subcommittee_size != subnet_id:
+                    continue
+                if self.sync_committee_pool.add(message, position):
+                    added_any = True
+
+            if added_any:
+                key = (int(message.slot), from_peer, subnet_id)
+                self._sync_msg_log_buffer.setdefault(key, []).append(validator_index)
+                if self._sync_msg_log_task is None or self._sync_msg_log_task.done():
+                    self._sync_msg_log_task = asyncio.create_task(
+                        self._flush_sync_msg_log_after()
+                    )
+        except Exception as e:
+            logger.error(f"Error processing P2P sync committee message: {e}")
+
+    async def _flush_sync_msg_log_after(self) -> None:
+        """Flush buffered SyncCommitteeMessage debug logs after a short delay.
+
+        Groups by (slot, peer, subnet) and emits a single line with all
+        validator indices so a slot's worth of subnet chatter is one row
+        per (peer, subnet) instead of one per validator.
+        """
+        try:
+            await asyncio.sleep(0.5)
+        except asyncio.CancelledError:
+            return
+        buf = self._sync_msg_log_buffer
+        self._sync_msg_log_buffer = {}
+        for (slot, peer, subnet), validators in sorted(buf.items()):
+            unique_sorted = sorted(set(validators))
+            logger.debug(
+                f"P2P: SyncCommitteeMessages slot={slot} subnet={subnet} "
+                f"count={len(unique_sorted)} validators={unique_sorted} "
+                f"from={peer[:16]}"
+            )
+
     async def _on_p2p_sync_committee_contribution(self, data: bytes, from_peer: str) -> None:
         """Handle a sync committee contribution received via libp2p gossipsub."""
         try:
@@ -2930,20 +3075,54 @@ class BeaconNode:
         target_block = target_signed_block.message
         target_slot = int(target_block.slot)
 
+        # Bound the walk by our finalized checkpoint. Per fork-choice spec,
+        # only blocks descended from `store.finalized_checkpoint` can be
+        # canonical; a target at or below the finalized slot is unreachable
+        # by fork choice and walking past finality wastes memory (each
+        # `chain` entry is a full SignedBeaconBlock).
+        finalized_root: Optional[bytes] = None
+        finalized_slot: Optional[int] = None
+        if self.state is not None and hasattr(self.state, "finalized_checkpoint"):
+            ckpt = self.state.finalized_checkpoint
+            ckpt_root = bytes(ckpt.root)
+            ckpt_epoch = int(ckpt.epoch)
+            if ckpt_root != b"\x00" * 32 and ckpt_epoch > 0:
+                finalized_root = ckpt_root
+                finalized_slot = ckpt_epoch * SLOTS_PER_EPOCH()
+
+        if finalized_slot is not None and target_slot <= finalized_slot:
+            logger.warning(
+                f"reorg: rejecting target slot={target_slot} root={target_root.hex()[:16]} — "
+                f"at or below finalized slot {finalized_slot}"
+            )
+            return
+
         # Walk back collecting (root, signed_block) from target until we
         # reach either:
         #   (a) an ancestor whose post-state we already have cached in the
         #       store — start replay from that state, or
-        #   (b) genesis — fall back to a full replay.
+        #   (b) the finalized checkpoint — anchor on its cached post-state,
+        #       or fall back to genesis if we don't have it, or
+        #   (c) genesis — fall back to a full replay.
         # Without (a) we'd re-replay from genesis on every Gloas-boundary
         # block, the replays queue up under wall-clock pressure, head gets
         # stuck for hours.
         chain: list[tuple[bytes, object]] = [(target_root, target_signed_block)]
         cursor = bytes(target_block.parent_root)
         anchor_state = None
-        max_walk = max(target_slot + 8, 64)
+        # Cap walk depth at finalized-window + small jitter buffer. Without
+        # finality info, fall back to the previous heuristic.
+        if finalized_slot is not None:
+            max_walk = max(8, target_slot - finalized_slot + 8)
+        else:
+            max_walk = max(target_slot + 8, 64)
         for _ in range(max_walk):
             if self._genesis_block_root and cursor == self._genesis_block_root:
+                break
+            if finalized_root is not None and cursor == finalized_root:
+                # Stop at finality. If we have the finalized state cached,
+                # use it as anchor; otherwise fall through to genesis replay.
+                anchor_state = self.store.get_state(cursor)
                 break
             cached = self.store.get_state(cursor)
             if cached is not None:
@@ -2951,10 +3130,18 @@ class BeaconNode:
                 break
             ancestor_signed = self.store.get_block(cursor)
             if ancestor_signed is None:
-                raise ValueError(
+                # Peer's chain extends past anything we've stored. We don't
+                # have a BlocksByRoot protocol yet, so backfill via a range
+                # request anchored on the target slot and bail without
+                # updating head — a later block or the periodic sync loop
+                # will retry once the gap closes.
+                logger.warning(
                     f"reorg: missing ancestor {cursor.hex()[:16]} while walking "
-                    f"back from {target_root.hex()[:16]}"
+                    f"back from {target_root.hex()[:16]} (target_slot={target_slot}); "
+                    f"requesting range backfill"
                 )
+                asyncio.create_task(self._backfill_for_reorg(target_slot))
+                return
             chain.append((cursor, ancestor_signed))
             anc_block = ancestor_signed.message if hasattr(ancestor_signed, "message") else ancestor_signed
             cursor = bytes(anc_block.parent_root)

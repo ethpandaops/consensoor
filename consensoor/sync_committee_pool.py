@@ -194,7 +194,9 @@ class SyncCommitteePool:
         )
         return True
 
-    def get_sync_aggregate(self, slot: int) -> SyncAggregate:
+    def get_sync_aggregate(
+        self, slot: int, expected_block_root: Optional[bytes] = None
+    ) -> SyncAggregate:
         """Get aggregated SyncAggregate for a slot.
 
         Combines individual messages and contributions into a single SyncAggregate.
@@ -202,6 +204,11 @@ class SyncCommitteePool:
 
         Args:
             slot: The slot to aggregate for
+            expected_block_root: When set, drop any message or contribution whose
+                ``beacon_block_root`` doesn't match. Required when the pool may
+                contain messages signing different head roots (i.e. peers on
+                another fork) — mixing them produces an aggregate that fails
+                BLS verification against the state's view of previous_slot.
 
         Returns:
             SyncAggregate with aggregated bits and signature
@@ -216,6 +223,8 @@ class SyncCommitteePool:
         contributions = self._contributions.get(slot, {})
         for subcommittee_index, pooled in contributions.items():
             contribution = pooled.contribution
+            if expected_block_root is not None and bytes(contribution.beacon_block_root) != expected_block_root:
+                continue
             base_position = subcommittee_index * subcommittee_size
 
             has_bits = False
@@ -233,6 +242,8 @@ class SyncCommitteePool:
         messages = self._messages.get(slot, {})
         uncovered_messages = []
         for position, pooled in messages.items():
+            if expected_block_root is not None and bytes(pooled.message.beacon_block_root) != expected_block_root:
+                continue
             if position not in covered_positions and 0 <= position < sync_committee_size:
                 sync_bits[position] = True
                 uncovered_messages.append(pooled)

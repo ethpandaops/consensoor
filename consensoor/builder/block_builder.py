@@ -495,16 +495,28 @@ class BlockBuilder:
 
     def _build_block_body(self, state, randao_reveal: BLSSignature, execution_payload, fork: str, attestations=None):
         """Build the beacon block body for the appropriate fork."""
+        from ..spec.state_transition.helpers.accessors import get_block_root_at_slot
+
         current_slot = int(state.slot)
         # SyncAggregate: messages produced at slot N sign block at slot N-1
         # Block at slot N includes the sync aggregate from messages produced at slot N
         sync_aggregate_slot = current_slot
-        sync_aggregate = self.node.sync_committee_pool.get_sync_aggregate(sync_aggregate_slot)
+        # Filter pool to messages signing the same head root our state will
+        # verify against — `process_sync_aggregate` BLS-checks the aggregate
+        # against `get_block_root_at_slot(state, slot-1)`. Without this, any
+        # peer on another fork pollutes the pool and the aggregate gets
+        # zeroed out by `_validate_sync_aggregate`.
+        previous_slot = max(current_slot, 1) - 1
+        expected_block_root = bytes(get_block_root_at_slot(state, previous_slot))
+        sync_aggregate = self.node.sync_committee_pool.get_sync_aggregate(
+            sync_aggregate_slot, expected_block_root=expected_block_root
+        )
         participant_count = sum(1 for b in sync_aggregate.sync_committee_bits if b)
         sig_bytes = bytes(sync_aggregate.sync_committee_signature)
         g2_infinity = b'\xc0' + b'\x00' * 95
         logger.info(
-            f"Sync aggregate for block at slot {current_slot} (using messages from slot {sync_aggregate_slot}): "
+            f"Sync aggregate for block at slot {current_slot} (using messages from slot {sync_aggregate_slot}, "
+            f"expected_root={expected_block_root.hex()[:16]}): "
             f"{participant_count}/{SYNC_COMMITTEE_SIZE()} participants, sig_is_infinity={sig_bytes == g2_infinity}"
         )
 
@@ -722,14 +734,21 @@ class BlockBuilder:
         - signed_execution_payload_bid instead of execution_payload
         - payload_attestations from PTC
         """
+        from ..spec.state_transition.helpers.accessors import get_block_root_at_slot
+
         current_slot = int(state.slot)
         sync_aggregate_slot = current_slot
-        sync_aggregate = self.node.sync_committee_pool.get_sync_aggregate(sync_aggregate_slot)
+        previous_slot = max(current_slot, 1) - 1
+        expected_block_root = bytes(get_block_root_at_slot(state, previous_slot))
+        sync_aggregate = self.node.sync_committee_pool.get_sync_aggregate(
+            sync_aggregate_slot, expected_block_root=expected_block_root
+        )
         participant_count = sum(1 for b in sync_aggregate.sync_committee_bits if b)
         sig_bytes = bytes(sync_aggregate.sync_committee_signature)
         g2_infinity = b'\xc0' + b'\x00' * 95
         logger.info(
-            f"Sync aggregate for GLOAS block at slot {current_slot}: "
+            f"Sync aggregate for GLOAS block at slot {current_slot} "
+            f"(expected_root={expected_block_root.hex()[:16]}): "
             f"{participant_count}/{SYNC_COMMITTEE_SIZE()} participants, sig_is_infinity={sig_bytes == g2_infinity}"
         )
 
