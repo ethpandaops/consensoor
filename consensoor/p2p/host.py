@@ -581,45 +581,75 @@ class P2PHost:
         """Issue a BeaconBlocksByRange request via the rust binding.
 
         Returns a list of raw SSZ-encoded SignedBeaconBlock bytes (one per
-        chunk). Empty list if no peer is connected, the request times out,
-        or the responder declined.
+        chunk). Empty list if every peer either errored, timed out, or
+        responded with no chunks.
 
-        We pick the first peer that has a /eth2/.../beacon_blocks_by_range
-        protocol (in practice, the upstream we auto-bootstrapped against).
+        Iterates through all currently-connected peers — a single peer
+        returning empty is common (they don't have those blocks yet, or
+        decline to serve sync ranges close to head). Without retry we miss
+        blocks any time gossipsub also dropped them, which strands the
+        whole node on a stale head (slot 15 incident: 2026-05-15).
+        Per-peer budget is `timeout / max_peers` so the overall call
+        still respects the caller's deadline.
         """
         if self._network is None:
             return []
-        # Prefer a peer the rust libp2p stack reports as currently connected.
-        # Fall back to anything embedded in static_peers (multiaddr with
-        # /p2p/<peer_id>) so configurations without runtime peer-tracking
-        # still work.
-        target_peer = None
         try:
-            connected = self._network.connected_peers()
+            connected = list(self._network.connected_peers())
         except Exception:
             connected = []
+        candidates: list[dict] = []
         if connected:
-            target_peer = connected[0]
+            candidates = list(connected)
         else:
+            # No live peers — fall back to whatever was statically configured.
             for addr in self.config.static_peers:
                 if "/p2p/" in addr:
-                    target_peer = addr.rsplit("/p2p/", 1)[1]
-                    break
-        if target_peer is None:
+                    candidates.append({"peer_id": addr.rsplit("/p2p/", 1)[1]})
+
+        if not candidates:
             logger.debug("request_blocks_by_range: no known peer to dial")
             return []
-        try:
-            self._network.request_blocks_by_range(target_peer, int(start_slot), int(count))
-        except Exception as e:
-            logger.debug(f"request_blocks_by_range send failed: {e}")
-            return []
-        # Wait for the response on the rust event channel.
+
+        # Bound the per-peer wait so iterating across all peers still
+        # fits in the caller-provided deadline. Floor at 1.5s so we
+        # don't ask peers to respond in milliseconds.
+        per_peer_timeout = max(1.5, timeout / max(1, len(candidates)))
         loop = asyncio.get_running_loop()
-        ev = await loop.run_in_executor(
-            None, lambda: self._network.next_blocks_by_range(int(timeout * 1000))
+
+        for peer_info in candidates:
+            peer_id = peer_info.get("peer_id") if isinstance(peer_info, dict) else peer_info
+            if not peer_id:
+                continue
+            try:
+                self._network.request_blocks_by_range(peer_id, int(start_slot), int(count))
+            except Exception as e:
+                logger.debug(f"BeaconBlocksByRange send to {peer_id[:24]}... failed: {e}")
+                continue
+            ev = await loop.run_in_executor(
+                None, lambda: self._network.next_blocks_by_range(int(per_peer_timeout * 1000))
+            )
+            if ev is None:
+                logger.debug(
+                    f"BeaconBlocksByRange timeout from {peer_id[:24]}... "
+                    f"(slots {start_slot}..{start_slot + count - 1})"
+                )
+                continue
+            if ev.error:
+                logger.debug(
+                    f"BeaconBlocksByRange error from {peer_id[:24]}...: {ev.error}"
+                )
+                continue
+            if ev.response is None or not ev.response.chunks:
+                logger.debug(
+                    f"BeaconBlocksByRange empty response from {peer_id[:24]}... "
+                    f"(slots {start_slot}..{start_slot + count - 1})"
+                )
+                continue
+            return [bytes(c.ssz_block) for c in ev.response.chunks]
+
+        logger.warning(
+            f"BeaconBlocksByRange exhausted {len(candidates)} peer(s) without chunks "
+            f"(slots {start_slot}..{start_slot + count - 1})"
         )
-        if ev is None or ev.error or ev.response is None:
-            if ev and ev.error:
-                logger.debug(f"BeaconBlocksByRange failed: {ev.error}")
-            return []
-        return [bytes(c.ssz_block) for c in ev.response.chunks]
+        return []

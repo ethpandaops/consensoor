@@ -1589,7 +1589,8 @@ class BeaconNode:
             for pubkey, key in self.validator_client.keys.items():
                 if key.validator_index == validator_index:
                     message = await self.validator_client.produce_sync_committee_message(
-                        state_for_signing, slot, key
+                        state_for_signing, slot, key,
+                        head_block_root=self.head_root,
                     )
                     if message:
                         produced_validators.append(int(validator_index))
@@ -2082,6 +2083,16 @@ class BeaconNode:
                     f"head={current_head_root.hex()[:16]})"
                 )
                 await self._request_payload_for_slot(slot)
+                # Safety net for the case where head-adoption re-prep
+                # (in _on_p2p_block) didn't fire in time and we still
+                # ended up issuing fcU{payload_attributes} at slot start.
+                # Geth typically needs ~500ms to seal txs into a payload
+                # after fcU; calling getPayload in the same tick yields
+                # tx_count=0. Sleep keeps the proposal honest at the
+                # cost of being ~500ms later than the slot start. The
+                # `else` branch handles the rare case — the warm path
+                # (prep_is_valid=True) skips this entirely.
+                await asyncio.sleep(0.5)
             if not self._current_payload_id:
                 logger.error("Cannot produce block: failed to get payload_id")
                 return
@@ -2641,6 +2652,27 @@ class BeaconNode:
                         await self._apply_execution_payload_envelope(pending_envelope)
 
                     await self._update_forkchoice()
+
+                    # If we're the proposer for the *next* slot, kick off a
+                    # fresh payload-prep against the new head right now
+                    # (not at end-of-slot). Geth needs ~500ms-1s to seal
+                    # txs into a payload after fcU{payload_attributes};
+                    # prepping immediately on head adoption gives it the
+                    # full inter-slot gap to build, instead of racing the
+                    # slot boundary. Without this, every block we propose
+                    # ends up with tx_count=0 because the slot-start
+                    # late-prep + getPayload happens in the same second.
+                    next_slot = int(block.slot) + 1
+                    if (
+                        self.validator_client
+                        and self.validator_client.keys
+                        and self.validator_client.is_our_proposer_slot(self.state, next_slot)
+                    ):
+                        logger.info(
+                            f"Upcoming proposer for slot {next_slot}; "
+                            f"re-prepping payload on head adoption"
+                        )
+                        await self._update_forkchoice_for_slot(int(block.slot))
                 except Exception as e:
                     logger.warning(
                         f"P2P: Failed to apply block slot={block.slot}: {e}. "
