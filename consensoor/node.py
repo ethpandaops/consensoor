@@ -1074,6 +1074,7 @@ class BeaconNode:
             }
             if hasattr(self.state, "ptc_window"):
                 payload_attributes["slotNumber"] = hex(int(slot))
+                payload_attributes["targetGasLimit"] = hex(int(self.config.target_gas_limit))
 
             # Debug: compare head_root with hash of latest_block_header
             latest_header_hash = hash_tree_root(self.state.latest_block_header)
@@ -1370,6 +1371,7 @@ class BeaconNode:
             gloas_fork_epoch = getattr(network_config, "gloas_fork_epoch", None)
             if gloas_fork_epoch is not None and next_slot // SLOTS_PER_EPOCH() >= gloas_fork_epoch:
                 payload_attributes["slotNumber"] = hex(int(next_slot))
+                payload_attributes["targetGasLimit"] = hex(int(self.config.target_gas_limit))
 
             response = await self.engine.forkchoice_updated(
                 forkchoice_state, payload_attributes, timestamp=timestamp

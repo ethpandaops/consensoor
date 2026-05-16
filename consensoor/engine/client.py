@@ -1021,4 +1021,5 @@ class EngineAPIClient:
             withdrawals=[cls._withdrawal_dict_to_ssz(w) for w in a.get("withdrawals", [])],
             parent_beacon_block_root=ssz.Bytes32(cls._hex_bytes(a["parentBeaconBlockRoot"])),
             slot_number=cls._hex_int(a["slotNumber"]),
+            target_gas_limit=cls._hex_int(a.get("targetGasLimit", "0x0")),
         )

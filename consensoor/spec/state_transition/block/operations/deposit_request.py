@@ -86,8 +86,9 @@ def process_deposit_request(
     if _is_gloas_state(state):
         from .deposit import is_valid_deposit_signature as _check_signature
 
-        def is_pending_validator(pubkey) -> bool:
-            for pd in state.pending_deposits:
+        def is_pending_validator(pending_deposits, pubkey) -> bool:
+            """Alpha 8: takes an explicit pending_deposits sequence instead of state."""
+            for pd in pending_deposits:
                 if pd.pubkey != pubkey:
                     continue
                 if _check_signature(
@@ -108,7 +109,7 @@ def process_deposit_request(
         if is_builder or (
             is_builder_prefix
             and not is_validator
-            and not is_pending_validator(deposit_request.pubkey)
+            and not is_pending_validator(state.pending_deposits, deposit_request.pubkey)
         ):
             apply_deposit_for_builder(
                 deposit_request.pubkey,
