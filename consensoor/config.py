@@ -26,6 +26,10 @@ class Config:
     checkpoint_sync_url: str = ""
     supernode: bool = False
     engine_force_json: bool = False
+    # Proposer's preferred target gas limit, in gas (not millions). Sent as
+    # targetGasLimit on Gloas PayloadAttributesV4 and as
+    # ProposerPreferences.target_gas_limit. Default: 60_000_000.
+    target_gas_limit: int = 60_000_000
     _el_client_info: Optional[dict] = field(default=None, repr=False)
 
     @property

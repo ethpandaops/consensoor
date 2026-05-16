@@ -177,6 +177,16 @@ def cli():
     help="Force JSON-RPC for all Engine API calls, even if the EL advertises SSZ-over-REST. Useful for debugging.",
     envvar="CONSENSOOR_ENGINE_FORCE_JSON",
 )
+@click.option(
+    "--target-gas-limit",
+    type=int,
+    default=60,
+    show_default=True,
+    help="Proposer's preferred target gas limit, in millions of gas (e.g. 200 for 200M). "
+         "Sent as targetGasLimit in PayloadAttributesV4 on Gloas fcU calls and embedded in "
+         "broadcast SignedProposerPreferences.",
+    envvar="CONSENSOOR_TARGET_GAS_LIMIT",
+)
 def run(
     engine_api_url: str,
     jwt_secret: Optional[str],
@@ -197,6 +207,7 @@ def run(
     bootnodes: tuple[str, ...],
     supernode: bool,
     engine_force_json: bool,
+    target_gas_limit: int,
 ):
     """Run the consensus layer node."""
     setup_logging(log_level)
@@ -209,6 +220,10 @@ def run(
     from .node import run_node
 
     all_peers = list(peers) + list(bootnodes)
+
+    if target_gas_limit <= 0:
+        raise click.BadParameter("--target-gas-limit must be a positive integer (millions of gas)")
+    target_gas_limit_wei = target_gas_limit * 1_000_000
 
     config = Config(
         engine_api_url=engine_api_url,
@@ -229,6 +244,7 @@ def run(
         checkpoint_sync_url=checkpoint_sync_url or "",
         supernode=supernode,
         engine_force_json=engine_force_json,
+        target_gas_limit=target_gas_limit_wei,
     )
 
     logger.info("Starting consensoor")
@@ -238,6 +254,7 @@ def run(
     logger.info(f"  Engine API: {engine_api_url}")
     if engine_force_json:
         logger.info("  Engine transport: JSON-RPC forced (--engine-force-json)")
+    logger.info(f"  Target gas limit: {target_gas_limit}M ({target_gas_limit_wei:,} gas)")
     logger.info(f"  P2P: {p2p_host}:{p2p_port}")
     logger.info(f"  Beacon API: port {beacon_api_port}")
     logger.info(f"  Metrics: port {metrics_port}")

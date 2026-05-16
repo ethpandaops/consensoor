@@ -167,6 +167,7 @@ class PayloadAttributesV4(Container):
     withdrawals: List[WithdrawalV1, MAX_WITHDRAWALS_PER_PAYLOAD]
     parent_beacon_block_root: Bytes32
     slot_number: uint64
+    target_gas_limit: uint64
 
 
 class ForkchoiceUpdatedResponseV1(Container):
