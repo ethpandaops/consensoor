@@ -1127,6 +1127,7 @@ class BeaconNode:
         last_slot_processed = -1
         last_attestation_slot = -1
         last_ptc_slot = -1
+        last_sync_committee_slot = -1
 
         while self._running:
             try:
@@ -1155,10 +1156,23 @@ class BeaconNode:
                     # stays responsive for gossipsub block processing
                     asyncio.create_task(self._on_slot_start_safe(current_slot))
 
-                # Phase 2: Attestation due time - produce attestations
+                # Phase 2: Attestation due time - produce attestations and
+                # sync committee messages. Per altair/validator.md sync
+                # committee members sign at the same 1/3 mark (or earlier
+                # if the slot's block already landed) — signing at slot
+                # start, before the slot's block has arrived, makes our
+                # messages reference the previous slot's head root while
+                # peer aggregators sign this slot's block. The pool's
+                # expected_block_root filter then drops all of ours,
+                # which is why our 83 sync committee validators never
+                # appear in any block's sync_aggregate.
                 if current_slot > last_attestation_slot and time_into_slot >= attestation_offset:
                     last_attestation_slot = current_slot
                     await self._produce_attestations(current_slot)
+
+                if current_slot > last_sync_committee_slot and time_into_slot >= attestation_offset:
+                    last_sync_committee_slot = current_slot
+                    await self._produce_sync_committee_messages(current_slot)
 
                 # Phase 3: PTC due time (Gloas) - produce payload attestations
                 # Vote on whether slot M's execution payload was revealed in
@@ -1217,8 +1231,9 @@ class BeaconNode:
         epoch = slot // slots_per_epoch
         logger.info(f"Slot {slot} (epoch {epoch})")
 
-        # Produce sync committee messages — block builder needs them in pool
-        await self._produce_sync_committee_messages(slot)
+        # Sync committee message production moved to the 1/3 mark (next
+        # to attestations) so we sign this slot's head, not the previous
+        # one. See _slot_ticker for the call site.
 
         # Yield to event loop so gossipsub blocks can be processed
         await asyncio.sleep(0)
@@ -1631,11 +1646,19 @@ class BeaconNode:
         produced_validators: list[int] = []
         produced_positions: list[int] = []
         block_root_hex: Optional[str] = None
+        # Sign against the tracked head root. Without this, the producer
+        # falls back to state.block_roots[(slot-1) % HIST] which at slot
+        # start is stale or zero (process_slot for slot-1 hasn't run yet),
+        # so our messages would sign a phantom root that no peer agrees on
+        # — Lighthouse/Teku silently drop them and even our own
+        # `_validate_sync_aggregate` zeroes them out on BLS check.
+        head_block_root = self.head_root
         for validator_index, positions in self._sync_committee_duties.items():
             for pubkey, key in self.validator_client.keys.items():
                 if key.validator_index == validator_index:
                     message = await self.validator_client.produce_sync_committee_message(
                         state_for_signing, slot, key,
+                        head_block_root=head_block_root,
                     )
                     if message:
                         produced_validators.append(int(validator_index))
@@ -2672,21 +2695,68 @@ class BeaconNode:
                         self.store.save_block(block_root, signed_block)
                         return
                 else:
-                    # Different chain — but parent is in our store and the
-                    # new block is at a slot ≥ head. Treat as reorg candidate.
+                    # Parent is in our store but != head. Two cases:
+                    #  (a) Sequential gap-fill: blocks arrived out of order
+                    #      over gossip (e.g. 37 before 32-36) but every
+                    #      intermediate descends from our current head.
+                    #      No reorg — just apply the missing blocks forward
+                    #      on top of self.state.
+                    #  (b) Real reorg: a sibling chain whose common ancestor
+                    #      sits below our current head. Walk-and-replay via
+                    #      `_reorg_to`.
+                    # Out-of-order gossip is the common case; misclassifying
+                    # it as a reorg replays from a deep anchor every time a
+                    # new gossip block arrives, and head never advances.
                     self.store.save_block(block_root, signed_block)
                     if int(block.slot) > self.head_slot:
-                        logger.info(
-                            f"P2P: Reorg candidate slot={block.slot} root={block_root.hex()[:16]} "
-                            f"(our head slot={self.head_slot} root={self.head_root.hex()[:16]})"
-                        )
-                        try:
-                            await self._reorg_to(block_root, signed_block)
-                        except Exception as e:
-                            logger.error(f"P2P: Reorg to slot={block.slot} failed: {e}")
-                            import traceback
-                            traceback.print_exc()
-                        return
+                        gap_chain = self._walk_back_to_head(parent_root, max_steps=64)
+                        if gap_chain is not None:
+                            logger.info(
+                                f"P2P: Sequential gap-fill slot={block.slot}: "
+                                f"applying {len(gap_chain)} intermediate block(s) "
+                                f"on top of head slot={self.head_slot} "
+                                f"root={self.head_root.hex()[:16]}"
+                            )
+                            try:
+                                for missing_root, missing_signed in gap_chain:
+                                    missing_block = (
+                                        missing_signed.message
+                                        if hasattr(missing_signed, "message")
+                                        else missing_signed
+                                    )
+                                    await self._apply_block_to_state(
+                                        missing_block, missing_root, missing_signed
+                                    )
+                                    await self._notify_el_of_received_block(missing_block)
+                                    self.head_slot = int(missing_block.slot)
+                                    self.head_root = missing_root
+                                    self.store.set_head(missing_root)
+                            except Exception as e:
+                                logger.error(
+                                    f"P2P: gap-fill failed before slot={block.slot}: {e}"
+                                )
+                                import traceback
+                                traceback.print_exc()
+                                return
+                            # parent_root now equals self.head_root; fall
+                            # through to the normal forward-import path
+                            # below to apply the new block as head.
+                        else:
+                            logger.info(
+                                f"P2P: Reorg candidate slot={block.slot} "
+                                f"root={block_root.hex()[:16]} "
+                                f"(our head slot={self.head_slot} "
+                                f"root={self.head_root.hex()[:16]})"
+                            )
+                            try:
+                                await self._reorg_to(block_root, signed_block)
+                            except Exception as e:
+                                logger.error(
+                                    f"P2P: Reorg to slot={block.slot} failed: {e}"
+                                )
+                                import traceback
+                                traceback.print_exc()
+                            return
                     else:
                         logger.debug(
                             f"P2P: Block slot={block.slot} on different chain but not "
@@ -3049,6 +3119,36 @@ class BeaconNode:
             logger.info(f"Stored blob sidecar: slot={slot}, index={index}, block_root={block_root.hex()[:16]}")
         except Exception as e:
             logger.warning(f"Failed to persist blob sidecar to LevelDB: {e}")
+
+    def _walk_back_to_head(
+        self, start_root: bytes, max_steps: int = 64
+    ) -> Optional[list[tuple[bytes, object]]]:
+        """If `start_root`'s ancestry reaches `self.head_root` within
+        `max_steps`, return the list of (root, signed_block) entries from
+        oldest to newest (i.e. the missing blocks that, applied in order on
+        top of `self.state`, advance head from current to `start_root`).
+        Returns None if we hit an unknown ancestor, exceed max_steps, or
+        head isn't set.
+        """
+        if self.head_root is None:
+            return None
+        chain: list[tuple[bytes, object]] = []
+        cursor = start_root
+        for _ in range(max_steps):
+            if cursor == self.head_root:
+                chain.reverse()
+                return chain
+            ancestor_signed = self.store.get_block(cursor)
+            if ancestor_signed is None:
+                return None
+            chain.append((cursor, ancestor_signed))
+            anc_block = (
+                ancestor_signed.message
+                if hasattr(ancestor_signed, "message")
+                else ancestor_signed
+            )
+            cursor = bytes(anc_block.parent_root)
+        return None
 
     async def _reorg_to(self, target_root: bytes, target_signed_block) -> None:
         """Switch chain head to a new block by walking back to a common
