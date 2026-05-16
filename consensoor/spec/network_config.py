@@ -41,6 +41,7 @@ class NetworkConfig:
     aggregate_due_bps_gloas: int = 5000  # 50% of slot
     sync_message_due_bps_gloas: int = 2500
     contribution_due_bps_gloas: int = 5000
+    payload_due_bps: int = 7500  # 75% of slot (Gloas alpha 8)
     payload_attestation_due_bps: int = 7500  # 75% of slot
 
     # EIP-7805 timing
@@ -50,7 +51,7 @@ class NetworkConfig:
     min_validator_withdrawability_delay: int = 256
     shard_committee_period: int = 256
     eth1_follow_distance: int = 2048
-    min_builder_withdrawability_delay: int = 4096
+    min_builder_withdrawability_delay: int = 8192
 
     min_genesis_active_validator_count: int = 16384
     min_genesis_time: int = 0
@@ -190,6 +191,7 @@ class NetworkConfig:
         config.aggregate_due_bps = 6667
         config.attestation_due_bps_gloas = 2500
         config.aggregate_due_bps_gloas = 5000
+        config.payload_due_bps = 7500
         config.payload_attestation_due_bps = 7500
         # Validator cycle (per minimal.yaml)
         config.min_per_epoch_churn_limit = 2
@@ -361,6 +363,11 @@ class NetworkConfig:
         """
         slot_duration = self.slot_duration_ms / 1000.0
         return slot_duration * (self.payload_attestation_due_bps / 10000.0)
+
+    def get_payload_due_offset(self) -> float:
+        """Payload due offset in seconds (PTC validators consider payloads seen after this stale)."""
+        slot_duration = self.slot_duration_ms / 1000.0
+        return slot_duration * (self.payload_due_bps / 10000.0)
 
 
 _config: NetworkConfig | None = None

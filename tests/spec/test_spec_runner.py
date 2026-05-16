@@ -703,9 +703,11 @@ def pytest_generate_tests(metafunc):
 
     if "compliance_case" in metafunc.fixturenames:
         test_cases = discover_fork_choice_compliance_tests(spec_tests_dir)
-        if test_cases:
-            ids = [tc[0] for tc in test_cases]
-            metafunc.parametrize("compliance_case", test_cases, ids=ids)
+        # Always parametrize (with empty list if comptests fixtures aren't
+        # downloaded) so pytest collects zero tests rather than raising
+        # "fixture 'compliance_case' not found" at setup time.
+        ids = [tc[0] for tc in test_cases]
+        metafunc.parametrize("compliance_case", test_cases, ids=ids)
 
 
 class TestSSZStatic:

@@ -309,7 +309,8 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
 
     pre_header = pre.latest_execution_payload_header
 
-    # Spec: latest_execution_payload_bid only sets block_hash and execution_requests_root
+    # Spec: latest_execution_payload_bid sets block_hash, gas_limit (alpha 8),
+    # and execution_requests_root from the pre-fork execution payload header.
     empty_requests_root = hash_tree_root(ExecutionRequests())
     empty_bid = ExecutionPayloadBid(
         parent_block_hash=Hash32(),
@@ -317,7 +318,7 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
         block_hash=pre_header.block_hash,
         prev_randao=Bytes32(),
         fee_recipient=b"\x00" * 20,
-        gas_limit=uint64(0),
+        gas_limit=uint64(pre_header.gas_limit),
         builder_index=uint64(0),
         slot=uint64(0),
         value=Gwei(0),

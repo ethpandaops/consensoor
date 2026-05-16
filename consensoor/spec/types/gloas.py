@@ -205,7 +205,7 @@ class ProposerPreferences(Container):
     proposal_slot: Slot
     validator_index: ValidatorIndex
     fee_recipient: ExecutionAddress
-    gas_limit: uint64
+    target_gas_limit: uint64
 
 
 class SignedProposerPreferences(Container):
