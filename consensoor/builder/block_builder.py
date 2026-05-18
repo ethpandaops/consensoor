@@ -285,7 +285,14 @@ class BlockBuilder:
         else:
             # Non-GLOAS: Build execution payload directly
             execution_payload = self._build_execution_payload(execution_payload_dict, fork)
-            body = self._build_block_body(temp_state, randao_reveal, execution_payload, fork, attestations)
+            body = self._build_block_body(
+                temp_state,
+                randao_reveal,
+                execution_payload,
+                fork,
+                attestations,
+                execution_requests=execution_requests,
+            )
         logger.debug(f"Block body attestations count after build: {len(body.attestations)}")
 
         # Build block with placeholder state_root
@@ -493,7 +500,15 @@ class BlockBuilder:
 
         return ExecutionPayload(**base_fields)
 
-    def _build_block_body(self, state, randao_reveal: BLSSignature, execution_payload, fork: str, attestations=None):
+    def _build_block_body(
+        self,
+        state,
+        randao_reveal: BLSSignature,
+        execution_payload,
+        fork: str,
+        attestations=None,
+        execution_requests: list | None = None,
+    ):
         """Build the beacon block body for the appropriate fork."""
         from ..spec.state_transition.helpers.accessors import get_block_root_at_slot
 
@@ -563,14 +578,83 @@ class BlockBuilder:
         if fork == "deneb":
             return DenebBeaconBlockBody(**base_fields)
 
-        empty_execution_requests = ExecutionRequests(
-            deposits=[],
-            withdrawals=[],
-            consolidations=[],
+        # Electra+ blocks commit to body.execution_requests as a separate
+        # SSZ field, and the EL's execution_payload.block_hash was computed
+        # from the same EIP-7685 request list (via requests_hash). If we
+        # build the body with empty execution_requests but the EL returned
+        # real ones via getPayload, the gossiped block is self-inconsistent
+        # — peers call newPayload(payload, requests=[]) and the EL rejects
+        # with "invalid requests hash" while WE happen to accept our own
+        # block because consensoor-side state-transition doesn't reach the
+        # EL. This silently orphans every block we propose that contains
+        # any deposit / withdrawal / consolidation request.
+        base_fields["execution_requests"] = self._decode_execution_requests_hex(
+            execution_requests
         )
-        base_fields["execution_requests"] = empty_execution_requests
 
         return ElectraBeaconBlockBody(**base_fields)
+
+    @staticmethod
+    def _decode_execution_requests_hex(execution_requests: list | None) -> ExecutionRequests:
+        """Turn the EL's EIP-7685 hex-string list into an SSZ ExecutionRequests.
+
+        Per EIP-7685, each entry is `<type_byte><concatenated SSZ records>`:
+            type 0x00 → DepositRequest (192 bytes each)
+            type 0x01 → WithdrawalRequest (76 bytes each)
+            type 0x02 → ConsolidationRequest (116 bytes each)
+        Multiple records of the same type are packed into a single entry.
+        """
+        from ..spec.types.electra import (
+            DepositRequest,
+            WithdrawalRequest,
+            ConsolidationRequest,
+        )
+
+        DEPOSIT_SIZE = 48 + 32 + 8 + 96 + 8       # 192
+        WITHDRAWAL_SIZE = 20 + 48 + 8             # 76
+        CONSOLIDATION_SIZE = 20 + 48 + 48         # 116
+
+        deposits: list = []
+        withdrawals: list = []
+        consolidations: list = []
+
+        for entry in execution_requests or []:
+            if not isinstance(entry, str):
+                continue
+            data = bytes.fromhex(entry.replace("0x", ""))
+            if len(data) < 1:
+                continue
+            type_byte = data[0]
+            body = data[1:]
+            if type_byte == 0x00:
+                size = DEPOSIT_SIZE
+                cls = DepositRequest
+                target = deposits
+            elif type_byte == 0x01:
+                size = WITHDRAWAL_SIZE
+                cls = WithdrawalRequest
+                target = withdrawals
+            elif type_byte == 0x02:
+                size = CONSOLIDATION_SIZE
+                cls = ConsolidationRequest
+                target = consolidations
+            else:
+                logger.warning(f"Unknown execution_request type 0x{type_byte:02x}; skipping")
+                continue
+            if len(body) % size != 0:
+                logger.error(
+                    f"execution_request type 0x{type_byte:02x} body length "
+                    f"{len(body)} not a multiple of {size}"
+                )
+                continue
+            for i in range(0, len(body), size):
+                target.append(cls.decode_bytes(body[i:i + size]))
+
+        return ExecutionRequests(
+            deposits=deposits,
+            withdrawals=withdrawals,
+            consolidations=consolidations,
+        )
 
     def _validate_sync_aggregate(self, state, sync_aggregate: SyncAggregate) -> SyncAggregate:
         """Validate sync aggregate signature before including in block.
@@ -652,11 +736,6 @@ class BlockBuilder:
         The builder_index is set to BUILDER_INDEX_SELF_BUILD (2^64 - 1).
         """
         from ..spec.types.base import uint64
-        from ..spec.types.electra import (
-            DepositRequest,
-            WithdrawalRequest,
-            ConsolidationRequest,
-        )
 
         def hex_to_bytes(h: str) -> bytes:
             return bytes.fromhex(h.replace("0x", ""))
@@ -682,25 +761,11 @@ class BlockBuilder:
         # envelope is built from the same EL request list, so build the
         # ExecutionRequests container here and hash it. Lighthouse asserts
         # bid.execution_requests_root == hash_tree_root(envelope.execution_requests).
-        exec_requests_obj = ExecutionRequests(
-            deposits=[],
-            withdrawals=[],
-            consolidations=[],
-        )
-        for req_hex in execution_requests or []:
-            if not isinstance(req_hex, str):
-                continue
-            req_bytes = hex_to_bytes(req_hex)
-            if not req_bytes:
-                continue
-            req_type = req_bytes[0]
-            req_data = req_bytes[1:]
-            if req_type == 0x00:
-                exec_requests_obj.deposits.append(DepositRequest.decode_bytes(req_data))
-            elif req_type == 0x01:
-                exec_requests_obj.withdrawals.append(WithdrawalRequest.decode_bytes(req_data))
-            elif req_type == 0x02:
-                exec_requests_obj.consolidations.append(ConsolidationRequest.decode_bytes(req_data))
+        # Each EIP-7685 entry packs ALL requests of one type, so a single
+        # entry like 0x00<dep1_192><dep2_192> must produce two DepositRequests.
+        # The previous one-record-per-type decode silently dropped extras
+        # and produced a wrong bid root for any block with >1 deposit.
+        exec_requests_obj = self._decode_execution_requests_hex(execution_requests)
         execution_requests_root = hash_tree_root(exec_requests_obj)
 
         bid = ExecutionPayloadBid(
