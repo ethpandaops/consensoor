@@ -325,6 +325,16 @@ class BeaconGossip:
         """
         self._host.set_block_provider(provider)
 
+    def set_block_by_root_provider(
+        self, provider: Callable[[bytes], Optional[tuple[bytes, bytes]]]
+    ) -> None:
+        """Set the root-keyed block provider for BlocksByRoot req/resp.
+
+        The provider takes a 32-byte block root and returns
+        (ssz_bytes, fork_digest) or None if the block is unknown.
+        """
+        self._host.set_block_by_root_provider(provider)
+
     @property
     def peer_id(self) -> Optional[str]:
         """Get the local peer ID."""
@@ -347,3 +357,14 @@ class BeaconGossip:
             List of SSZ-encoded signed beacon blocks
         """
         return await self._host.request_blocks_by_range(start_slot, count, timeout)
+
+    async def request_blocks_by_root(
+        self, roots: list[bytes], timeout: float = 15.0
+    ) -> list[bytes]:
+        """Request blocks by 32-byte root from a peer via BlocksByRoot v2.
+
+        Returns a list of SSZ-encoded signed beacon blocks. Used to backfill
+        blocks that were missed via gossip (e.g. when a child arrived before
+        its parent).
+        """
+        return await self._host.request_blocks_by_root(roots, timeout)

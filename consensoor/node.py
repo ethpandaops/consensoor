@@ -705,6 +705,7 @@ class BeaconNode:
             self.beacon_gossip.subscribe_payload_attestation_messages(self._on_p2p_payload_attestation_message)
             self.beacon_gossip.set_status_provider(self._get_chain_status)
             self.beacon_gossip.set_block_provider(self._get_block_for_slot)
+            self.beacon_gossip.set_block_by_root_provider(self._get_block_by_root)
 
             await self.beacon_gossip.start()
             await self.beacon_gossip.activate_subscriptions()
@@ -801,6 +802,39 @@ class BeaconNode:
 
         except Exception as e:
             logger.warning(f"Failed to get block for slot {slot}: {e}")
+            return None
+
+    def _get_block_by_root(self, root: bytes) -> Optional[tuple[bytes, bytes]]:
+        """Get a block by its 32-byte root for serving via BlocksByRoot req/resp.
+
+        Returns (ssz_encoded_signed_block, fork_digest_context) or None when
+        we don't have the block. Called from the P2P host dispatcher thread —
+        must be cheap and not perform async work.
+        """
+        try:
+            block = self.store.get_block(root)
+            if block is None:
+                return None
+
+            block_ssz = block.encode_bytes()
+
+            from .p2p.encoding import compute_fork_digest
+            from .spec.network_config import get_config as get_network_config
+            from .spec.constants import SLOTS_PER_EPOCH
+
+            net_config = get_network_config()
+            slot = int(block.message.slot)
+            epoch = slot // SLOTS_PER_EPOCH()
+            fork_version = net_config.get_fork_version(epoch)
+            genesis_validators_root = (
+                bytes(self.state.genesis_validators_root) if self.state else b"\x00" * 32
+            )
+            fork_digest = compute_fork_digest(fork_version, genesis_validators_root)
+
+            return (block_ssz, fork_digest)
+
+        except Exception as e:
+            logger.warning(f"Failed to get block by root {root.hex()[:16]}: {e}")
             return None
 
     def _get_next_fork_info(self, net_config, current_epoch: int) -> tuple[bytes, int]:

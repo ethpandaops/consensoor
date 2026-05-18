@@ -24,6 +24,9 @@ use tokio::runtime::Runtime;
 use crate::blocks_by_range::{
     self, BlocksByRangeBehaviour, BlocksByRangeEvent, BlocksByRangeRequest, BlocksByRangeResponse,
 };
+use crate::blocks_by_root::{
+    self, BlocksByRootBehaviour, BlocksByRootEvent, BlocksByRootRequest, BlocksByRootResponse,
+};
 use crate::bootnode;
 use crate::gossip;
 use crate::rpc::{
@@ -66,6 +69,7 @@ struct Eth2Behaviour {
     goodbye: rpc::GoodbyeBehaviour,
     metadata: rpc::MetadataBehaviour,
     blocks_by_range: BlocksByRangeBehaviour,
+    blocks_by_root: BlocksByRootBehaviour,
 }
 
 #[pyclass]
@@ -247,6 +251,8 @@ enum Command {
     AnswerMetadata { id: u64, metadata: MetaDataMessage },
     RequestBlocksByRange { peer: String, request: BlocksByRangeRequest },
     AnswerBlocksByRange { id: u64, response: BlocksByRangeResponse },
+    RequestBlocksByRoot { peer: String, request: BlocksByRootRequest },
+    AnswerBlocksByRoot { id: u64, response: BlocksByRootResponse },
     Shutdown,
 }
 
@@ -260,6 +266,7 @@ pub struct Network {
     goodbye_rx: Mutex<Receiver<GoodbyeEvent>>,
     metadata_rx: Mutex<Receiver<MetadataEvent>>,
     by_range_rx: Mutex<Receiver<BlocksByRangeEvent>>,
+    by_root_rx: Mutex<Receiver<BlocksByRootEvent>>,
     local_peer_id: String,
     listen_addrs: Arc<Mutex<Vec<String>>>,
     connected_peers: Arc<Mutex<HashMap<String, &'static str>>>,
@@ -374,6 +381,7 @@ impl Network {
         let (goodbye_tx, goodbye_rx) = bounded::<GoodbyeEvent>(256);
         let (metadata_tx, metadata_rx) = bounded::<MetadataEvent>(256);
         let (by_range_tx, by_range_rx) = bounded::<BlocksByRangeEvent>(64);
+        let (by_root_tx, by_root_rx) = bounded::<BlocksByRootEvent>(64);
         let listen_addrs = Arc::new(Mutex::new(Vec::<String>::new()));
         let listen_addrs_clone = listen_addrs.clone();
         let connected_peers = Arc::new(Mutex::new(HashMap::<String, &'static str>::new()));
@@ -406,6 +414,7 @@ impl Network {
                 goodbye_tx,
                 metadata_tx,
                 by_range_tx,
+                by_root_tx,
                 listen_addrs_clone,
                 connected_peers_clone,
                 peer_enrs_clone,
@@ -433,6 +442,7 @@ impl Network {
             goodbye_rx: Mutex::new(goodbye_rx),
             metadata_rx: Mutex::new(metadata_rx),
             by_range_rx: Mutex::new(by_range_rx),
+            by_root_rx: Mutex::new(by_root_rx),
             local_peer_id: local_peer_id_str,
             listen_addrs,
             connected_peers,
@@ -745,6 +755,49 @@ impl Network {
         }
     }
 
+    pub fn request_blocks_by_root(&self, peer: String, roots: Vec<u8>) -> PyResult<()> {
+        let request = BlocksByRootRequest::new(roots)?;
+        self.cmd_tx
+            .send_blocking(Command::RequestBlocksByRoot { peer, request })
+            .map_err(|e| PyRuntimeError::new_err(format!("request_blocks_by_root: {e}")))
+    }
+
+    pub fn answer_blocks_by_root(
+        &self,
+        request_id: u64,
+        response: BlocksByRootResponse,
+    ) -> PyResult<()> {
+        self.cmd_tx
+            .send_blocking(Command::AnswerBlocksByRoot {
+                id: request_id,
+                response,
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("answer_blocks_by_root: {e}")))
+    }
+
+    #[pyo3(signature = (timeout_ms=None))]
+    pub fn next_blocks_by_root<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Option<Py<BlocksByRootEvent>>> {
+        let rx = self.by_root_rx.lock().clone();
+        let runtime = self.runtime.clone();
+        let result = py.allow_threads(|| match timeout_ms {
+            Some(ms) => runtime.block_on(async move {
+                tokio::time::timeout(Duration::from_millis(ms), rx.recv())
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+            }),
+            None => runtime.block_on(async move { rx.recv().await.ok() }),
+        });
+        match result {
+            Some(ev) => Ok(Some(Py::new(py, ev)?)),
+            None => Ok(None),
+        }
+    }
+
     /// Block until a gossipsub message arrives or `timeout_ms` elapses.
     #[pyo3(signature = (timeout_ms=None))]
     pub fn next_message<'py>(
@@ -884,6 +937,7 @@ async fn run_swarm(
     goodbye_tx: Sender<GoodbyeEvent>,
     metadata_tx: Sender<MetadataEvent>,
     by_range_tx: Sender<BlocksByRangeEvent>,
+    by_root_tx: Sender<BlocksByRootEvent>,
     listen_addrs: Arc<Mutex<Vec<String>>>,
     connected_peers: Arc<Mutex<HashMap<String, &'static str>>>,
     peer_enrs: Arc<Mutex<HashMap<String, String>>>,
@@ -978,6 +1032,7 @@ async fn run_swarm(
         goodbye: rpc::new_goodbye_behaviour(),
         metadata: rpc::new_metadata_behaviour(),
         blocks_by_range: blocks_by_range::new_blocks_by_range_behaviour(),
+        blocks_by_root: blocks_by_root::new_blocks_by_root_behaviour(),
     };
 
     // Swarm config based on lighthouse_network::service `with_executor` block
@@ -1048,6 +1103,10 @@ async fn run_swarm(
     let mut pending_by_range: HashMap<
         u64,
         request_response::ResponseChannel<BlocksByRangeResponse>,
+    > = HashMap::new();
+    let mut pending_by_root: HashMap<
+        u64,
+        request_response::ResponseChannel<BlocksByRootResponse>,
     > = HashMap::new();
     let mut next_response_id: u64 = 1;
 
@@ -1252,6 +1311,14 @@ async fn run_swarm(
                         &mut next_response_id,
                     ).await;
                 }
+                SwarmEvent::Behaviour(Eth2BehaviourEvent::BlocksByRoot(rr_event)) => {
+                    handle_blocks_by_root_event(
+                        rr_event,
+                        &by_root_tx,
+                        &mut pending_by_root,
+                        &mut next_response_id,
+                    ).await;
+                }
                 _ => {}
             },
             cmd = cmd_rx.recv() => match cmd {
@@ -1379,6 +1446,23 @@ async fn run_swarm(
                         tracing::warn!("answer_blocks_by_range: no pending request id {id}");
                     }
                 }
+                Ok(Command::RequestBlocksByRoot { peer, request }) => {
+                    match peer.parse::<libp2p::PeerId>() {
+                        Ok(peer_id) => {
+                            let _ = swarm.behaviour_mut().blocks_by_root.send_request(&peer_id, request);
+                        }
+                        Err(e) => tracing::warn!("request_blocks_by_root: bad peer id {peer}: {e}"),
+                    }
+                }
+                Ok(Command::AnswerBlocksByRoot { id, response }) => {
+                    if let Some(channel) = pending_by_root.remove(&id) {
+                        if swarm.behaviour_mut().blocks_by_root.send_response(channel, response).is_err() {
+                            tracing::warn!("answer_blocks_by_root: channel dropped for id {id}");
+                        }
+                    } else {
+                        tracing::warn!("answer_blocks_by_root: no pending request id {id}");
+                    }
+                }
                 Ok(Command::Shutdown) => break,
                 Err(_) => break,
             }
@@ -1448,6 +1532,70 @@ async fn handle_symmetric_rpc_event<M, EvT, Mk>(
                     None,
                     Some(format!("{error}")),
                 ))
+                .await;
+        }
+        Event::ResponseSent { .. } => {}
+    }
+}
+
+async fn handle_blocks_by_root_event(
+    ev: request_response::Event<BlocksByRootRequest, BlocksByRootResponse>,
+    tx: &Sender<BlocksByRootEvent>,
+    pending: &mut HashMap<u64, request_response::ResponseChannel<BlocksByRootResponse>>,
+    next_id: &mut u64,
+) {
+    use request_response::Event;
+    use request_response::Message;
+    match ev {
+        Event::Message { peer, message, .. } => match message {
+            Message::Request {
+                request, channel, ..
+            } => {
+                let id = *next_id;
+                *next_id = next_id.wrapping_add(1);
+                pending.insert(id, channel);
+                let _ = tx
+                    .send(BlocksByRootEvent {
+                        peer: peer.to_string(),
+                        kind: format!("request:{id}"),
+                        request: Some(request),
+                        response: None,
+                        error: None,
+                    })
+                    .await;
+            }
+            Message::Response { response, .. } => {
+                let _ = tx
+                    .send(BlocksByRootEvent {
+                        peer: peer.to_string(),
+                        kind: "response".into(),
+                        request: None,
+                        response: Some(response),
+                        error: None,
+                    })
+                    .await;
+            }
+        },
+        Event::OutboundFailure { peer, error, .. } => {
+            let _ = tx
+                .send(BlocksByRootEvent {
+                    peer: peer.to_string(),
+                    kind: "failure".into(),
+                    request: None,
+                    response: None,
+                    error: Some(format!("{error}")),
+                })
+                .await;
+        }
+        Event::InboundFailure { peer, error, .. } => {
+            let _ = tx
+                .send(BlocksByRootEvent {
+                    peer: peer.to_string(),
+                    kind: "failure".into(),
+                    request: None,
+                    response: None,
+                    error: Some(format!("{error}")),
+                })
                 .await;
         }
         Event::ResponseSent { .. } => {}

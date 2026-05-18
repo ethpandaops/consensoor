@@ -116,6 +116,8 @@ class P2PHost:
         self._status_thread: Optional[threading.Thread] = None
         self._ping_thread: Optional[threading.Thread] = None
         self._meta_thread: Optional[threading.Thread] = None
+        self._by_range_thread: Optional[threading.Thread] = None
+        self._by_root_thread: Optional[threading.Thread] = None
         self._status_sender_thread: Optional[threading.Thread] = None
         # Peers we've already sent an outbound Status RPC to. Eth2 spec says
         # the dialer is expected to send Status first; if we don't, peers
@@ -123,6 +125,13 @@ class P2PHost:
         self._status_sent_to: set[str] = set()
 
         self._block_provider: Optional[Callable[[int], Optional[tuple[bytes, bytes]]]] = None
+        # Lookup by 32-byte block root. Used to serve inbound BlocksByRoot v2
+        # requests — prysm uses this to backfill blocks it missed via gossip,
+        # so without it our blocks get orphaned on the prysm side even when
+        # gossipsub delivery recovers.
+        self._block_by_root_provider: Optional[
+            Callable[[bytes], Optional[tuple[bytes, bytes]]]
+        ] = None
         self._status_provider: Optional[Callable[[], dict]] = None
 
         self._peer_id: Optional[str] = None
@@ -135,6 +144,18 @@ class P2PHost:
         self, provider: Callable[[int], Optional[tuple[bytes, bytes]]]
     ) -> None:
         self._block_provider = provider
+
+    def set_block_by_root_provider(
+        self, provider: Callable[[bytes], Optional[tuple[bytes, bytes]]]
+    ) -> None:
+        """Install a root-keyed block lookup for the BlocksByRoot RPC.
+
+        Provider receives a 32-byte block root and returns
+        (ssz_signed_block, fork_digest) or None when the block is unknown.
+        Called on the Rust→Python dispatcher thread, so must be cheap and
+        not perform async work.
+        """
+        self._block_by_root_provider = provider
 
     def set_status_provider(self, provider: Callable[[], dict]) -> None:
         self._status_provider = provider
@@ -250,6 +271,16 @@ class P2PHost:
             target=self._meta_loop, name="p2p-meta-dispatch", daemon=True
         )
         self._meta_thread.start()
+
+        self._by_range_thread = threading.Thread(
+            target=self._by_range_loop, name="p2p-by-range-dispatch", daemon=True
+        )
+        self._by_range_thread.start()
+
+        self._by_root_thread = threading.Thread(
+            target=self._by_root_loop, name="p2p-by-root-dispatch", daemon=True
+        )
+        self._by_root_thread.start()
 
         self._status_sender_thread = threading.Thread(
             target=self._status_sender_loop, name="p2p-status-send", daemon=True
@@ -430,6 +461,90 @@ class P2PHost:
                     self._network.answer_ping(req_id, cp.PingMessage(self._our_metadata_seq))
                 except Exception as e:
                     logger.warning(f"answer_ping failed: {e}")
+
+    def _by_range_loop(self) -> None:
+        """Serve inbound BeaconBlocksByRange requests from the slot-keyed
+        block provider.
+
+        Peers (prysm/lighthouse) hit this after our gossip drops a block to
+        backfill the gap. Without this loop, the Rust binding queues the
+        request indefinitely and the peer times out — which still leaves us
+        looking like we have no chain to them.
+        """
+        import consensoor_p2p as cp
+        MAX_REQUEST_BLOCKS = 1024
+        while not self._stop.is_set():
+            try:
+                ev = self._network.next_blocks_by_range(1000)
+            except Exception as e:
+                logger.warning(f"next_blocks_by_range error: {e}")
+                continue
+            if ev is None:
+                continue
+            if not ev.kind.startswith("request:"):
+                continue
+            req_id = int(ev.kind.split(":")[1])
+            chunks: list = []
+            try:
+                if self._block_provider is None or ev.request is None:
+                    self._network.answer_blocks_by_range(req_id, cp.BlocksByRangeResponse([], None))
+                    continue
+                start_slot = int(ev.request.start_slot)
+                count = min(int(ev.request.count), MAX_REQUEST_BLOCKS)
+                for slot in range(start_slot, start_slot + count):
+                    res = self._block_provider(slot)
+                    if res is None:
+                        continue
+                    ssz_block, fork_digest = res
+                    chunks.append(cp.BlockChunk(list(fork_digest), list(ssz_block)))
+                self._network.answer_blocks_by_range(
+                    req_id, cp.BlocksByRangeResponse(chunks, None)
+                )
+            except Exception as e:
+                logger.warning(f"answer_blocks_by_range failed: {e}")
+
+    def _by_root_loop(self) -> None:
+        """Serve inbound BeaconBlocksByRoot v2 requests by looking up each
+        requested root in the root-keyed block provider.
+
+        This is the protocol prysm uses to backfill blocks it missed via
+        gossipsub. Without serving it, our blocks stay orphaned on prysm
+        whenever a gossip message goes missing.
+        """
+        import consensoor_p2p as cp
+        MAX_REQUEST_BLOCKS = 1024
+        while not self._stop.is_set():
+            try:
+                ev = self._network.next_blocks_by_root(1000)
+            except Exception as e:
+                logger.warning(f"next_blocks_by_root error: {e}")
+                continue
+            if ev is None:
+                continue
+            if not ev.kind.startswith("request:"):
+                continue
+            req_id = int(ev.kind.split(":")[1])
+            chunks: list = []
+            try:
+                if self._block_by_root_provider is None or ev.request is None:
+                    self._network.answer_blocks_by_root(req_id, cp.BlocksByRootResponse([], None))
+                    continue
+                flat = bytes(ev.request.roots)
+                n = len(flat) // 32
+                if n > MAX_REQUEST_BLOCKS:
+                    n = MAX_REQUEST_BLOCKS
+                for i in range(n):
+                    root = flat[i * 32:(i + 1) * 32]
+                    res = self._block_by_root_provider(root)
+                    if res is None:
+                        continue
+                    ssz_block, fork_digest = res
+                    chunks.append(cp.BlockChunk(list(fork_digest), list(ssz_block)))
+                self._network.answer_blocks_by_root(
+                    req_id, cp.BlocksByRootResponse(chunks, None)
+                )
+            except Exception as e:
+                logger.warning(f"answer_blocks_by_root failed: {e}")
 
     def _meta_loop(self) -> None:
         import consensoor_p2p as cp
@@ -651,5 +766,74 @@ class P2PHost:
         logger.warning(
             f"BeaconBlocksByRange exhausted {len(candidates)} peer(s) without chunks "
             f"(slots {start_slot}..{start_slot + count - 1})"
+        )
+        return []
+
+    async def request_blocks_by_root(
+        self, roots: list[bytes], timeout: float = 15.0
+    ) -> list[bytes]:
+        """Issue a BeaconBlocksByRoot v2 request via the rust binding.
+
+        `roots` is a list of 32-byte block roots. Returns a list of raw
+        SSZ-encoded SignedBeaconBlock bytes. Empty list if no peer answered.
+        Iterates connected peers, same retry pattern as
+        request_blocks_by_range.
+        """
+        if self._network is None:
+            return []
+        if not roots:
+            return []
+        for r in roots:
+            if len(r) != 32:
+                raise ValueError(f"BlocksByRoot: each root must be 32 bytes, got {len(r)}")
+        try:
+            connected = list(self._network.connected_peers())
+        except Exception:
+            connected = []
+        candidates: list[dict] = list(connected) if connected else []
+        if not candidates:
+            for addr in self.config.static_peers:
+                if "/p2p/" in addr:
+                    candidates.append({"peer_id": addr.rsplit("/p2p/", 1)[1]})
+        if not candidates:
+            logger.debug("request_blocks_by_root: no known peer to dial")
+            return []
+
+        flat = b"".join(roots)
+        per_peer_timeout = max(1.5, timeout / max(1, len(candidates)))
+        loop = asyncio.get_running_loop()
+
+        for peer_info in candidates:
+            peer_id = peer_info.get("peer_id") if isinstance(peer_info, dict) else peer_info
+            if not peer_id:
+                continue
+            try:
+                self._network.request_blocks_by_root(peer_id, list(flat))
+            except Exception as e:
+                logger.debug(f"BeaconBlocksByRoot send to {peer_id[:24]}... failed: {e}")
+                continue
+            ev = await loop.run_in_executor(
+                None, lambda: self._network.next_blocks_by_root(int(per_peer_timeout * 1000))
+            )
+            if ev is None:
+                logger.debug(
+                    f"BeaconBlocksByRoot timeout from {peer_id[:24]}... "
+                    f"(n_roots={len(roots)})"
+                )
+                continue
+            if ev.error:
+                logger.debug(f"BeaconBlocksByRoot error from {peer_id[:24]}...: {ev.error}")
+                continue
+            if ev.response is None or not ev.response.chunks:
+                logger.debug(
+                    f"BeaconBlocksByRoot empty response from {peer_id[:24]}... "
+                    f"(n_roots={len(roots)})"
+                )
+                continue
+            return [bytes(c.ssz_block) for c in ev.response.chunks]
+
+        logger.warning(
+            f"BeaconBlocksByRoot exhausted {len(candidates)} peer(s) without chunks "
+            f"(n_roots={len(roots)})"
         )
         return []

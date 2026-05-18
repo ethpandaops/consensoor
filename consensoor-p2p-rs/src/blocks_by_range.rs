@@ -105,6 +105,14 @@ pub struct BlockChunk {
 
 #[pymethods]
 impl BlockChunk {
+    #[new]
+    pub fn new(fork_digest: Vec<u8>, ssz_block: Vec<u8>) -> Self {
+        Self {
+            fork_digest,
+            ssz_block,
+        }
+    }
+
     pub fn __repr__(&self) -> String {
         format!(
             "BlockChunk(fork_digest=0x{}, ssz_block={}B)",
@@ -128,6 +136,12 @@ pub struct BlocksByRangeResponse {
 
 #[pymethods]
 impl BlocksByRangeResponse {
+    #[new]
+    #[pyo3(signature = (chunks=Vec::new(), error=None))]
+    pub fn new(chunks: Vec<BlockChunk>, error: Option<String>) -> Self {
+        Self { chunks, error }
+    }
+
     pub fn __repr__(&self) -> String {
         format!(
             "BlocksByRangeResponse(chunks={}, error={:?})",

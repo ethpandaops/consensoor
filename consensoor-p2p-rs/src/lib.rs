@@ -10,6 +10,7 @@
 //! Status protocol.
 
 mod blocks_by_range;
+mod blocks_by_root;
 mod bootnode;
 mod discovery;
 mod gossip;
@@ -53,6 +54,9 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<blocks_by_range::BlockChunk>()?;
     m.add_class::<blocks_by_range::BlocksByRangeResponse>()?;
     m.add_class::<blocks_by_range::BlocksByRangeEvent>()?;
+    m.add_class::<blocks_by_root::BlocksByRootRequest>()?;
+    m.add_class::<blocks_by_root::BlocksByRootResponse>()?;
+    m.add_class::<blocks_by_root::BlocksByRootEvent>()?;
     m.add_function(wrap_pyfunction!(network::generate_keypair, m)?)?;
     Ok(())
 }
