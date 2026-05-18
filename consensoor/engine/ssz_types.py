@@ -297,7 +297,11 @@ SSZ_CAPABILITIES: list[str] = [
     "POST /engine/v1/forkchoice",
     "POST /engine/v2/forkchoice",
     "POST /engine/v3/forkchoice",
-    "POST /engine/v4/forkchoice",
+    # "POST /engine/v4/forkchoice" intentionally omitted: PayloadAttributesV4
+    # gained target_gas_limit (execution-apis PR #796) but the SSZ schema
+    # (PR #764) hadn't caught up, so EL SSZ decoders reject the 8-byte-longer
+    # body as "Malformed SSZ body". Re-add once nethermind/geth ship SSZ
+    # support for target_gas_limit. JSON-RPC fcU v4 tolerates the field.
     "POST /engine/v1/blobs",
     "POST /engine/v2/blobs",
     "POST /engine/v3/blobs",
