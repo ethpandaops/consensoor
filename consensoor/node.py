@@ -2603,11 +2603,20 @@ class BeaconNode:
 
         # Check if our state is behind the current slot
         state_slot = int(self.state.slot)
-        slots_behind = current_slot - state_slot
 
-        # Sync if we're even 1 slot behind (aggressive sync for gossipsub workaround)
-        if slots_behind < 1:
+        # Never request the current slot — at slot-start tick the current
+        # slot's proposer hasn't broadcast yet (often we ARE the proposer),
+        # and every connected peer answers with an empty range. The
+        # request_blocks_by_range path serialises a 1.5s timeout per peer
+        # before giving up, so with N peers the proposer trigger fires
+        # 1.5*N seconds late, well after gossipsub would have delivered the
+        # *previous* slot's block. Cap the request at current_slot - 1 so
+        # we only chase slots that should already be on the wire.
+        end_slot = current_slot - 1
+        if state_slot >= end_slot:
             return
+
+        slots_behind = current_slot - state_slot
 
         # IMPORTANT: When we're on a different fork (e.g., our slot 1 vs peer's slot 1),
         # we need to request from slot 1, not state_slot+1, because the peer's chain
@@ -2616,10 +2625,13 @@ class BeaconNode:
         if state_slot <= 1 and slots_behind > 1:
             # We're at genesis or slot 1, peer is ahead - request from slot 1
             start_slot = 1
-            count = min(current_slot, 32)  # Get up to 32 blocks to catch up
+            count = min(end_slot - start_slot + 1, 32)
         else:
             start_slot = state_slot + 1
-            count = min(slots_behind, 16)
+            count = min(end_slot - start_slot + 1, 16)
+
+        if count < 1:
+            return
 
         logger.info(f"State is {slots_behind} slots behind (state_slot={state_slot}, current={current_slot}). "
                     f"Requesting blocks {start_slot} to {start_slot + count - 1} via req/resp")
