@@ -747,8 +747,31 @@ class BlockBuilder:
                 return h
             return int(h, 16)
 
-        # Get parent block info from state
-        parent_block_hash = bytes(state.latest_block_hash) if hasattr(state, "latest_block_hash") else b"\x00" * 32
+        # Get parent block info from state. In gloas, the bid's parent_block_hash
+        # must commit to the *previous payload's* block_hash, i.e. the EL hash
+        # the slot N-1 builder committed via its bid — that's
+        # state.latest_execution_payload_bid.block_hash. Using state.latest_block_hash
+        # here is wrong on consensoor's lifecycle: per the lighthouse-style
+        # "envelope = pure verify" pattern, latest_block_hash only advances during
+        # the NEXT block's process_parent_execution_payload, so at slot N proposal
+        # time it still reflects slot N-2 (or earlier). Building a bid with
+        # parent_block_hash = stale value forces our own process_parent_execution_payload
+        # into the "Parent was EMPTY" branch, latest_block_hash never advances,
+        # and the slot N envelope phase-2 assertion
+        #   payload.parent_hash == state.latest_block_hash
+        # fires on every self-built gloas slot.
+        if hasattr(state, "latest_execution_payload_bid"):
+            committed_bid_hash = bytes(state.latest_execution_payload_bid.block_hash)
+            if committed_bid_hash != b"\x00" * 32:
+                parent_block_hash = committed_bid_hash
+            elif hasattr(state, "latest_block_hash"):
+                parent_block_hash = bytes(state.latest_block_hash)
+            else:
+                parent_block_hash = b"\x00" * 32
+        elif hasattr(state, "latest_block_hash"):
+            parent_block_hash = bytes(state.latest_block_hash)
+        else:
+            parent_block_hash = b"\x00" * 32
         parent_block_root = hash_tree_root(state.latest_block_header)
 
         from ..spec.types import KZGCommitment
