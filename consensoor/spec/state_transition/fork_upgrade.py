@@ -302,11 +302,13 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
 
     Adds ePBS (enshrined Proposer-Builder Separation) fields per alpha 7 spec.
     """
+    import time as _time
     from ..types.electra import ExecutionRequests
     from ...crypto import hash_tree_root
     from .helpers.ptc import compute_ptc
     from .helpers.misc import compute_start_slot_at_epoch
 
+    _t0 = _time.monotonic()
     pre_header = pre.latest_execution_payload_header
 
     # Spec: latest_execution_payload_bid sets block_hash, gas_limit (alpha 8),
@@ -358,6 +360,7 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
     ptc_size_val = PTC_SIZE()
     empty_ptc = [ValidatorIndex(0)] * ptc_size_val
 
+    _t_ptc_start = _time.monotonic()
     ptc_window = []
     # Empty for previous epoch
     for _ in range(spe):
@@ -367,7 +370,19 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
         target_epoch = current_epoch + e
         start_slot = compute_start_slot_at_epoch(target_epoch)
         for i in range(spe):
+            _ts = _time.monotonic()
             ptc_window.append(list(compute_ptc(pre, start_slot + i)))
+            logger.info(
+                f"upgrade_to_gloas: compute_ptc slot={start_slot + i} took "
+                f"{(_time.monotonic() - _ts) * 1000:.0f}ms"
+            )
+    logger.info(
+        f"upgrade_to_gloas: PTC window built in "
+        f"{(_time.monotonic() - _t_ptc_start) * 1000:.0f}ms "
+        f"(prefix={(_t_ptc_start - _t0) * 1000:.0f}ms)"
+    )
+
+    _t_ctor = _time.monotonic()
 
     post = GloasBeaconState(
         genesis_time=pre.genesis_time,
@@ -422,7 +437,14 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
         ptc_window=ptc_window,
     )
 
-    logger.info(f"Upgraded state to Gloas at epoch {epoch}")
+    logger.info(
+        f"upgrade_to_gloas: GloasBeaconState ctor took "
+        f"{(_time.monotonic() - _t_ctor) * 1000:.0f}ms"
+    )
+    logger.info(
+        f"Upgraded state to Gloas at epoch {epoch} (total "
+        f"{(_time.monotonic() - _t0) * 1000:.0f}ms)"
+    )
     return post
 
 

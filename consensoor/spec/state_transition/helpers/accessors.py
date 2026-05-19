@@ -141,21 +141,77 @@ def get_randao_mix(state: "BeaconState", epoch: int) -> bytes:
     return bytes(state.randao_mixes[epoch % EPOCHS_PER_HISTORICAL_VECTOR()])
 
 
+# Module-level caches keyed by id(state). Cleared automatically when a
+# state object goes out of scope and a new one takes the same id slot —
+# we use a WeakValueDictionary-style miss-on-mismatch by also remembering
+# the validator count: if the snapshot length differs we recompute. This
+# avoids a 50s state-transition stall at the Fulu→Gloas fork boundary,
+# where compute_ptc gets called (1 + MIN_SEED_LOOKAHEAD) * SLOTS_PER_EPOCH
+# times against the same pre-fork state and the inner loops hammer
+# state.validators[i].effective_balance through remerkleable on every
+# acceptance check.
+from collections import OrderedDict as _OrderedDict
+
+_ACTIVE_INDICES_CACHE: "_OrderedDict[tuple[int, int, int], list[int]]" = _OrderedDict()
+_ACTIVE_INDICES_CACHE_MAX = 16
+_EFFECTIVE_BALANCES_CACHE: "_OrderedDict[tuple[int, int], list[int]]" = _OrderedDict()
+_EFFECTIVE_BALANCES_CACHE_MAX = 4
+
+
 def get_active_validator_indices(state: "BeaconState", epoch: int) -> Sequence[int]:
     """Return the indices of active validators at the given epoch.
 
-    Args:
-        state: Beacon state
-        epoch: Target epoch
-
-    Returns:
-        Sequence of validator indices
+    Cached per (id(state), validator_count, epoch). The validator count is
+    part of the key so the same id(state) reused for a different state
+    object after GC doesn't return a stale answer.
     """
-    return [
+    n = len(state.validators)
+    key = (id(state), n, int(epoch))
+    cached = _ACTIVE_INDICES_CACHE.get(key)
+    if cached is not None:
+        _ACTIVE_INDICES_CACHE.move_to_end(key)
+        return cached
+
+    result = [
         i
         for i, v in enumerate(state.validators)
         if is_active_validator(v, epoch)
     ]
+
+    _ACTIVE_INDICES_CACHE[key] = result
+    while len(_ACTIVE_INDICES_CACHE) > _ACTIVE_INDICES_CACHE_MAX:
+        _ACTIVE_INDICES_CACHE.popitem(last=False)
+    return result
+
+
+def get_effective_balances(state: "BeaconState") -> list[int]:
+    """Return state.validators[*].effective_balance as a plain Python list.
+
+    Each access via `state.validators[i].effective_balance` walks
+    remerkleable containers and is ~100x slower than a list index. PTC and
+    balance-weighted selection do this in a hot loop — caching the snapshot
+    once per state turns 32k validator-field reads at the gloas fork into 32k
+    plain int reads.
+
+    Keyed by (id(state), len(state.validators)). Mutations to validator
+    balances within the same state make the cache stale; we deliberately
+    don't try to invalidate on mutate. Use only in code paths that don't
+    mutate effective_balance (PTC init / committee balance-weighted
+    sampling). The validator-count guard catches the common
+    fork-upgrade churn case where a new state object grows by deposits.
+    """
+    n = len(state.validators)
+    key = (id(state), n)
+    cached = _EFFECTIVE_BALANCES_CACHE.get(key)
+    if cached is not None:
+        _EFFECTIVE_BALANCES_CACHE.move_to_end(key)
+        return cached
+
+    balances = [int(v.effective_balance) for v in state.validators]
+    _EFFECTIVE_BALANCES_CACHE[key] = balances
+    while len(_EFFECTIVE_BALANCES_CACHE) > _EFFECTIVE_BALANCES_CACHE_MAX:
+        _EFFECTIVE_BALANCES_CACHE.popitem(last=False)
+    return balances
 
 
 def get_validator_churn_limit(state: "BeaconState") -> int:

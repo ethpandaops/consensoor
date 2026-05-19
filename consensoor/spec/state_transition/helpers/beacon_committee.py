@@ -140,6 +140,20 @@ def compute_balance_weighted_selection(
     """Return size indices sampled by effective balance."""
     total = len(indices)
     assert total > 0
+
+    # Hoist the slow remerkleable validator-field walk out of the inner
+    # acceptance loop. compute_balance_weighted_acceptance reads
+    # state.validators[i].effective_balance every iteration; at the
+    # Fulu→Gloas fork boundary on mainnet preset that's 64
+    # (= (1 + MIN_SEED_LOOKAHEAD) * SLOTS_PER_EPOCH) compute_ptc calls,
+    # each running this loop with ~PTC_SIZE acceptances over ~total
+    # validators — tens of thousands of Container traversals that turn
+    # into a 50-second stall. The cached snapshot below makes the same
+    # loop a list-index read.
+    from .accessors import get_effective_balances
+    effective_balances = get_effective_balances(state)
+    max_random_value = 2**16 - 1
+
     selected = []
     i = 0
     while len(selected) < size:
@@ -147,7 +161,13 @@ def compute_balance_weighted_selection(
         if shuffle_indices:
             next_index = compute_shuffled_index(next_index, total, seed)
         candidate_index = indices[next_index]
-        if compute_balance_weighted_acceptance(state, candidate_index, seed, i):
+        random_bytes = sha256(seed + (i // 16).to_bytes(8, "little"))
+        offset = (i % 16) * 2
+        random_value = int.from_bytes(random_bytes[offset:offset + 2], "little")
+        if (
+            effective_balances[candidate_index] * max_random_value
+            >= MAX_EFFECTIVE_BALANCE_ELECTRA * random_value
+        ):
             selected.append(candidate_index)
         i += 1
     return selected
