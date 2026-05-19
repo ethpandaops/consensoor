@@ -17,7 +17,9 @@ from ._native import (
     BlockChunk,
     BlocksByRangeResponse,
     BlocksByRangeEvent,
-
+    BlocksByRootRequest,
+    BlocksByRootResponse,
+    BlocksByRootEvent,
 )
 
 __all__ = [
@@ -37,4 +39,7 @@ __all__ = [
     "BlockChunk",
     "BlocksByRangeResponse",
     "BlocksByRangeEvent",
+    "BlocksByRootRequest",
+    "BlocksByRootResponse",
+    "BlocksByRootEvent",
 ]
