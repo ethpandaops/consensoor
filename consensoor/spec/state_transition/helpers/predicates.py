@@ -13,6 +13,7 @@ from ...constants import (
     COMPOUNDING_WITHDRAWAL_PREFIX,
     MAX_EFFECTIVE_BALANCE,
     MAX_EFFECTIVE_BALANCE_ELECTRA,
+    MIN_ACTIVATION_BALANCE,
     EFFECTIVE_BALANCE_INCREMENT,
     BUILDER_INDEX_FLAG,
     BUILDER_WITHDRAWAL_PREFIX,
@@ -75,9 +76,21 @@ def is_eligible_for_activation_queue(validator: "Validator") -> bool:
     Returns:
         True if eligible for activation queue
     """
+    # EIP-7251 (Electra): the eligibility threshold became
+    #   effective_balance >= MIN_ACTIVATION_BALANCE
+    # in place of the old `== MAX_EFFECTIVE_BALANCE` check, so compounding
+    # validators (0x02 withdrawal credentials) with >32 ETH effective_balance
+    # still queue for activation. Pre-Electra MAX_EFFECTIVE_BALANCE equals
+    # MIN_ACTIVATION_BALANCE (both 32 ETH), so the relaxed check is
+    # equivalent for pre-Electra validators — no fork gate needed.
+    # Without this fix, every post-Electra validator with consolidated
+    # balance (e.g. genesis 0x02-cred validators in our test rig with
+    # 64 ETH) stays at activation_eligibility_epoch=FAR_FUTURE forever
+    # and the state diverges from the network at the first registry pass
+    # after deposit-processing makes them eligible.
     return (
         int(validator.activation_eligibility_epoch) == FAR_FUTURE_EPOCH
-        and int(validator.effective_balance) == MAX_EFFECTIVE_BALANCE
+        and int(validator.effective_balance) >= MIN_ACTIVATION_BALANCE
     )
 
 
