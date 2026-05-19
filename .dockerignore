@@ -32,3 +32,10 @@ data/
 Dockerfile
 .dockerignore
 *.md
+# Local cargo build artifacts: COPYing them in confuses maturin/cargo
+# inside the rust-builder stage (host artifacts are macOS arm64; container
+# is linux). On Docker layer cache hits, cargo would also reuse stale
+# .so/.rlib from a previous source revision and silently emit a wheel
+# missing newly-added pyclasses (e.g. BlocksByRoot* after the
+# blocks_by_root.rs addition). 2.8GB of bloat in the build context too.
+consensoor-p2p-rs/target/

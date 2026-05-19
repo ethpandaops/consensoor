@@ -44,8 +44,21 @@ def setup_logging(level: str) -> None:
         handlers=[handler],
         force=True,
     )
+    # aiohttp emits per-request access lines at INFO level, which floods the
+    # log under the beacon-API/Dora/assertoor polling load. Re-route them to
+    # DEBUG so `--log-level=info` is quiet and `--log-level=debug` still
+    # surfaces them when explicitly requested.
+    class _AccessAtDebug(logging.Filter):
+        def filter(self, record: logging.LogRecord) -> bool:
+            if record.levelno == logging.INFO:
+                record.levelno = logging.DEBUG
+                record.levelname = "DEBUG"
+            return True
+
+    access_logger = logging.getLogger("aiohttp.access")
+    access_logger.addFilter(_AccessAtDebug())
     if level.upper() != "DEBUG":
-        logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+        access_logger.setLevel(logging.WARNING)
 
 
 @click.group()

@@ -82,7 +82,7 @@ def load_keystore(keystore_path: Union[str, Path], password: str) -> ValidatorKe
             f"Public key mismatch: derived {pubkey.hex()}, expected {expected_pubkey.hex()}"
         )
 
-    logger.debug(f"Loaded validator key: {pubkey.hex()[:16]}...")
+    logger.info(f"Loaded validator key: {pubkey.hex()[:16]}...")
     return ValidatorKey(pubkey=pubkey, privkey=privkey)
 
 
