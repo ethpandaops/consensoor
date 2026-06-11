@@ -66,6 +66,7 @@ BLOB_SIDECAR_TOPIC_PREFIX = "blob_sidecar_"  # blob_sidecar_{subnet_id}
 BEACON_ATTESTATION_TOPIC_PREFIX = "beacon_attestation_"  # beacon_attestation_{subnet_id}
 EXECUTION_PAYLOAD_TOPIC = "execution_payload"  # GLOAS/ePBS execution payload envelope
 PAYLOAD_ATTESTATION_MESSAGE_TOPIC = "payload_attestation_message"  # GLOAS/ePBS PTC vote
+PROPOSER_PREFERENCES_TOPIC = "proposer_preferences"  # GLOAS/ePBS proposer fee_recipient/gas_limit prefs
 
 
 def get_blob_sidecar_topic(subnet_id: int, fork_digest: bytes, encoding: str = "ssz_snappy") -> str:

@@ -75,6 +75,8 @@ from .beacon_committee import (
     get_committee_count_per_slot,
     get_beacon_committee,
     get_beacon_proposer_index,
+    is_valid_proposal_slot,
+    get_proposer_dependent_root,
 )
 from .domain import (
     get_domain,
@@ -172,6 +174,8 @@ __all__ = [
     "get_committee_count_per_slot",
     "get_beacon_committee",
     "get_beacon_proposer_index",
+    "is_valid_proposal_slot",
+    "get_proposer_dependent_root",
     # Domain
     "get_domain",
     "compute_domain",

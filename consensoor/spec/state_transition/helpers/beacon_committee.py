@@ -16,9 +16,15 @@ from ...constants import (
     MAX_EFFECTIVE_BALANCE,
     EFFECTIVE_BALANCE_INCREMENT,
     MAX_EFFECTIVE_BALANCE_ELECTRA,
+    MIN_SEED_LOOKAHEAD,
 )
-from .misc import compute_epoch_at_slot
-from .accessors import get_current_epoch, get_active_validator_indices, get_seed
+from .misc import compute_epoch_at_slot, compute_start_slot_at_epoch
+from .accessors import (
+    get_current_epoch,
+    get_active_validator_indices,
+    get_seed,
+    get_block_root_at_slot,
+)
 from ....crypto import sha256
 
 if TYPE_CHECKING:
@@ -389,5 +395,38 @@ def get_beacon_proposer_indices(state: "BeaconState", epoch: int) -> Sequence[in
         Sequence of proposer indices for each slot in the epoch
     """
     indices = get_active_validator_indices(state, epoch)
+    if hasattr(state, "execution_payload_availability"):
+        # [Modified in Gloas:EIP8045] slashed validators never propose
+        indices = [i for i in indices if not state.validators[i].slashed]
     seed = get_seed(state, epoch, DOMAIN_BEACON_PROPOSER)
     return compute_proposer_indices(state, epoch, seed, indices)
+
+
+def is_valid_proposal_slot(state: "BeaconState", preferences) -> bool:
+    """Check if the validator is the proposer for the given slot within the
+    proposer lookahead (Gloas p2p, proposer_preferences gossip validation).
+    """
+    current_epoch = get_current_epoch(state)
+    proposal_slot = int(preferences.proposal_slot)
+    proposal_epoch = compute_epoch_at_slot(proposal_slot)
+    if proposal_epoch < current_epoch:
+        return False
+    if proposal_epoch > current_epoch + MIN_SEED_LOOKAHEAD:
+        return False
+
+    index = (proposal_epoch - current_epoch) * SLOTS_PER_EPOCH()
+    index += proposal_slot % SLOTS_PER_EPOCH()
+    return int(state.proposer_lookahead[index]) == int(preferences.validator_index)
+
+
+def get_proposer_dependent_root(state: "BeaconState", epoch: int) -> bytes | None:
+    """Return the dependent root for the proposer lookahead at ``epoch``.
+
+    Returns None on underflow (epoch <= MIN_SEED_LOOKAHEAD, where the spec
+    slot would be negative) — callers should substitute the genesis block
+    root per gloas/validator.md.
+    """
+    if epoch <= MIN_SEED_LOOKAHEAD:
+        return None
+    slot = compute_start_slot_at_epoch(epoch - MIN_SEED_LOOKAHEAD) - 1
+    return get_block_root_at_slot(state, slot)

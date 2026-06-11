@@ -31,6 +31,7 @@ class NetworkConfig:
 
     # Intra-slot timing (basis points = hundredths of a percent)
     proposer_reorg_cutoff_bps: int = 1667  # ~17% of slot
+    confirmation_byzantine_threshold: int = 25  # fast-confirmation rule, percent
     attestation_due_bps: int = 3333  # ~33% of slot (1/3 mark)
     aggregate_due_bps: int = 6667  # ~67% of slot (2/3 mark)
     sync_message_due_bps: int = 3333

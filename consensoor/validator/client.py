@@ -8,6 +8,7 @@ from ..spec.constants import (
     DOMAIN_BEACON_ATTESTER,
     DOMAIN_SYNC_COMMITTEE,
     DOMAIN_PTC_ATTESTER,
+    DOMAIN_PROPOSER_PREFERENCES,
 )
 from ..spec.state_transition.helpers.beacon_committee import (
     get_beacon_committee,
@@ -26,6 +27,8 @@ from ..spec.types.altair import SyncCommitteeMessage
 from ..spec.types.gloas import (
     PayloadAttestationData,
     PayloadAttestationMessage,
+    ProposerPreferences,
+    SignedProposerPreferences,
 )
 from ..spec.types.base import Checkpoint, Bitlist, Bitvector
 from ..spec.constants import MAX_VALIDATORS_PER_COMMITTEE, MAX_COMMITTEES_PER_SLOT
@@ -411,4 +414,45 @@ class ValidatorClient:
             logger.error(f"Failed to produce payload attestation message: {e}")
             import traceback
             traceback.print_exc()
+            return None
+
+    async def produce_proposer_preferences(
+        self,
+        state,
+        proposal_slot: int,
+        validator_key: ValidatorKey,
+        dependent_root: bytes,
+        fee_recipient: bytes,
+        target_gas_limit: int,
+    ) -> Optional[SignedProposerPreferences]:
+        """Sign ProposerPreferences for one of our upcoming proposal slots.
+
+        Per gloas/validator.md, proposers MAY broadcast their preferred
+        fee_recipient and target_gas_limit for slots within the proposer
+        lookahead so builders can construct matching bids. Domain epoch is
+        the epoch of the proposal slot.
+        """
+        try:
+            if validator_key.validator_index is None:
+                return None
+
+            preferences = ProposerPreferences(
+                dependent_root=dependent_root,
+                proposal_slot=proposal_slot,
+                validator_index=validator_key.validator_index,
+                fee_recipient=fee_recipient,
+                target_gas_limit=target_gas_limit,
+            )
+            epoch = compute_epoch_at_slot(proposal_slot)
+            domain = get_domain(state, DOMAIN_PROPOSER_PREFERENCES, epoch)
+            signing_root = compute_signing_root(preferences, domain)
+            signature = await bls_sign_async(validator_key.privkey, signing_root)
+
+            return SignedProposerPreferences(
+                message=preferences,
+                signature=signature,
+            )
+
+        except Exception as e:
+            logger.error(f"Failed to produce proposer preferences: {e}")
             return None

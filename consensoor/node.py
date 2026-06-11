@@ -178,6 +178,14 @@ class BeaconNode:
         self.sync_committee_pool = SyncCommitteePool()
         from .payload_attestation_pool import PayloadAttestationPool
         self.payload_attestation_pool = PayloadAttestationPool()
+        # Gloas proposer preferences seen via gossip (or self-published),
+        # keyed (dependent_root, proposal_slot, validator_index) per the
+        # first-valid-message dedup rule in gloas/p2p-interface.md. Builders
+        # consult this to match bid.fee_recipient to the proposer's wishes.
+        self.proposer_preferences: dict[tuple[bytes, int, int], object] = {}
+        # Tuples we already broadcast for our own validators, to avoid
+        # re-publishing the same preferences every slot.
+        self._published_prefs_keys: set[tuple[bytes, int, int]] = set()
         self._attester_duties: dict[int, list] = {}  # epoch -> duties
         self._sync_committee_duties: dict[int, list] = {}  # validator_index -> committee positions
         # Cache of validator_index -> list[position] for ALL validators in the
@@ -703,6 +711,7 @@ class BeaconNode:
             self.beacon_gossip.subscribe_blob_sidecars(self._on_p2p_blob_sidecar)
             self.beacon_gossip.subscribe_execution_payloads(self._on_p2p_execution_payload)
             self.beacon_gossip.subscribe_payload_attestation_messages(self._on_p2p_payload_attestation_message)
+            self.beacon_gossip.subscribe_proposer_preferences(self._on_p2p_proposer_preferences)
             self.beacon_gossip.set_status_provider(self._get_chain_status)
             self.beacon_gossip.set_block_provider(self._get_block_for_slot)
             self.beacon_gossip.set_block_by_root_provider(self._get_block_by_root)
@@ -1076,28 +1085,7 @@ class BeaconNode:
                 # Same epoch - use the target epoch's mix directly
                 prev_randao = bytes(randao_mixes[target_epoch % len(randao_mixes)])
 
-            withdrawals_list = []
-            if hasattr(self.state, "payload_expected_withdrawals"):
-                for w in self.state.payload_expected_withdrawals:
-                    withdrawals_list.append({
-                        "index": hex(int(w.index)),
-                        "validatorIndex": hex(int(w.validator_index)),
-                        "address": "0x" + bytes(w.address).hex(),
-                        "amount": hex(int(w.amount)),
-                    })
-            elif hasattr(self.state, "next_withdrawal_index"):
-                from .spec.state_transition.block.withdrawals import get_expected_withdrawals
-                try:
-                    expected = get_expected_withdrawals(self.state)
-                    for w in expected.withdrawals:
-                        withdrawals_list.append({
-                            "index": hex(int(w.index)),
-                            "validatorIndex": hex(int(w.validator_index)),
-                            "address": "0x" + bytes(w.address).hex(),
-                            "amount": hex(int(w.amount)),
-                        })
-                except Exception as we:
-                    logger.warning(f"get_expected_withdrawals failed: {we}")
+            withdrawals_list = self._withdrawals_attr_list_for_slot(int(slot))
 
             payload_attributes = {
                 "timestamp": hex(timestamp),
@@ -1190,6 +1178,12 @@ class BeaconNode:
                     # Launch heavy slot work as background task so the event loop
                     # stays responsive for gossipsub block processing
                     asyncio.create_task(self._on_slot_start_safe(current_slot))
+                    # Gloas: advertise fee_recipient/target_gas_limit for our
+                    # upcoming proposal slots (deduped inside)
+                    if gloas_active:
+                        asyncio.create_task(
+                            self._broadcast_proposer_preferences(current_slot)
+                        )
 
                 # Phase 2: Attestation due time - produce attestations and
                 # sync committee messages. Per altair/validator.md sync
@@ -1364,30 +1358,7 @@ class BeaconNode:
                 # Same epoch - use the target epoch's mix directly
                 prev_randao = bytes(randao_mixes[target_epoch % len(randao_mixes)])
 
-            # Withdrawals: Gloas keeps the expected withdrawals on state itself
-            # (payload_expected_withdrawals); pre-Gloas we compute them from state.
-            withdrawals_list = []
-            if hasattr(self.state, "payload_expected_withdrawals"):
-                for w in self.state.payload_expected_withdrawals:
-                    withdrawals_list.append({
-                        "index": hex(int(w.index)),
-                        "validatorIndex": hex(int(w.validator_index)),
-                        "address": "0x" + bytes(w.address).hex(),
-                        "amount": hex(int(w.amount)),
-                    })
-            elif hasattr(self.state, "next_withdrawal_index"):
-                from .spec.state_transition.block.withdrawals import get_expected_withdrawals
-                try:
-                    expected = get_expected_withdrawals(self.state)
-                    for w in expected.withdrawals:
-                        withdrawals_list.append({
-                            "index": hex(int(w.index)),
-                            "validatorIndex": hex(int(w.validator_index)),
-                            "address": "0x" + bytes(w.address).hex(),
-                            "amount": hex(int(w.amount)),
-                        })
-                except Exception as we:
-                    logger.warning(f"get_expected_withdrawals failed: {we}; sending empty list")
+            withdrawals_list = self._withdrawals_attr_list_for_slot(int(next_slot))
 
             payload_attributes = {
                 "timestamp": hex(timestamp),
@@ -1834,6 +1805,98 @@ class BeaconNode:
                 f"payload_present={payload_present} "
                 f"blob_data_available={blob_data_available}"
             )
+
+    async def _broadcast_proposer_preferences(self, current_slot: int) -> None:
+        """Broadcast SignedProposerPreferences for our upcoming proposal slots.
+
+        Per gloas/validator.md, for every slot in the proposer lookahead that
+        belongs to one of our validators and hasn't passed yet, sign and
+        gossip the preferred fee_recipient/target_gas_limit so builders can
+        construct matching bids. Deduped per
+        (dependent_root, proposal_slot, validator_index), so a tuple is only
+        re-published when its dependent root changes (reorg) or the lookahead
+        advances.
+        """
+        if not self.state or not self.validator_client or not self.beacon_gossip:
+            return
+        if not self._is_synced():
+            return
+        state = self.state
+        if not hasattr(state, "proposer_lookahead") or not hasattr(state, "builders"):
+            return
+
+        try:
+            from .spec.state_transition.helpers.accessors import get_current_epoch
+            from .spec.state_transition.helpers.beacon_committee import (
+                get_proposer_dependent_root,
+            )
+
+            our_keys = {
+                k.validator_index: k for k in self.validator_client.keys.values()
+                if k.validator_index is not None
+            }
+            if not our_keys:
+                return
+
+            slots_per_epoch = SLOTS_PER_EPOCH()
+            epoch_start_slot = get_current_epoch(state) * slots_per_epoch
+
+            for offset, proposer_index in enumerate(state.proposer_lookahead):
+                proposal_slot = epoch_start_slot + offset
+                if proposal_slot <= current_slot:
+                    continue
+                vi = int(proposer_index)
+                key = our_keys.get(vi)
+                if key is None:
+                    continue
+
+                proposal_epoch = proposal_slot // slots_per_epoch
+                try:
+                    dependent_root = get_proposer_dependent_root(state, proposal_epoch)
+                except Exception:
+                    dependent_root = None
+                if dependent_root is None:
+                    # Underflow near genesis: spec says use the genesis block root
+                    dependent_root = getattr(self, "_genesis_block_root", None)
+                if dependent_root is None:
+                    continue
+
+                dedup_key = (bytes(dependent_root), proposal_slot, vi)
+                if dedup_key in self._published_prefs_keys:
+                    continue
+
+                signed = await self.validator_client.produce_proposer_preferences(
+                    state,
+                    proposal_slot,
+                    key,
+                    bytes(dependent_root),
+                    self.config.fee_recipient_bytes,
+                    self.config.target_gas_limit,
+                )
+                if signed is None:
+                    continue
+
+                self._published_prefs_keys.add(dedup_key)
+                # Self-feed so a local builder can match our own proposals
+                self.proposer_preferences[dedup_key] = signed
+
+                try:
+                    await self.beacon_gossip.publish_proposer_preferences(
+                        signed.encode_bytes()
+                    )
+                    logger.info(
+                        f"Proposer preferences: vi={vi} slot={proposal_slot} "
+                        f"fee_recipient={self.config.fee_recipient} "
+                        f"target_gas_limit={self.config.target_gas_limit}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"proposer_preferences gossip publish failed for vi={vi}: {e}"
+                    )
+
+            self._prune_proposer_preferences(current_slot)
+        except Exception as e:
+            logger.error(f"Proposer preferences broadcast failed: {e}", exc_info=True)
 
     async def _broadcast_sync_committee_contributions(self, slot: int, state) -> None:
         """Broadcast sync committee contributions for each subcommittee."""
@@ -3093,6 +3156,82 @@ class BeaconNode:
         except Exception as e:
             logger.warning(f"P2P payload_attestation_message decode/handle failed: {e}")
 
+    async def _on_p2p_proposer_preferences(self, data: bytes, from_peer: str) -> None:
+        """Handle a SignedProposerPreferences from gossip (Gloas).
+
+        Validates per gloas/p2p-interface.md against the head state (we use
+        the head state rather than the dependent-root checkpoint state; on a
+        devnet without long reorgs the proposer_lookahead they expose for the
+        validated epoch range is identical).
+        """
+        if self.state is None or not hasattr(self.state, "proposer_lookahead"):
+            return
+        try:
+            from .spec.types.gloas import SignedProposerPreferences
+            from .spec.state_transition.helpers.beacon_committee import is_valid_proposal_slot
+            from .spec.state_transition.helpers.misc import compute_epoch_at_slot
+            from .spec.state_transition.helpers.domain import get_domain, compute_signing_root
+            from .spec.constants import DOMAIN_PROPOSER_PREFERENCES, MIN_SEED_LOOKAHEAD
+            from .crypto.crypto import verify_async
+
+            signed = SignedProposerPreferences.decode_bytes(data)
+            prefs = signed.message
+            proposal_slot = int(prefs.proposal_slot)
+            validator_index = int(prefs.validator_index)
+            dependent_root = bytes(prefs.dependent_root)
+
+            current_slot = self._current_wall_slot()
+            # [IGNORE] proposal_slot has not already passed
+            if proposal_slot <= current_slot:
+                return
+            # [IGNORE] proposal_slot within the proposer lookahead
+            proposal_epoch = compute_epoch_at_slot(proposal_slot)
+            current_epoch = compute_epoch_at_slot(current_slot)
+            if not (current_epoch <= proposal_epoch <= current_epoch + MIN_SEED_LOOKAHEAD):
+                return
+            # [IGNORE] first valid message for the tuple
+            key = (dependent_root, proposal_slot, validator_index)
+            if key in self.proposer_preferences:
+                return
+            # [REJECT] validator is the scheduled proposer for the slot
+            if not is_valid_proposal_slot(self.state, prefs):
+                self._record_peer_event(from_peer, "gossip_invalid_proposer_preferences")
+                return
+            # [REJECT] signature valid for the validator's pubkey
+            if validator_index >= len(self.state.validators):
+                self._record_peer_event(from_peer, "gossip_invalid_proposer_preferences")
+                return
+            domain = get_domain(self.state, DOMAIN_PROPOSER_PREFERENCES, proposal_epoch)
+            signing_root = compute_signing_root(prefs, domain)
+            pubkey = bytes(self.state.validators[validator_index].pubkey)
+            if not await verify_async(pubkey, signing_root, bytes(signed.signature)):
+                self._record_peer_event(from_peer, "gossip_invalid_proposer_preferences")
+                return
+
+            self.proposer_preferences[key] = signed
+            self._prune_proposer_preferences(current_slot)
+            logger.debug(
+                f"P2P: proposer_preferences vi={validator_index} slot={proposal_slot} "
+                f"fee_recipient=0x{bytes(prefs.fee_recipient).hex()} "
+                f"target_gas_limit={int(prefs.target_gas_limit)} from={from_peer[:16]}"
+            )
+        except Exception as e:
+            logger.warning(f"P2P proposer_preferences decode/handle failed: {e}")
+
+    def _prune_proposer_preferences(self, current_slot: int) -> None:
+        """Drop preferences (and publish dedup keys) for slots already passed."""
+        stale = [k for k in self.proposer_preferences if k[1] <= current_slot]
+        for k in stale:
+            del self.proposer_preferences[k]
+        stale_pub = [k for k in self._published_prefs_keys if k[1] <= current_slot]
+        for k in stale_pub:
+            self._published_prefs_keys.discard(k)
+
+    def _current_wall_slot(self) -> int:
+        """Wall-clock slot derived from genesis time."""
+        slot_duration = get_config().slot_duration_ms / 1000.0
+        return int((time.time() - self._genesis_time) // slot_duration)
+
     async def _on_p2p_blob_sidecar(self, data: bytes, from_peer: str) -> None:
         """Handle a blob sidecar received via libp2p gossipsub."""
         try:
@@ -3581,6 +3720,43 @@ class BeaconNode:
             return bytes(self.state.latest_block_hash)
         return bytes(self.state.latest_execution_payload_header.block_hash)
 
+    def _withdrawals_attr_list_for_slot(self, target_slot: int) -> list:
+        """Expected withdrawals for the payload of ``target_slot``, EL-JSON shaped.
+
+        Gloas: state.payload_expected_withdrawals is the PREVIOUS block's list
+        (process_withdrawals overwrites it during the next block's phase 1),
+        so sending it in payload attributes makes the EL build a payload whose
+        withdrawals_root mismatches what peers' process_withdrawals expects —
+        they reject the envelope, PTC votes absent, and the block is reorged
+        out. Always recompute with get_expected_withdrawals; across an epoch
+        boundary advance a throwaway copy first since the epoch transition
+        moves balances and withdrawability.
+        """
+        state = self.state
+        if state is None or not hasattr(state, "next_withdrawal_index"):
+            return []
+        from .spec.state_transition.block.withdrawals import get_expected_withdrawals
+        try:
+            if target_slot // SLOTS_PER_EPOCH() > int(state.slot) // SLOTS_PER_EPOCH():
+                from .spec.state_transition.transition import process_slots
+                clone = state.__class__.decode_bytes(bytes(state.encode_bytes()))
+                state = process_slots(clone, int(target_slot))
+            expected = get_expected_withdrawals(state)
+            return [
+                {
+                    "index": hex(int(w.index)),
+                    "validatorIndex": hex(int(w.validator_index)),
+                    "address": "0x" + bytes(w.address).hex(),
+                    "amount": hex(int(w.amount)),
+                }
+                for w in expected.withdrawals
+            ]
+        except Exception as we:
+            logger.warning(
+                f"expected withdrawals for slot {target_slot} failed: {we}; sending empty list"
+            )
+            return []
+
     def _resolve_finalized_block_hash(self) -> Optional[bytes]:
         """Get the EL block_hash of the finalized beacon block, or None.
 
@@ -3604,11 +3780,37 @@ class BeaconNode:
         block = signed_block.message if hasattr(signed_block, "message") else signed_block
         body = block.body
         if hasattr(body, "signed_execution_payload_bid"):
-            bh = bytes(body.signed_execution_payload_bid.message.block_hash)
-            if bh != b"\x00" * 32:
-                return bh
-            # Gloas builder-deferred: fall back to state's latest_block_hash.
-            return bytes(self.state.latest_block_hash)
+            # Gloas: a block's bid.block_hash only became an EL block if its
+            # payload envelope was revealed AND applied on the canonical
+            # chain. A withheld (or late, PTC-voted-absent) payload leaves a
+            # bid hash the EL chain skipped — sending it in
+            # forkchoiceUpdated draws a 409 Inconsistent ForkChoiceState.
+            # Holding the envelope in our store is NOT enough (we store
+            # late-revealed envelopes that fork choice discarded); consult
+            # the head state's execution_payload_availability bit, which
+            # tracks canonical payload application per slot. Walk back to
+            # the nearest ancestor whose payload was applied.
+            avail = self.state.execution_payload_availability
+            window = len(avail)
+            head_slot = int(self.state.slot)
+            sb, root = signed_block, finalized_root
+            for _ in range(4 * SLOTS_PER_EPOCH()):
+                if sb is None:
+                    return None
+                blk = sb.message if hasattr(sb, "message") else sb
+                b = blk.body
+                if not hasattr(b, "signed_execution_payload_bid"):
+                    # Crossed the fork boundary: pre-Gloas payloads are
+                    # always executed with their block.
+                    if hasattr(b, "execution_payload"):
+                        return bytes(b.execution_payload.block_hash)
+                    return None
+                slot = int(blk.slot)
+                if head_slot - slot < window and bool(avail[slot % window]):
+                    return bytes(b.signed_execution_payload_bid.message.block_hash)
+                root = bytes(blk.parent_root)
+                sb = self.store.get_block(root)
+            return None
         if hasattr(body, "execution_payload"):
             return bytes(body.execution_payload.block_hash)
         return None

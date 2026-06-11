@@ -69,6 +69,8 @@ def clear_accessors_caches() -> None:
     _total_active_balance_cache.clear()
     _base_reward_per_increment_cache.clear()
     _eligible_validator_indices_cache.clear()
+    _ACTIVE_INDICES_CACHE.clear()
+    _EFFECTIVE_BALANCES_CACHE.clear()
 
 
 def get_current_epoch(state: "BeaconState") -> int:
@@ -150,6 +152,7 @@ def get_randao_mix(state: "BeaconState", epoch: int) -> bytes:
 # times against the same pre-fork state and the inner loops hammer
 # state.validators[i].effective_balance through remerkleable on every
 # acceptance check.
+import weakref as _weakref
 from collections import OrderedDict as _OrderedDict
 
 _ACTIVE_INDICES_CACHE: "_OrderedDict[tuple[int, int, int], list[int]]" = _OrderedDict()
@@ -179,6 +182,8 @@ def get_active_validator_indices(state: "BeaconState", epoch: int) -> Sequence[i
     ]
 
     _ACTIVE_INDICES_CACHE[key] = result
+    # Evict on GC of the state so a recycled id() can never serve stale data
+    _weakref.finalize(state, _ACTIVE_INDICES_CACHE.pop, key, None)
     while len(_ACTIVE_INDICES_CACHE) > _ACTIVE_INDICES_CACHE_MAX:
         _ACTIVE_INDICES_CACHE.popitem(last=False)
     return result
@@ -209,6 +214,8 @@ def get_effective_balances(state: "BeaconState") -> list[int]:
 
     balances = [int(v.effective_balance) for v in state.validators]
     _EFFECTIVE_BALANCES_CACHE[key] = balances
+    # Evict on GC of the state so a recycled id() can never serve stale data
+    _weakref.finalize(state, _EFFECTIVE_BALANCES_CACHE.pop, key, None)
     while len(_EFFECTIVE_BALANCES_CACHE) > _EFFECTIVE_BALANCES_CACHE_MAX:
         _EFFECTIVE_BALANCES_CACHE.popitem(last=False)
     return balances

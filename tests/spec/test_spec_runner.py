@@ -1304,8 +1304,10 @@ class TestForkChoiceCompliance:
                 except (AssertionError, Exception) as e:
                     if valid:
                         raise AssertionError(f"{case_id} step {i}: attester_slashing rejected unexpectedly: {e}") from e
-            elif "payload_attestation" in step:
-                ref = step["payload_attestation"]
+            elif "payload_attestation" in step or "payload_attestation_message" in step:
+                # Verb renamed payload_attestation -> payload_attestation_message
+                # in newer compliance fixtures; both carry a PayloadAttestationMessage.
+                ref = step.get("payload_attestation_message", step.get("payload_attestation"))
                 valid = step.get("valid", True)
                 pa_file = case_path / f"{ref}.ssz_snappy"
                 try:

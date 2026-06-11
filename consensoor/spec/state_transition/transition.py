@@ -476,7 +476,12 @@ def process_operations(state: "BeaconState", body, is_gloas: bool = False) -> No
         process_attestation(state, attestation)
 
     # Process deposits
-    if hasattr(state, "deposit_requests_start_index"):
+    if hasattr(state, "proposer_lookahead"):
+        # [Modified in Fulu] former deposit mechanism removed entirely
+        assert len(body.deposits) == 0, (
+            f"Fulu+ blocks must carry no deposits, got {len(body.deposits)}"
+        )
+    elif hasattr(state, "deposit_requests_start_index"):
         # Electra+: disable former deposit mechanism once all prior deposits are processed
         eth1_deposit_index_limit = min(
             int(state.eth1_data.deposit_count),

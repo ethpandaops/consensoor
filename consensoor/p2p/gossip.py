@@ -28,6 +28,7 @@ from .encoding import (
     BLOB_SIDECAR_TOPIC_PREFIX,
     EXECUTION_PAYLOAD_TOPIC,
     PAYLOAD_ATTESTATION_MESSAGE_TOPIC,
+    PROPOSER_PREFERENCES_TOPIC,
 )
 from ..spec.constants import SYNC_COMMITTEE_SUBNET_COUNT
 
@@ -176,6 +177,15 @@ class BeaconGossip:
     async def publish_payload_attestation_message(self, message_ssz: bytes) -> None:
         """Publish a PayloadAttestationMessage from one of our PTC validators."""
         topic = get_topic_name(PAYLOAD_ATTESTATION_MESSAGE_TOPIC, self.fork_digest)
+        await self._host.publish(topic, message_ssz)
+
+    def subscribe_proposer_preferences(self, handler: MessageHandler) -> None:
+        """Subscribe to SignedProposerPreferences gossip (GLOAS/ePBS)."""
+        self._handlers[PROPOSER_PREFERENCES_TOPIC] = handler
+
+    async def publish_proposer_preferences(self, message_ssz: bytes) -> None:
+        """Publish a SignedProposerPreferences for one of our proposers."""
+        topic = get_topic_name(PROPOSER_PREFERENCES_TOPIC, self.fork_digest)
         await self._host.publish(topic, message_ssz)
 
     def subscribe_blob_sidecars(self, handler: MessageHandler) -> None:

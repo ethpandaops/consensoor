@@ -1,6 +1,6 @@
 """Gloas SSZ types (ePBS - Enshrined Proposer-Builder Separation).
 
-Updated for v1.7.0-alpha.7.
+Updated for v1.7.0-alpha.10.
 """
 
 from .base import (
@@ -247,7 +247,7 @@ class SignedBeaconBlock(Container):
 class BeaconState(Container):
     """Gloas BeaconState (ePBS).
 
-    Field order matches v1.7.0-alpha.7 exactly. Critical for SSZ correctness.
+    Field order matches v1.7.0-alpha.10 exactly. Critical for SSZ correctness.
     """
     genesis_time: uint64
     genesis_validators_root: Root

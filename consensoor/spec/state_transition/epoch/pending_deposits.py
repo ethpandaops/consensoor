@@ -57,10 +57,14 @@ def process_pending_deposits(state: "BeaconState") -> None:
     # Compute finalized slot
     finalized_slot = int(state.finalized_checkpoint.epoch) * SLOTS_PER_EPOCH()
 
+    # [Modified in Fulu] former deposit mechanism removed; no Eth1 bridge wait
+    is_post_fulu = hasattr(state, "proposer_lookahead")
+
     for deposit in state.pending_deposits:
         # Do not process deposit requests if Eth1 bridge deposits are not yet applied
         if (
-            int(deposit.slot) > GENESIS_SLOT
+            not is_post_fulu
+            and int(deposit.slot) > GENESIS_SLOT
             and int(state.eth1_deposit_index) < int(state.deposit_requests_start_index)
         ):
             break
