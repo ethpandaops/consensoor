@@ -1277,6 +1277,29 @@ class TestForkChoiceCompliance:
                             spec_mod.on_attester_slashing(store, block_slash)
                         except AssertionError:
                             pass
+                    # Post-Gloas: an on_block step also implies receiving the
+                    # block's payload attestations, unpacked into individual
+                    # PayloadAttestationMessages (mirrors upstream add_block).
+                    if hasattr(signed.message.body, "payload_attestations"):
+                        block_state = store.block_states[signed.message.hash_tree_root()]
+                        for pa in signed.message.body.payload_attestations:
+                            pa_slot = pa.data.slot
+                            ptc = spec_mod.get_ptc(block_state, pa_slot)
+                            bits = pa.aggregation_bits
+                            for bit_i, v_index in enumerate(ptc):
+                                if not bits[bit_i]:
+                                    continue
+                                ptc_message = spec_mod.PayloadAttestationMessage(
+                                    validator_index=v_index,
+                                    data=pa.data,
+                                    signature=spec_mod.BLSSignature(),
+                                )
+                                try:
+                                    spec_mod.on_payload_attestation_message(
+                                        store, ptc_message, is_from_block=True
+                                    )
+                                except AssertionError:
+                                    pass
                 except (AssertionError, Exception) as e:
                     if valid:
                         raise AssertionError(f"{case_id} step {i}: block rejected unexpectedly: {e}") from e

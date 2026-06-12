@@ -63,13 +63,20 @@ if [[ -f "${version_file}" ]] && [[ "$(cat "${version_file}")" == "${expected_ve
   exit 0
 fi
 
-artifact_name="small.tar.gz"
-artifact_url="$(curl -s -H "${auth_header}" \
-  "${api}/repos/${repo}/actions/runs/${run_id}/artifacts?name=${artifact_name}&per_page=1" | \
-  jq -r '.artifacts[0].archive_download_url')"
+# Nightly runs upload `small.tar.gz`; release-tagged runs (e.g.
+# "Compliance Tests for v1.7.0-alpha.10") upload `comptests.tar.gz`.
+artifact_url=""
+for artifact_name in small.tar.gz comptests.tar.gz; do
+  artifact_url="$(curl -s -H "${auth_header}" \
+    "${api}/repos/${repo}/actions/runs/${run_id}/artifacts?name=${artifact_name}&per_page=1" | \
+    jq -r '.artifacts[0].archive_download_url')"
+  if [[ -n "${artifact_url}" && "${artifact_url}" != "null" ]]; then
+    break
+  fi
+done
 
 if [[ -z "${artifact_url}" || "${artifact_url}" == "null" ]]; then
-  echo "Artifact ${artifact_name} not found in run ${run_id}"
+  echo "No compliance artifact (small.tar.gz or comptests.tar.gz) found in run ${run_id}"
   exit 1
 fi
 

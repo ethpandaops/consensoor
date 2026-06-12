@@ -200,6 +200,13 @@ class BeaconNode:
 
         self._running = False
         self._genesis_time: int = 0
+        # Serializes block imports. Gossip and req/resp batches land
+        # concurrently, and the parent-check → gap-walk → apply sequence in
+        # _on_p2p_block yields at every await — two interleaved imports each
+        # walk a gap chain from the same head and double-apply the same
+        # blocks (process_block_header then fails its slot monotonicity
+        # assert).
+        self._block_import_lock = asyncio.Lock()
         self._slot_ticker_task: Optional[asyncio.Task] = None
         self._block_sync_task: Optional[asyncio.Task] = None
         self._current_payload_id: Optional[bytes] = None
@@ -501,7 +508,7 @@ class BeaconNode:
 
         self.head_root = hash_tree_root(genesis_block)
         self._genesis_block_root = self.head_root
-        self._genesis_state = self.state.__class__.decode_bytes(bytes(self.state.encode_bytes()))
+        self._genesis_state = self.state.copy()
 
         # Save state by genesis_state_root (its true hash). Per spec the
         # genesis state has latest_block_header.state_root == ZERO_HASH;
@@ -1532,7 +1539,7 @@ class BeaconNode:
         temp_state = self.state
         if slot > int(temp_state.slot):
             def _advance(state, target_slot):
-                cloned = state.__class__.decode_bytes(bytes(state.encode_bytes()))
+                cloned = state.copy()
                 return process_slots(cloned, target_slot)
             temp_state = await self._on_state_thread(_advance, temp_state, slot)
 
@@ -2504,12 +2511,15 @@ class BeaconNode:
             # This MUST happen before updating head_slot/head_root to avoid race condition
             # where SSE event is emitted before state is saved
             state_root = await self._on_state_thread(hash_tree_root, self.state)
-            self.store.save_state(state_root, self.state)
-            self.store.save_state(block_root, self.state)  # Also by block_root for flexibility
+            state_data = await self._on_state_thread(
+                lambda: bytes(self.state.encode_bytes())
+            )
+            self.store.save_state(state_root, self.state, data=state_data)
+            self.store.save_state(block_root, self.state, data=state_data)  # Also by block_root for flexibility
             # Also save by the block's state_root field, as that's what Dora looks for
             block_state_root = bytes(block.state_root)
             if block_state_root != state_root:
-                self.store.save_state(block_state_root, self.state)
+                self.store.save_state(block_state_root, self.state, data=state_data)
 
             # NOW update head_slot/head_root (SSE event loop will see this change)
             self.head_slot = slot
@@ -2745,7 +2755,12 @@ class BeaconNode:
             pass
 
     async def _on_p2p_block(self, data: bytes, from_peer: str) -> None:
-        """Handle a beacon block received via libp2p gossipsub."""
+        """Handle a beacon block received via libp2p gossipsub or req/resp."""
+        async with self._block_import_lock:
+            await self._import_signed_block(data, from_peer)
+
+    async def _import_signed_block(self, data: bytes, from_peer: str) -> None:
+        """Import one signed block. Caller must hold _block_import_lock."""
         try:
             signed_block = decode_signed_beacon_block(data)
             block = signed_block.message
@@ -2835,19 +2850,53 @@ class BeaconNode:
                                         if hasattr(missing_signed, "message")
                                         else missing_signed
                                     )
+                                    if self.state is not None and int(
+                                        missing_block.slot
+                                    ) <= int(self.state.latest_block_header.slot):
+                                        # Already applied (e.g. chain walked
+                                        # from a head that lagged the state).
+                                        continue
                                     await self._apply_block_to_state(
                                         missing_block, missing_root, missing_signed
                                     )
-                                    await self._notify_el_of_received_block(missing_block)
+                                    # Head moves with the state, immediately.
+                                    # Anything fallible (EL notify) comes
+                                    # after — a failure between apply and
+                                    # head update leaves head pointing at a
+                                    # block the state already moved past,
+                                    # and every later gap-fill dies on the
+                                    # parent_root assert.
                                     self.head_slot = int(missing_block.slot)
                                     self.head_root = missing_root
                                     self.store.set_head(missing_root)
+                                    try:
+                                        await self._notify_el_of_received_block(
+                                            missing_block
+                                        )
+                                    except Exception as el_err:
+                                        logger.warning(
+                                            f"EL notify for gap-fill "
+                                            f"slot={missing_block.slot} failed: {el_err}"
+                                        )
                             except Exception as e:
                                 logger.error(
                                     f"P2P: gap-fill failed before slot={block.slot}: {e}"
                                 )
                                 import traceback
                                 traceback.print_exc()
+                                # The gap chain didn't connect to the state's
+                                # branch (head and state on different forks).
+                                # _reorg_to replays from a cached ancestor
+                                # state and swaps state+head atomically —
+                                # use it to self-heal instead of staying
+                                # wedged.
+                                try:
+                                    await self._reorg_to(block_root, signed_block)
+                                except Exception as reorg_err:
+                                    logger.error(
+                                        f"P2P: heal-reorg to slot={block.slot} "
+                                        f"failed: {reorg_err}"
+                                    )
                                 return
                             # parent_root now equals self.head_root; fall
                             # through to the normal forward-import path
@@ -2891,13 +2940,6 @@ class BeaconNode:
                     await self._apply_block_to_state(block, block_root, signed_block)
                     logger.debug(f"P2P: _apply_block_to_state succeeded for slot={block.slot}")
 
-                    # Push the execution payload to our EL. For Gloas blocks
-                    # the envelope path does this; pre-Gloas blocks need it
-                    # here or geth never sees the canonical chain past our
-                    # own proposals — and the first Gloas slot then can't
-                    # extend the unknown parent.
-                    await self._notify_el_of_received_block(block)
-
                     # Do NOT mutate latest_block_header.state_root — see comment
                     # in _produce_and_broadcast_block; same spec-divergence trap.
 
@@ -2905,18 +2947,34 @@ class BeaconNode:
                     # This MUST happen before updating head_slot/head_root to avoid race condition
                     # where SSE event is emitted before state is saved
                     state_root = await self._on_state_thread(hash_tree_root, self.state)
-                    self.store.save_state(state_root, self.state)
-                    self.store.save_state(block_root, self.state)  # Also by block_root for flexibility
+                    state_data = await self._on_state_thread(
+                        lambda: bytes(self.state.encode_bytes())
+                    )
+                    self.store.save_state(state_root, self.state, data=state_data)
+                    self.store.save_state(block_root, self.state, data=state_data)  # Also by block_root for flexibility
                     # Also save by the block's state_root field, as that's what Dora looks for
                     block_state_root = bytes(block.state_root)
                     if block_state_root != state_root:
-                        self.store.save_state(block_state_root, self.state)
+                        self.store.save_state(block_state_root, self.state, data=state_data)
 
                     # NOW update head_slot/head_root (SSE event loop will see this change)
                     self.head_slot = int(block.slot)
                     self.head_root = block_root
                     self.store.set_head(block_root)
                     self._push_status_snapshot()
+
+                    # Push the execution payload to our EL. For Gloas blocks
+                    # the envelope path does this; pre-Gloas blocks need it
+                    # here or geth never sees the canonical chain past our
+                    # own proposals. Best-effort AFTER the head update: the
+                    # state is already advanced, and an EL hiccup here must
+                    # not strand head behind the state.
+                    try:
+                        await self._notify_el_of_received_block(block)
+                    except Exception as el_err:
+                        logger.warning(
+                            f"EL notify for slot={block.slot} failed: {el_err}"
+                        )
 
                     # Update metrics
                     from .spec import constants
@@ -3446,16 +3504,12 @@ class BeaconNode:
                 f"Reorg: replaying {len(chain)} blocks from cached ancestor "
                 f"slot {anchor_slot} to slot {target_slot}"
             )
-            new_state = anchor_state.__class__.decode_bytes(
-                bytes(anchor_state.encode_bytes())
-            )
+            new_state = anchor_state.copy()
         else:
             logger.info(
                 f"Reorg: replaying {len(chain)} blocks from genesis to slot {target_slot}"
             )
-            new_state = self._genesis_state.__class__.decode_bytes(
-                bytes(self._genesis_state.encode_bytes())
-            )
+            new_state = self._genesis_state.copy()
 
         from .spec.state_transition import state_transition
 
@@ -3463,6 +3517,13 @@ class BeaconNode:
             for idx, (root, signed) in enumerate(indexed_blocks):
                 try:
                     state = state_transition(state, signed, False)
+                    replayed = (
+                        signed.message if hasattr(signed, "message") else signed
+                    )
+                    # Canonical-chain pinning — see _apply_with_check.
+                    state.latest_block_header.state_root = bytes(
+                        replayed.state_root
+                    )
                 except Exception as exc:
                     blk = signed.message if hasattr(signed, "message") else signed
                     raise RuntimeError(
@@ -3477,17 +3538,19 @@ class BeaconNode:
         # Push the (potentially expensive) replay onto a worker thread.
         new_state = await asyncio.to_thread(_replay, new_state, chain)
 
-        # Per spec, latest_block_header.state_root stays ZERO until the
-        # next slot's process_slot fills it in. Do not mutate here.
+        # latest_block_header.state_root is pinned to each block's claimed
+        # root inside _replay (canonical-chain pinning); nothing to fill
+        # here.
 
         # Persist the new state under several keys so the API + dora can
         # find it back.
         state_root = await asyncio.to_thread(hash_tree_root, new_state)
-        self.store.save_state(state_root, new_state)
-        self.store.save_state(target_root, new_state)
+        state_data = await asyncio.to_thread(lambda: bytes(new_state.encode_bytes()))
+        self.store.save_state(state_root, new_state, data=state_data)
+        self.store.save_state(target_root, new_state, data=state_data)
         block_state_root = bytes(target_block.state_root)
         if block_state_root != state_root:
-            self.store.save_state(block_state_root, new_state)
+            self.store.save_state(block_state_root, new_state, data=state_data)
 
         old_head = self.head_root.hex()[:16] if self.head_root else "None"
 
@@ -3563,7 +3626,11 @@ class BeaconNode:
             # the block's claimed state_root. First mismatch pinpoints the
             # exact slot where our state diverges from spec.
             def _apply_with_check(state, sb):
-                pre_copy = state.__class__.decode_bytes(bytes(state.encode_bytes()))
+                # remerkleable copy(): O(1) structural sharing that keeps
+                # the memoized subtree hashes — an encode/decode round-trip
+                # would throw the hash cache away and force a full
+                # re-merkleization of the state on the next hash_tree_root.
+                pre_copy = state.copy()
                 target = int(sb.message.slot)
                 if target > int(pre_copy.slot):
                     pre_copy = process_slots(pre_copy, target)
@@ -3577,6 +3644,16 @@ class BeaconNode:
                         f"computed={computed.hex()[:16]} "
                         f"claimed={claimed.hex()[:16]}"
                     )
+                # Pin the block's CLAIMED state_root into the header. Spec
+                # leaves it ZERO until the next process_slot fills it with
+                # our computed root — but when our transition diverges (see
+                # mismatch above) that filled root no longer hashes to the
+                # block root peers built on, the next canonical block fails
+                # its parent_root assert, and the node wedges permanently.
+                # The claimed root is by definition what peers hashed into
+                # the block root, so pinning it keeps us chained to the
+                # canonical chain even while our state content drifts.
+                pre_copy.latest_block_header.state_root = claimed
                 return pre_copy
             new_state = await self._on_state_thread(
                 _apply_with_check, self.state, signed_block
@@ -3598,6 +3675,8 @@ class BeaconNode:
             if target_slot > int(state.slot):
                 state = process_slots(state, target_slot)
             process_block(state, block)
+            # Canonical-chain pinning — see _apply_with_check above.
+            state.latest_block_header.state_root = bytes(block.state_root)
             return state
 
         self.state = await self._on_state_thread(_apply_sync, self.state)
@@ -3737,9 +3816,21 @@ class BeaconNode:
             return []
         from .spec.state_transition.block.withdrawals import get_expected_withdrawals
         try:
-            if target_slot // SLOTS_PER_EPOCH() > int(state.slot) // SLOTS_PER_EPOCH():
+            target_epoch = target_slot // SLOTS_PER_EPOCH()
+            state_epoch = int(state.slot) // SLOTS_PER_EPOCH()
+            if target_epoch > state_epoch:
+                # A checkpoint-synced state legitimately lags wall clock by
+                # 2-3 epochs. Anything beyond that means we're unsynced; a
+                # process_slots replay over thousands of slots runs for hours
+                # on the event loop, so bail out instead.
+                if target_epoch - state_epoch > 4:
+                    logger.warning(
+                        f"state epoch {state_epoch} is {target_epoch - state_epoch} epochs "
+                        f"behind target slot {target_slot}; skipping withdrawals precompute"
+                    )
+                    return []
                 from .spec.state_transition.transition import process_slots
-                clone = state.__class__.decode_bytes(bytes(state.encode_bytes()))
+                clone = state.copy()
                 state = process_slots(clone, int(target_slot))
             expected = get_expected_withdrawals(state)
             return [

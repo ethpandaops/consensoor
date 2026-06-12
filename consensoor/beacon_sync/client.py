@@ -63,6 +63,14 @@ class RemoteBeaconClient:
                     headers={"Accept": "text/event-stream"},
                     timeout=aiohttp.ClientTimeout(total=None, sock_read=None),
                 ) as response:
+                    if response.status == 404:
+                        # Lightweight checkpoint providers (checkpointz) don't
+                        # serve /eth/v1/events — retrying can't ever succeed.
+                        logger.warning(
+                            "Upstream does not support SSE events (404); "
+                            "relying on periodic sync and P2P gossip"
+                        )
+                        return
                     if response.status != 200:
                         logger.error(f"SSE connection failed: {response.status}")
                         await asyncio.sleep(self._reconnect_delay)

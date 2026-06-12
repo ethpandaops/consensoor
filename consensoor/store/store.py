@@ -208,15 +208,21 @@ class Store:
         data = value[16:]
         return fork, data
 
-    def save_state(self, root: bytes, state: object) -> None:
-        """Save a beacon state by root."""
+    def save_state(self, root: bytes, state: object, data: bytes = None) -> None:
+        """Save a beacon state by root.
+
+        ``data`` lets callers saving the same state under several keys
+        share one SSZ encoding — encode_bytes() on a full beacon state is
+        hundreds of ms, and the multi-key save paths were paying it per key.
+        """
         self._state_cache[root] = state
         self._trim_cache(self._state_cache)
 
         try:
             fork = self._detect_fork(state)
             slot = int(state.slot) if hasattr(state, "slot") else 0
-            data = state.encode_bytes()
+            if data is None:
+                data = state.encode_bytes()
 
             batch = self._db.write_batch()
             batch.put(PREFIX_STATE + root, self._encode_value(fork, data))

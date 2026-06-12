@@ -20,6 +20,12 @@ _LEVEL_COLORS = {
 _COLOR_RESET = "\033[0m"
 
 
+def _split_commas(ctx, param, value):
+    """Allow comma-separated values in addition to repeated flags
+    (e.g. --bootnodes=enr1,enr2), matching other CL clients."""
+    return tuple(v.strip() for item in value for v in item.split(",") if v.strip())
+
+
 class _ColorFormatter(logging.Formatter):
     """Formatter that colors the level name to match Rust tracing output."""
 
@@ -173,7 +179,8 @@ def cli():
 @click.option(
     "--bootnodes",
     multiple=True,
-    help="Bootnode ENRs or multiaddrs (can be specified multiple times)",
+    callback=_split_commas,
+    help="Bootnode ENRs or multiaddrs (repeated flags or comma-separated)",
     envvar="CONSENSOOR_BOOTNODES",
 )
 @click.option(

@@ -38,6 +38,12 @@ class StateSyncManager:
             self._on_event,
         )
 
+        # Pull the finalized state BEFORE returning. node.start() prepares the
+        # first payload right after this, and with the state still at genesis
+        # that walks process_slots from slot 0 to the wall-clock slot — an
+        # hours-long replay that starves the event loop and the sync itself.
+        await self._initial_sync()
+
         self._sync_task = asyncio.create_task(self._periodic_sync())
         logger.info("State sync manager started")
 
@@ -156,8 +162,6 @@ class StateSyncManager:
 
     async def _periodic_sync(self) -> None:
         """Periodically sync state to keep randao_mixes current."""
-        await self._initial_sync()
-
         while self._running:
             try:
                 await asyncio.sleep(60)
@@ -224,15 +228,21 @@ class StateSyncManager:
 
     async def _apply_state(self, synced_state: AnyBeaconState) -> None:
         """Apply synced state to local node state."""
-        if self.node.state is None:
-            logger.warning("No local state to update, setting synced state directly")
-            self.node.state = synced_state
-            self.node.head_slot = int(synced_state.slot)
-            self.node.head_root = hash_tree_root(synced_state)
+        synced_slot = int(synced_state.slot)
+
+        # Adopt the state wholesale when there is no usable local chain yet
+        # (no state, or still sitting at genesis). Merging selected fields
+        # into the genesis state leaves the rest (block_roots, participation,
+        # exit queue, ...) stale, and without the checkpoint block root
+        # anchored in the store the reorg walk falls through the checkpoint
+        # chasing pre-checkpoint blocks no peer serves anymore.
+        if self.node.state is None or (
+            int(self.node.state.slot) == 0 and synced_slot > 0
+        ):
+            await self._adopt_checkpoint_state(synced_state)
             return
 
         local_state = self.node.state
-        synced_slot = int(synced_state.slot)
 
         for i, mix in enumerate(synced_state.randao_mixes):
             local_state.randao_mixes[i] = mix
@@ -264,6 +274,54 @@ class StateSyncManager:
 
         self.node.head_slot = synced_slot
         # Note: Don't overwrite head_root here - let block events update it with the actual block root
+
+    async def _adopt_checkpoint_state(self, state: AnyBeaconState) -> None:
+        """Adopt a checkpoint state as the node's chain anchor.
+
+        Computes the anchor block root per spec (latest_block_header with
+        state_root filled in), points head at it, and caches the state under
+        that root so _reorg_to's ancestor walk terminates at the checkpoint
+        instead of requiring ancestry back to genesis.
+        """
+        slot = int(state.slot)
+        header = state.latest_block_header
+        header_state_root = bytes(header.state_root)
+        if header_state_root == b"\x00" * 32:
+            header_state_root = bytes(hash_tree_root(state))
+        anchor_header = BeaconBlockHeader(
+            slot=int(header.slot),
+            proposer_index=int(header.proposer_index),
+            parent_root=bytes(header.parent_root),
+            state_root=header_state_root,
+            body_root=bytes(header.body_root),
+        )
+        anchor_root = bytes(hash_tree_root(anchor_header))
+
+        self.node.state = state
+        self.node.head_slot = slot
+        self.node.head_root = anchor_root
+        self.node.store.save_state(anchor_root, state)
+        self.node.store.set_head(anchor_root)
+
+        # Best effort: fetch the anchor block itself so req/resp and the
+        # beacon API can serve it. Checkpoint providers serve finalized
+        # blocks by root.
+        try:
+            ssz_bytes = await self.client.get_block("0x" + anchor_root.hex())
+            signed_block = self._decode_signed_block(ssz_bytes)
+            if signed_block is not None:
+                self.node.store.save_block(anchor_root, signed_block)
+        except Exception as e:
+            logger.debug(f"Anchor block fetch failed: {e}")
+
+        if self.node.validator_client:
+            self.node.validator_client.update_validator_indices(state)
+
+        logger.info(
+            f"Adopted checkpoint state: slot={slot}, "
+            f"anchor_block={anchor_root.hex()[:16]}, "
+            f"finalized_epoch={int(state.finalized_checkpoint.epoch)}"
+        )
 
     async def _sync_finality(self) -> None:
         """Sync finality checkpoints from upstream."""
