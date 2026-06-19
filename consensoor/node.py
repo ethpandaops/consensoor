@@ -1322,12 +1322,7 @@ class BeaconNode:
         parent_block_hash: bytes,
         withdrawals_list: list,
     ) -> None:
-        """Emit a beacon-API payload_attributes SSE event for ``proposal_slot``.
-
-        Mirrors the attributes we hand the EL in forkchoiceUpdated, but in the
-        beacon-APIs JSON shape (decimal strings, snake_case) that builders such
-        as buildoor consume to trigger block building.
-        """
+        """Emit a beacon-API payload_attributes SSE event for ``proposal_slot``."""
         if not self.beacon_api or self.state is None:
             return
         try:
@@ -1339,8 +1334,7 @@ class BeaconNode:
                 if idx is not None:
                     proposer_index = int(idx)
 
-            # The engine-API withdrawals list is hex + camelCase; the beacon-API
-            # event uses decimal + snake_case, so convert.
+            # engine-API withdrawals are hex/camelCase; beacon-API wants decimal/snake_case.
             spec_withdrawals = [
                 {
                     "index": str(int(w["index"], 16)),
@@ -1436,10 +1430,6 @@ class BeaconNode:
 
             withdrawals_list = self._withdrawals_attr_list_for_slot(int(next_slot))
 
-            # Let external builders (e.g. buildoor) know we are preparing a
-            # payload for next_slot. We do this on every slot, so subscribers
-            # get a payload_attributes event each slot regardless of whether we
-            # are the proposer.
             await self._emit_payload_attributes_event(
                 int(next_slot), int(timestamp), prev_randao, head_block_hash, withdrawals_list
             )

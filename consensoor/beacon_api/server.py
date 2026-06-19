@@ -1417,13 +1417,7 @@ class BeaconAPI:
         payload_attributes: dict,
         parent_block_number: int = 0,
     ) -> None:
-        """Emit a payload_attributes SSE event (beacon-APIs spec).
-
-        External builders (e.g. buildoor) subscribe to this topic to learn
-        when to start building a payload. consensoor prepares payload
-        attributes on every slot (see node._update_forkchoice_for_slot), so
-        this fires every slot regardless of whether we hold the proposer duty.
-        """
+        """Emit a payload_attributes SSE event (beacon-APIs spec)."""
         self._cross_loop_events.put({
             "event": "payload_attributes",
             "data": {
