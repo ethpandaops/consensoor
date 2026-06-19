@@ -1266,7 +1266,8 @@ class BeaconAPI:
         topics = set(t.strip() for t in topics_param.split(",") if t.strip())
 
         valid_topics = {"head", "block", "finalized_checkpoint", "chain_reorg",
-                        "execution_payload_available", "execution_payload_bid"}
+                        "execution_payload_available", "execution_payload_bid",
+                        "payload_attributes"}
         requested_topics = topics & valid_topics if topics else valid_topics
 
         if not requested_topics:
@@ -1402,6 +1403,39 @@ class BeaconAPI:
             "data": {
                 "slot": str(slot),
                 "block_root": "0x" + block_root.hex(),
+            },
+        })
+
+    async def emit_payload_attributes(
+        self,
+        *,
+        proposal_slot: int,
+        proposer_index: int,
+        parent_block_root: bytes,
+        parent_block_hash: bytes,
+        version: str,
+        payload_attributes: dict,
+        parent_block_number: int = 0,
+    ) -> None:
+        """Emit a payload_attributes SSE event (beacon-APIs spec).
+
+        External builders (e.g. buildoor) subscribe to this topic to learn
+        when to start building a payload. consensoor prepares payload
+        attributes on every slot (see node._update_forkchoice_for_slot), so
+        this fires every slot regardless of whether we hold the proposer duty.
+        """
+        self._cross_loop_events.put({
+            "event": "payload_attributes",
+            "data": {
+                "version": version,
+                "data": {
+                    "proposal_slot": str(proposal_slot),
+                    "proposer_index": str(proposer_index),
+                    "parent_block_root": "0x" + parent_block_root.hex(),
+                    "parent_block_number": str(parent_block_number),
+                    "parent_block_hash": "0x" + parent_block_hash.hex(),
+                    "payload_attributes": payload_attributes,
+                },
             },
         })
 

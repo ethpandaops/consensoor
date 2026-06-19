@@ -1314,6 +1314,75 @@ class BeaconNode:
 
         # NOTE: Attestations are produced at the 1/3 mark by _slot_ticker, not here
 
+    async def _emit_payload_attributes_event(
+        self,
+        proposal_slot: int,
+        timestamp: int,
+        prev_randao: bytes,
+        parent_block_hash: bytes,
+        withdrawals_list: list,
+    ) -> None:
+        """Emit a beacon-API payload_attributes SSE event for ``proposal_slot``.
+
+        Mirrors the attributes we hand the EL in forkchoiceUpdated, but in the
+        beacon-APIs JSON shape (decimal strings, snake_case) that builders such
+        as buildoor consume to trigger block building.
+        """
+        if not self.beacon_api or self.state is None:
+            return
+        try:
+            proposer_index = 0
+            if self.validator_client is not None:
+                idx = self.validator_client._get_proposer_index(
+                    self.state, int(proposal_slot)
+                )
+                if idx is not None:
+                    proposer_index = int(idx)
+
+            # The engine-API withdrawals list is hex + camelCase; the beacon-API
+            # event uses decimal + snake_case, so convert.
+            spec_withdrawals = [
+                {
+                    "index": str(int(w["index"], 16)),
+                    "validator_index": str(int(w["validatorIndex"], 16)),
+                    "address": w["address"],
+                    "amount": str(int(w["amount"], 16)),
+                }
+                for w in withdrawals_list
+            ]
+
+            network_config = get_config()
+            gloas_fork_epoch = getattr(network_config, "gloas_fork_epoch", None)
+            is_gloas = (
+                gloas_fork_epoch is not None
+                and int(proposal_slot) // SLOTS_PER_EPOCH() >= gloas_fork_epoch
+            )
+
+            payload_attributes = {
+                "timestamp": str(int(timestamp)),
+                "prev_randao": "0x" + prev_randao.hex(),
+                "suggested_fee_recipient": "0x" + "00" * 20,
+                "withdrawals": spec_withdrawals,
+                "parent_beacon_block_root": "0x" + (self.head_root or b"\x00" * 32).hex(),
+            }
+            if is_gloas:
+                payload_attributes["target_gas_limit"] = str(
+                    int(self.config.target_gas_limit)
+                )
+
+            await self.beacon_api.emit_payload_attributes(
+                proposal_slot=int(proposal_slot),
+                proposer_index=proposer_index,
+                parent_block_root=self.head_root or b"\x00" * 32,
+                parent_block_hash=parent_block_hash,
+                version="gloas" if is_gloas else "electra",
+                payload_attributes=payload_attributes,
+            )
+        except Exception as e:
+            logger.error(
+                f"Failed to emit payload_attributes for slot {proposal_slot}: {e}"
+            )
+
     async def _update_forkchoice_for_slot(self, slot: int) -> None:
         """Update forkchoice with EL and prepare payload for NEXT slot (slot + 1)."""
         if not self.engine or not self.state:
@@ -1366,6 +1435,14 @@ class BeaconNode:
                 prev_randao = bytes(randao_mixes[target_epoch % len(randao_mixes)])
 
             withdrawals_list = self._withdrawals_attr_list_for_slot(int(next_slot))
+
+            # Let external builders (e.g. buildoor) know we are preparing a
+            # payload for next_slot. We do this on every slot, so subscribers
+            # get a payload_attributes event each slot regardless of whether we
+            # are the proposer.
+            await self._emit_payload_attributes_event(
+                int(next_slot), int(timestamp), prev_randao, head_block_hash, withdrawals_list
+            )
 
             payload_attributes = {
                 "timestamp": hex(timestamp),
