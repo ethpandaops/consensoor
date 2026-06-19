@@ -1323,6 +1323,8 @@ class BeaconNode:
         withdrawals_list: list,
     ) -> None:
         """Emit a beacon-API payload_attributes SSE event for ``proposal_slot``."""
+        if not self.config.emit_payload_attributes:
+            return
         if not self.beacon_api or self.state is None:
             return
         try:

@@ -198,6 +198,14 @@ def cli():
     envvar="CONSENSOOR_ENGINE_FORCE_JSON",
 )
 @click.option(
+    "--emit-payload-attributes",
+    is_flag=True,
+    default=False,
+    help="Emit payload_attributes SSE events on every slot so external builders "
+         "(e.g. buildoor) can trigger block building.",
+    envvar="CONSENSOOR_EMIT_PAYLOAD_ATTRIBUTES",
+)
+@click.option(
     "--target-gas-limit",
     type=int,
     default=60,
@@ -227,6 +235,7 @@ def run(
     bootnodes: tuple[str, ...],
     supernode: bool,
     engine_force_json: bool,
+    emit_payload_attributes: bool,
     target_gas_limit: int,
 ):
     """Run the consensus layer node."""
@@ -264,6 +273,7 @@ def run(
         checkpoint_sync_url=checkpoint_sync_url or "",
         supernode=supernode,
         engine_force_json=engine_force_json,
+        emit_payload_attributes=emit_payload_attributes,
         target_gas_limit=target_gas_limit_wei,
     )
 
