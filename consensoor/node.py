@@ -2848,6 +2848,13 @@ class BeaconNode:
                 logger.debug(f"Block already known: {block_root.hex()[:16]}")
                 return
 
+            # Best-effort: backfill any missing blob sidecars from the EL pool
+            # (engine getBlobs, execution-apis #793). Runs in the background so
+            # it never delays import; the helper is self-guarding and the call
+            # is a no-op unless the EL advertises a matching /blobs/vN revision.
+            if getattr(block.body, "blob_kzg_commitments", None):
+                asyncio.create_task(self._fetch_missing_blobs_from_el(signed_block, block_root))
+
             # Check if this block builds on our current head or a known parent
             logger.debug(
                 f"P2P: Parent check: parent_root={parent_root.hex()[:16]}, "
@@ -3413,16 +3420,19 @@ class BeaconNode:
             ],
         }
 
-        # Check if we already have this blob index
+        self._persist_blob_sidecar_json(block_root, slot, sidecar_json)
+
+    def _persist_blob_sidecar_json(self, block_root: bytes, slot: int, sidecar_json: dict) -> None:
+        """Insert a JSON blob sidecar into the store (dedup by index, persist)."""
+        index = int(sidecar_json["index"])
+        existing_blobs = self.store.get_blobs(block_root)
         existing_indices = {int(b["index"]) for b in existing_blobs}
         if index in existing_indices:
             return  # Already have this blob
 
-        # Add to existing blobs
         updated_blobs = existing_blobs + [sidecar_json]
         updated_blobs.sort(key=lambda b: int(b["index"]))
 
-        # Store directly in the store's blob cache and DB
         import json
         from .store.store import PREFIX_BLOBS
 
@@ -3433,6 +3443,107 @@ class BeaconNode:
             logger.info(f"Stored blob sidecar: slot={slot}, index={index}, block_root={block_root.hex()[:16]}")
         except Exception as e:
             logger.warning(f"Failed to persist blob sidecar to LevelDB: {e}")
+
+    async def _fetch_missing_blobs_from_el(self, signed_block, block_root: bytes) -> None:
+        """Backfill missing blob sidecars from the EL pool via engine getBlobs.
+
+        On receiving a block whose blob sidecars haven't (all) arrived over
+        gossip, ask the local EL for the blobs it already holds in its pool
+        (execution-apis #793 `POST /engine/v2/blobs/vN`). For Deneb/Electra
+        (single-proof, whole-blob) we reconstruct Deneb-style sidecars and
+        store them. PeerDAS forks (Fulu+) return cell proofs for data-column
+        reconstruction, which consensoor handles on its own column path, so
+        here we only fetch/log them rather than rebuild sidecars.
+
+        Never raises — blob backfill is best-effort and must not break import.
+        """
+        if not self.engine:
+            return
+        block = signed_block.message if hasattr(signed_block, "message") else signed_block
+        body = block.body
+        commitments = getattr(body, "blob_kzg_commitments", None)
+        if not commitments or len(commitments) == 0:
+            return
+
+        existing = self.store.get_blobs(block_root)
+        have_indices = {int(b["index"]) for b in existing}
+        missing = [i for i in range(len(commitments)) if i not in have_indices]
+        if not missing:
+            return
+
+        from hashlib import sha256
+        versioned_hashes = [b"\x01" + sha256(bytes(c)).digest()[1:] for c in commitments]
+        timestamp = (
+            int(body.execution_payload.timestamp)
+            if hasattr(body, "execution_payload") else int(time.time())
+        )
+        try:
+            entries = await self.engine.get_blobs(versioned_hashes, timestamp=timestamp)
+        except Exception as e:
+            logger.debug(f"engine getBlobs for {block_root.hex()[:16]} failed: {e}")
+            return
+        if not entries:
+            return  # EL can't serve, or no matching /blobs/vN revision advertised
+
+        reconstructed = 0
+        cell_proof_blobs = 0
+        for i in missing:
+            if i >= len(entries):
+                break
+            entry = entries[i]
+            if not entry.get("available"):
+                continue
+            if "proof" not in entry:
+                # Cell-proof (PeerDAS) shape — column reconstruction lives on
+                # consensoor's own data-column path, not here.
+                cell_proof_blobs += 1
+                continue
+            sidecar_json = self._build_el_blob_sidecar_json(
+                signed_block, i, entry["blob"], "0x" + bytes(commitments[i]).hex(), entry["proof"]
+            )
+            self._persist_blob_sidecar_json(block_root, int(block.slot), sidecar_json)
+            reconstructed += 1
+
+        if reconstructed:
+            logger.info(
+                f"Backfilled {reconstructed} blob sidecar(s) from EL for "
+                f"block {block_root.hex()[:16]} (slot={int(block.slot)})"
+            )
+        elif cell_proof_blobs:
+            logger.debug(
+                f"EL returned {cell_proof_blobs} cell-proof blob(s) for "
+                f"{block_root.hex()[:16]}; PeerDAS column reconstruction not wired here"
+            )
+
+    def _build_el_blob_sidecar_json(
+        self, signed_block, index: int, blob_hex: str, commitment_hex: str, proof_hex: str
+    ) -> dict:
+        """Build a Deneb-style blob-sidecar JSON from EL-provided blob data.
+
+        The KZG-commitment inclusion proof is a placeholder, matching the
+        store's existing proposer-side blob handling (consensoor does not yet
+        compute real inclusion proofs).
+        """
+        block = signed_block.message if hasattr(signed_block, "message") else signed_block
+        from .crypto import hash_tree_root
+        signature = bytes(signed_block.signature) if hasattr(signed_block, "signature") else b"\x00" * 96
+        return {
+            "index": str(index),
+            "blob": blob_hex,
+            "kzg_commitment": commitment_hex,
+            "kzg_proof": proof_hex,
+            "signed_block_header": {
+                "message": {
+                    "slot": str(block.slot),
+                    "proposer_index": str(block.proposer_index),
+                    "parent_root": "0x" + bytes(block.parent_root).hex(),
+                    "state_root": "0x" + bytes(block.state_root).hex(),
+                    "body_root": "0x" + hash_tree_root(block.body).hex(),
+                },
+                "signature": "0x" + signature.hex(),
+            },
+            "kzg_commitment_inclusion_proof": ["0x" + "00" * 32] * 17,
+        }
 
     def _walk_back_to_head(
         self, start_root: bytes, max_steps: int = 64

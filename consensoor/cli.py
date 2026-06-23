@@ -194,7 +194,7 @@ def cli():
     "--engine-force-json",
     is_flag=True,
     default=False,
-    help="Force JSON-RPC for all Engine API calls, even if the EL advertises SSZ-over-REST. Useful for debugging.",
+    help="Force legacy JSON-RPC for all Engine API calls, disabling the v2 REST+SSZ transport (execution-apis #793). Useful for debugging.",
     envvar="CONSENSOOR_ENGINE_FORCE_JSON",
 )
 @click.option(
