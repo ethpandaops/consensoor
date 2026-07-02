@@ -68,10 +68,18 @@ class BeaconAPI:
         self.app.router.add_get("/eth/v1/config/fork_schedule", self.get_fork_schedule)
         self.app.router.add_get("/eth/v1/config/deposit_contract", self.get_deposit_contract)
         self.app.router.add_get("/eth/v1/beacon/execution_payload_envelope/{block_id}", self.get_execution_payload_envelope)
+        # Standard path per beacon-APIs #552/#580 (plural); singular kept as alias
+        self.app.router.add_get("/eth/v1/beacon/execution_payload_envelopes/{block_id}", self.get_execution_payload_envelope)
+        self.app.router.add_post("/eth/v1/beacon/execution_payload_envelopes", self.post_execution_payload_envelopes)
+        self.app.router.add_post("/eth/v1/beacon/execution_payload_bids", self.post_execution_payload_bids)
+        self.app.router.add_post("/eth/v1/validator/proposer_preferences", self.post_proposer_preferences)
         self.app.router.add_get("/eth/v1/events", self.get_events)
 
     async def start(self):
         """Start the API server on its own thread + event loop."""
+        # Capture the node's loop so POST handlers can schedule gossip
+        # publishes / node-state mutations back onto it.
+        self._node_loop = asyncio.get_running_loop()
         ready = threading.Event()
         startup_error: list[BaseException] = []
 
@@ -903,45 +911,157 @@ class BeaconAPI:
             )
 
         # JSON response
-        envelope = signed_envelope.message
-        payload = envelope.payload
-        data = {
-            "message": {
-                "payload": {
-                    "parent_hash": "0x" + bytes(payload.parent_hash).hex(),
-                    "fee_recipient": "0x" + bytes(payload.fee_recipient).hex(),
-                    "state_root": "0x" + bytes(payload.state_root).hex(),
-                    "receipts_root": "0x" + bytes(payload.receipts_root).hex(),
-                    "logs_bloom": "0x" + bytes(payload.logs_bloom).hex(),
-                    "prev_randao": "0x" + bytes(payload.prev_randao).hex(),
-                    "block_number": str(int(payload.block_number)),
-                    "gas_limit": str(int(payload.gas_limit)),
-                    "gas_used": str(int(payload.gas_used)),
-                    "timestamp": str(int(payload.timestamp)),
-                    "extra_data": "0x" + bytes(payload.extra_data).hex(),
-                    "base_fee_per_gas": str(int(payload.base_fee_per_gas)),
-                    "block_hash": "0x" + bytes(payload.block_hash).hex(),
-                    "transactions": ["0x" + bytes(tx).hex() for tx in payload.transactions],
-                },
-                "execution_requests": {
-                    "deposits": [],
-                    "withdrawals": [],
-                    "consolidations": [],
-                },
-                "builder_index": str(int(envelope.builder_index)),
-                "beacon_block_root": "0x" + bytes(envelope.beacon_block_root).hex(),
-                "slot": str(int(envelope.slot)),
-                "state_root": "0x" + bytes(envelope.state_root).hex(),
-            },
-            "signature": "0x" + bytes(signed_envelope.signature).hex(),
-        }
+        from .gloas import signed_envelope_to_json
+
         logger.info(f"Returning envelope JSON: block_id={block_id}")
         return web.json_response({
             "version": "gloas",
             "execution_optimistic": False,
             "finalized": False,
-            "data": data,
+            "data": signed_envelope_to_json(signed_envelope),
         })
+
+    async def _run_on_node_loop(self, coro):
+        """Run a coroutine on the node's event loop and await its result."""
+        fut = asyncio.run_coroutine_threadsafe(coro, self._node_loop)
+        return await asyncio.wrap_future(fut)
+
+    async def post_execution_payload_envelopes(self, request: web.Request) -> web.Response:
+        """POST /eth/v1/beacon/execution_payload_envelopes (beacon-APIs #580)
+
+        Accepts a SignedExecutionPayloadEnvelope (JSON, or SSZ via
+        application/octet-stream), broadcasts it on the `execution_payload`
+        gossip topic, and hands it to the node for local integration.
+        """
+        from ..spec.types.gloas import SignedExecutionPayloadEnvelope
+        from .gloas import json_to_signed_envelope
+
+        try:
+            content_type = request.headers.get("Content-Type", "application/json")
+            if "application/octet-stream" in content_type:
+                signed = SignedExecutionPayloadEnvelope.decode_bytes(await request.read())
+            else:
+                body = await request.json()
+                # SignedExecutionPayloadEnvelopeContents wraps the envelope
+                # with blobs/proofs; accept both shapes.
+                envelope_json = body.get("signed_execution_payload_envelope", body)
+                signed = json_to_signed_envelope(envelope_json)
+        except Exception as e:
+            return web.json_response(
+                {"code": 400, "message": f"Invalid signed execution payload envelope: {e}"},
+                status=400,
+            )
+
+        ssz_bytes = signed.encode_bytes()
+        try:
+            if self.node.beacon_gossip:
+                await self._run_on_node_loop(
+                    self.node.beacon_gossip.publish_execution_payload(ssz_bytes)
+                )
+        except Exception as e:
+            logger.error(f"Envelope gossip publish failed: {e}")
+            return web.json_response(
+                {"code": 500, "message": f"Broadcast failed: {e}"}, status=500
+            )
+
+        # Local integration via the normal gossip path; failure to integrate
+        # still returns 202 per spec (broadcast succeeded).
+        try:
+            await self._run_on_node_loop(
+                self.node._on_p2p_execution_payload(ssz_bytes, "beacon-api")
+            )
+        except Exception as e:
+            logger.warning(f"Envelope local integration failed: {e}")
+            return web.Response(status=202)
+
+        return web.Response(status=200)
+
+    async def post_execution_payload_bids(self, request: web.Request) -> web.Response:
+        """POST /eth/v1/beacon/execution_payload_bids (beacon-APIs #552)
+
+        Accepts a SignedExecutionPayloadBid (JSON, or SSZ via
+        application/octet-stream) and broadcasts it on the
+        `execution_payload_bid` gossip topic.
+        """
+        from ..spec.types.gloas import SignedExecutionPayloadBid
+        from .gloas import json_to_signed_bid
+
+        try:
+            content_type = request.headers.get("Content-Type", "application/json")
+            if "application/octet-stream" in content_type:
+                signed = SignedExecutionPayloadBid.decode_bytes(await request.read())
+            else:
+                signed = json_to_signed_bid(await request.json())
+        except Exception as e:
+            return web.json_response(
+                {"code": 400, "message": f"Invalid signed execution payload bid: {e}"},
+                status=400,
+            )
+
+        try:
+            if self.node.beacon_gossip:
+                await self._run_on_node_loop(
+                    self.node.beacon_gossip.publish_execution_payload_bid(signed.encode_bytes())
+                )
+        except Exception as e:
+            logger.error(f"Bid gossip publish failed: {e}")
+            return web.json_response(
+                {"code": 500, "message": f"Broadcast failed: {e}"}, status=500
+            )
+
+        await self.emit_execution_payload_bid(signed)
+        return web.Response(status=200)
+
+    async def post_proposer_preferences(self, request: web.Request) -> web.Response:
+        """POST /eth/v1/validator/proposer_preferences (beacon-APIs #608)
+
+        Accepts an array of SignedProposerPreferences (JSON), validates each
+        against the head state, stores them, and publishes them on the
+        `proposer_preferences` gossip topic.
+        """
+        from .gloas import json_to_signed_proposer_preferences
+
+        try:
+            body = await request.json()
+            if not isinstance(body, list):
+                raise ValueError("expected an array of SignedProposerPreferences")
+            items = [json_to_signed_proposer_preferences(d) for d in body]
+        except Exception as e:
+            return web.json_response(
+                {"code": 400, "message": f"Invalid signed proposer preferences: {e}"},
+                status=400,
+            )
+
+        failures = []
+        for i, signed in enumerate(items):
+            try:
+                ok, reason = await self._run_on_node_loop(
+                    self.node.process_proposer_preferences(signed)
+                )
+                if not ok and reason == "reject":
+                    failures.append({"index": i, "message": "rejected"})
+                    continue
+                if self.node.beacon_gossip and hasattr(
+                    self.node.beacon_gossip, "publish_proposer_preferences"
+                ):
+                    await self._run_on_node_loop(
+                        self.node.beacon_gossip.publish_proposer_preferences(
+                            signed.encode_bytes()
+                        )
+                    )
+            except Exception as e:
+                failures.append({"index": i, "message": str(e)})
+
+        if failures:
+            return web.json_response(
+                {
+                    "code": 400,
+                    "message": "Errors with one or more signed proposer preferences",
+                    "failures": failures,
+                },
+                status=400,
+            )
+        return web.Response(status=200)
 
     async def get_blob_sidecars(self, request: web.Request) -> web.Response:
         """GET /eth/v1/beacon/blob_sidecars/{block_id}"""
@@ -1267,7 +1387,7 @@ class BeaconAPI:
 
         valid_topics = {"head", "block", "finalized_checkpoint", "chain_reorg",
                         "execution_payload_available", "execution_payload_bid",
-                        "payload_attributes"}
+                        "payload_attributes", "proposer_preferences"}
         requested_topics = topics & valid_topics if topics else valid_topics
 
         if not requested_topics:
@@ -1418,18 +1538,33 @@ class BeaconAPI:
         parent_block_number: int = 0,
     ) -> None:
         """Emit a payload_attributes SSE event (beacon-APIs spec)."""
+        data = {
+            "proposal_slot": str(proposal_slot),
+            "proposer_index": str(proposer_index),
+            "parent_block_root": "0x" + parent_block_root.hex(),
+            "parent_block_hash": "0x" + parent_block_hash.hex(),
+            "payload_attributes": payload_attributes,
+        }
+        # [beacon-APIs #621] parent_block_number is removed from gloas onwards
+        if version in ("bellatrix", "capella", "deneb", "electra", "fulu"):
+            data["parent_block_number"] = str(parent_block_number)
         self._cross_loop_events.put({
             "event": "payload_attributes",
             "data": {
                 "version": version,
-                "data": {
-                    "proposal_slot": str(proposal_slot),
-                    "proposer_index": str(proposer_index),
-                    "parent_block_root": "0x" + parent_block_root.hex(),
-                    "parent_block_number": str(parent_block_number),
-                    "parent_block_hash": "0x" + parent_block_hash.hex(),
-                    "payload_attributes": payload_attributes,
-                },
+                "data": data,
+            },
+        })
+
+    async def emit_proposer_preferences(self, signed) -> None:
+        """Emit a proposer_preferences SSE event (beacon-APIs #608)."""
+        from .gloas import signed_proposer_preferences_to_json
+
+        self._cross_loop_events.put({
+            "event": "proposer_preferences",
+            "data": {
+                "version": "gloas",
+                "data": signed_proposer_preferences_to_json(signed),
             },
         })
 

@@ -46,11 +46,12 @@ COPY --from=rust-builder /tmp/wheels/*.whl /tmp/
 # now talks to consensoor_p2p (rust) directly.
 RUN pip install --no-cache-dir --no-deps /tmp/consensoor*.whl /tmp/consensoor_p2p*.whl && \
     pip install --no-cache-dir \
-        "remerkleable>=0.1.28" \
+        "eth-remerkleable>=0.1.30" \
         "blspy>=2.0.0" \
         "py_ecc>=7.0.0" \
         "plyvel>=1.5.0" \
         "prometheus_client>=0.20.0" \
+        "httpx[http2]>=0.27.0" \
         pycryptodome aiohttp click python-snappy coincurve rlp pyjwt pyyaml && \
     rm /tmp/*.whl
 

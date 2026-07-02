@@ -542,5 +542,11 @@ def process_operations(state: "BeaconState", body, is_gloas: bool = False) -> No
     # Process payload attestations (Gloas only - moved into process_operations in alpha 7)
     if is_gloas and hasattr(body, "payload_attestations"):
         from .block.operations import process_payload_attestation
+        from ..constants import MAX_PAYLOAD_ATTESTATIONS
+
+        # [New in Gloas:EIP7688] list is unbounded SSZ; enforce the limit here
+        assert len(body.payload_attestations) <= MAX_PAYLOAD_ATTESTATIONS, (
+            f"Too many payload attestations: {len(body.payload_attestations)}"
+        )
         for payload_attestation in body.payload_attestations:
             process_payload_attestation(state, payload_attestation)

@@ -332,8 +332,15 @@ FINALIZED_ROOT_DEPTH_ELECTRA: Final[int] = 7
 CURRENT_SYNC_COMMITTEE_DEPTH_ELECTRA: Final[int] = 6
 NEXT_SYNC_COMMITTEE_DEPTH_ELECTRA: Final[int] = 6
 
-# Gloas LightClient (uses execution_block_hash and gloas execution branch depth = floor(log2(832)) = 9)
-EXECUTION_BLOCK_HASH_DEPTH_GLOAS: Final[int] = 9
+# Gloas LightClient (EIP-7688 progressive BeaconState/BeaconBlockBody move the gindices)
+FINALIZED_ROOT_GINDEX_GLOAS: Final[int] = 735
+CURRENT_SYNC_COMMITTEE_GINDEX_GLOAS: Final[int] = 2945
+NEXT_SYNC_COMMITTEE_GINDEX_GLOAS: Final[int] = 2946
+EXECUTION_BLOCK_HASH_GINDEX_GLOAS: Final[int] = 2856
+FINALIZED_ROOT_DEPTH_GLOAS: Final[int] = 9  # floorlog2(735)
+CURRENT_SYNC_COMMITTEE_DEPTH_GLOAS: Final[int] = 11  # floorlog2(2945)
+NEXT_SYNC_COMMITTEE_DEPTH_GLOAS: Final[int] = 11  # floorlog2(2946)
+EXECUTION_BLOCK_HASH_DEPTH_GLOAS: Final[int] = 11  # floorlog2(2856)
 
 def MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA() -> int:
     from .network_config import get_config
@@ -422,8 +429,12 @@ def PTC_SIZE() -> int:
 
 
 MAX_PAYLOAD_ATTESTATIONS: Final[int] = 4
-BUILDER_REGISTRY_LIMIT: Final[int] = 2**40
-BUILDER_PENDING_WITHDRAWALS_LIMIT: Final[int] = 2**20
+
+# EIP-8282 (builder deposit/exit requests)
+MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD: Final[int] = 2**8
+MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD: Final[int] = 2**4
+BUILDER_DEPOSIT_REQUEST_TYPE: Final[bytes] = b"\x03"
+BUILDER_EXIT_REQUEST_TYPE: Final[bytes] = b"\x04"
 
 
 def MAX_BUILDERS_PER_WITHDRAWALS_SWEEP() -> int:
@@ -436,6 +447,7 @@ BUILDER_PAYMENT_THRESHOLD_DENOMINATOR: Final[int] = 10
 DOMAIN_BEACON_BUILDER: Final[bytes] = b"\x0b\x00\x00\x00"
 DOMAIN_PTC_ATTESTER: Final[bytes] = b"\x0c\x00\x00\x00"
 DOMAIN_PROPOSER_PREFERENCES: Final[bytes] = b"\x0d\x00\x00\x00"
+DOMAIN_BUILDER_DEPOSIT: Final[bytes] = b"\x0e\x00\x00\x00"
 
 BUILDER_WITHDRAWAL_PREFIX: Final[bytes] = b"\x03"
 

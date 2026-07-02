@@ -173,7 +173,12 @@ def get_indexed_attestation(
     attesting_indices = get_attesting_indices(state, attestation)
 
     # Use fork-appropriate IndexedAttestation type
-    if hasattr(attestation, "committee_bits"):
+    from ...types.gloas import Attestation as GloasAttestation
+
+    if isinstance(attestation, GloasAttestation):
+        # [Modified in Gloas:EIP7688] progressive (unbounded) IndexedAttestation
+        from ...types.gloas import IndexedAttestation
+    elif hasattr(attestation, "committee_bits"):
         # Electra+ attestations have committee_bits, use larger IndexedAttestation
         from ...types.electra import IndexedAttestation
     else:

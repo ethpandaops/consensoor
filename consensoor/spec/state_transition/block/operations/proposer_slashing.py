@@ -73,14 +73,20 @@ def process_proposer_slashing(
     if hasattr(state, "builder_pending_payments"):
         from ....types.gloas import BuilderPendingPayment
 
+        # [Modified in alpha.11+] only clear the payment when the slashed
+        # validator is the proposer it belongs to; an unrelated same-slot
+        # equivocation must not grief an honest proposer's payment.
         slot = int(header_1.slot)
         proposal_epoch = compute_epoch_at_slot(slot)
+        payment_index = None
         if proposal_epoch == get_current_epoch(state):
             payment_index = SLOTS_PER_EPOCH() + slot % SLOTS_PER_EPOCH()
-            state.builder_pending_payments[payment_index] = BuilderPendingPayment()
         elif proposal_epoch == get_previous_epoch(state):
             payment_index = slot % SLOTS_PER_EPOCH()
-            state.builder_pending_payments[payment_index] = BuilderPendingPayment()
+        if payment_index is not None:
+            payment = state.builder_pending_payments[payment_index]
+            if int(payment.proposer_index) == int(header_1.proposer_index):
+                state.builder_pending_payments[payment_index] = BuilderPendingPayment()
 
     # Slash the proposer
     slash_validator(state, proposer_index)

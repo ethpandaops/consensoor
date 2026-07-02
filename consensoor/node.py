@@ -1955,6 +1955,11 @@ class BeaconNode:
                 self._published_prefs_keys.add(dedup_key)
                 # Self-feed so a local builder can match our own proposals
                 self.proposer_preferences[dedup_key] = signed
+                if self.beacon_api:
+                    try:
+                        await self.beacon_api.emit_proposer_preferences(signed)
+                    except Exception as e:
+                        logger.debug(f"proposer_preferences SSE emit failed: {e}")
 
                 try:
                     await self.beacon_gossip.publish_proposer_preferences(
@@ -2231,24 +2236,12 @@ class BeaconNode:
             execution_payload_dict, "gloas"
         )
 
-        # Build execution requests
-        from .spec.types.electra import ExecutionRequests
-        exec_requests_obj = ExecutionRequests()
-        # Parse execution_requests if provided as hex strings
-        if execution_requests:
-            from .spec.types.electra import DepositRequest, WithdrawalRequest, ConsolidationRequest
-            for req_hex in execution_requests:
-                if isinstance(req_hex, str):
-                    req_bytes = bytes.fromhex(req_hex.replace("0x", ""))
-                    if req_bytes and len(req_bytes) > 0:
-                        req_type = req_bytes[0]
-                        req_data = req_bytes[1:]
-                        if req_type == 0x00:
-                            exec_requests_obj.deposits.append(DepositRequest.decode_bytes(req_data))
-                        elif req_type == 0x01:
-                            exec_requests_obj.withdrawals.append(WithdrawalRequest.decode_bytes(req_data))
-                        elif req_type == 0x02:
-                            exec_requests_obj.consolidations.append(ConsolidationRequest.decode_bytes(req_data))
+        # Build execution requests. [Modified in Gloas:EIP7688] use the block
+        # builder's decoder so the envelope carries the Gloas ExecutionRequests
+        # (ProgressiveContainer) and its root matches bid.execution_requests_root.
+        exec_requests_obj = self.block_builder._decode_execution_requests_hex(
+            execution_requests, gloas=True
+        )
 
         # Get KZG commitments from blobs bundle
         kzg_commitments = List[KZGCommitment, MAX_BLOB_COMMITMENTS]()
@@ -3295,55 +3288,80 @@ class BeaconNode:
             return
         try:
             from .spec.types.gloas import SignedProposerPreferences
-            from .spec.state_transition.helpers.beacon_committee import is_valid_proposal_slot
-            from .spec.state_transition.helpers.misc import compute_epoch_at_slot
-            from .spec.state_transition.helpers.domain import get_domain, compute_signing_root
-            from .spec.constants import DOMAIN_PROPOSER_PREFERENCES, MIN_SEED_LOOKAHEAD
-            from .crypto.crypto import verify_async
 
             signed = SignedProposerPreferences.decode_bytes(data)
-            prefs = signed.message
-            proposal_slot = int(prefs.proposal_slot)
-            validator_index = int(prefs.validator_index)
-            dependent_root = bytes(prefs.dependent_root)
-
-            current_slot = self._current_wall_slot()
-            # [IGNORE] proposal_slot has not already passed
-            if proposal_slot <= current_slot:
-                return
-            # [IGNORE] proposal_slot within the proposer lookahead
-            proposal_epoch = compute_epoch_at_slot(proposal_slot)
-            current_epoch = compute_epoch_at_slot(current_slot)
-            if not (current_epoch <= proposal_epoch <= current_epoch + MIN_SEED_LOOKAHEAD):
-                return
-            # [IGNORE] first valid message for the tuple
-            key = (dependent_root, proposal_slot, validator_index)
-            if key in self.proposer_preferences:
-                return
-            # [REJECT] validator is the scheduled proposer for the slot
-            if not is_valid_proposal_slot(self.state, prefs):
+            ok, reason = await self.process_proposer_preferences(signed)
+            if not ok and reason == "reject":
                 self._record_peer_event(from_peer, "gossip_invalid_proposer_preferences")
-                return
-            # [REJECT] signature valid for the validator's pubkey
-            if validator_index >= len(self.state.validators):
-                self._record_peer_event(from_peer, "gossip_invalid_proposer_preferences")
-                return
-            domain = get_domain(self.state, DOMAIN_PROPOSER_PREFERENCES, proposal_epoch)
-            signing_root = compute_signing_root(prefs, domain)
-            pubkey = bytes(self.state.validators[validator_index].pubkey)
-            if not await verify_async(pubkey, signing_root, bytes(signed.signature)):
-                self._record_peer_event(from_peer, "gossip_invalid_proposer_preferences")
-                return
-
-            self.proposer_preferences[key] = signed
-            self._prune_proposer_preferences(current_slot)
-            logger.debug(
-                f"P2P: proposer_preferences vi={validator_index} slot={proposal_slot} "
-                f"fee_recipient=0x{bytes(prefs.fee_recipient).hex()} "
-                f"target_gas_limit={int(prefs.target_gas_limit)} from={from_peer[:16]}"
-            )
+            elif ok:
+                prefs = signed.message
+                logger.debug(
+                    f"P2P: proposer_preferences vi={int(prefs.validator_index)} "
+                    f"slot={int(prefs.proposal_slot)} "
+                    f"fee_recipient=0x{bytes(prefs.fee_recipient).hex()} "
+                    f"target_gas_limit={int(prefs.target_gas_limit)} from={from_peer[:16]}"
+                )
         except Exception as e:
             logger.warning(f"P2P proposer_preferences decode/handle failed: {e}")
+
+    async def process_proposer_preferences(self, signed) -> tuple[bool, str]:
+        """Validate + store a SignedProposerPreferences (gossip or beacon API).
+
+        Validates per gloas/p2p-interface.md against the head state. Returns
+        (accepted, reason); reason is "reject" for [REJECT]-grade failures
+        (peer-scoreable), "ignore" for [IGNORE]-grade ones, and "" on success.
+        On acceptance the object is cached and a `proposer_preferences` SSE
+        event is emitted (beacon-APIs PR #608).
+        """
+        from .spec.state_transition.helpers.beacon_committee import is_valid_proposal_slot
+        from .spec.state_transition.helpers.misc import compute_epoch_at_slot
+        from .spec.state_transition.helpers.domain import get_domain, compute_signing_root
+        from .spec.constants import DOMAIN_PROPOSER_PREFERENCES, MIN_SEED_LOOKAHEAD
+        from .crypto.crypto import verify_async
+
+        if self.state is None or not hasattr(self.state, "proposer_lookahead"):
+            return False, "ignore"
+
+        prefs = signed.message
+        proposal_slot = int(prefs.proposal_slot)
+        validator_index = int(prefs.validator_index)
+        dependent_root = bytes(prefs.dependent_root)
+
+        current_slot = self._current_wall_slot()
+        # [IGNORE] proposal_slot has not already passed
+        if proposal_slot <= current_slot:
+            return False, "ignore"
+        # [IGNORE] proposal_slot within the proposer lookahead
+        proposal_epoch = compute_epoch_at_slot(proposal_slot)
+        current_epoch = compute_epoch_at_slot(current_slot)
+        if not (current_epoch <= proposal_epoch <= current_epoch + MIN_SEED_LOOKAHEAD):
+            return False, "ignore"
+        # [IGNORE] first valid message for the tuple
+        key = (dependent_root, proposal_slot, validator_index)
+        if key in self.proposer_preferences:
+            return False, "ignore"
+        # [REJECT] validator is the scheduled proposer for the slot
+        if not is_valid_proposal_slot(self.state, prefs):
+            return False, "reject"
+        # [REJECT] signature valid for the validator's pubkey
+        if validator_index >= len(self.state.validators):
+            return False, "reject"
+        domain = get_domain(self.state, DOMAIN_PROPOSER_PREFERENCES, proposal_epoch)
+        signing_root = compute_signing_root(prefs, domain)
+        pubkey = bytes(self.state.validators[validator_index].pubkey)
+        if not await verify_async(pubkey, signing_root, bytes(signed.signature)):
+            return False, "reject"
+
+        self.proposer_preferences[key] = signed
+        self._prune_proposer_preferences(current_slot)
+
+        if self.beacon_api:
+            try:
+                await self.beacon_api.emit_proposer_preferences(signed)
+            except Exception as e:
+                logger.debug(f"proposer_preferences SSE emit failed: {e}")
+
+        return True, ""
 
     def _prune_proposer_preferences(self, current_slot: int) -> None:
         """Drop preferences (and publish dedup keys) for slots already passed."""

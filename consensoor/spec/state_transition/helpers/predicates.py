@@ -186,6 +186,14 @@ def is_valid_indexed_attestation(
     if len(indices) == 0:
         logger.warning("IndexedAttestation validation failed: no indices")
         return False
+    # [New in Gloas:EIP7688] attesting_indices is an unbounded ProgressiveList;
+    # enforce the former SSZ bound here. (No-op for pre-Gloas bounded types.)
+    from ...constants import MAX_VALIDATORS_PER_COMMITTEE, MAX_COMMITTEES_PER_SLOT
+    if len(indices) > MAX_VALIDATORS_PER_COMMITTEE() * MAX_COMMITTEES_PER_SLOT():
+        logger.warning(
+            f"IndexedAttestation validation failed: too many indices ({len(indices)})"
+        )
+        return False
     if indices != sorted(set(indices)):
         logger.warning(f"IndexedAttestation validation failed: indices not sorted/unique: {indices[:10]}...")
         return False

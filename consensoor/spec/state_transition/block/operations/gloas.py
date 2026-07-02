@@ -86,6 +86,7 @@ def process_execution_payload_bid(state: "BeaconState", bid_source) -> None:
     if amount > 0:
         from ....types.gloas import BuilderPendingPayment, BuilderPendingWithdrawal
         from ....constants import SLOTS_PER_EPOCH
+        from ...helpers.beacon_committee import get_beacon_proposer_index
 
         pending_payment = BuilderPendingPayment(
             weight=0,
@@ -94,6 +95,8 @@ def process_execution_payload_bid(state: "BeaconState", bid_source) -> None:
                 amount=amount,
                 builder_index=bid.builder_index,
             ),
+            # [New in alpha.11+] attribute the payment to the proposer
+            proposer_index=get_beacon_proposer_index(state),
         )
         state.builder_pending_payments[
             SLOTS_PER_EPOCH() + int(bid.slot) % SLOTS_PER_EPOCH()
@@ -118,15 +121,33 @@ def settle_builder_payment(state: "BeaconState", payment_index: int) -> None:
 
 def apply_parent_execution_payload(state: "BeaconState", requests) -> None:
     """Apply the parent block's execution payload (Gloas EIP-7732)."""
-    from ....constants import SLOTS_PER_EPOCH, SLOTS_PER_HISTORICAL_ROOT
+    from ....constants import (
+        SLOTS_PER_EPOCH,
+        SLOTS_PER_HISTORICAL_ROOT,
+        MAX_DEPOSIT_REQUESTS_PER_PAYLOAD,
+        MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD,
+        MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD,
+        MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD,
+        MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD,
+    )
     from ....types.gloas import BuilderPendingWithdrawal
     from .deposit_request import process_deposit_request
     from .withdrawal_request import process_withdrawal_request
     from .consolidation_request import process_consolidation_request
+    from .builder_request import process_builder_deposit_request, process_builder_exit_request
 
     parent_bid = state.latest_execution_payload_bid
     parent_slot = int(parent_bid.slot)
     parent_epoch = compute_epoch_at_slot(parent_slot)
+
+    # [New in Gloas:EIP7688] request lists are unbounded SSZ ProgressiveLists;
+    # the per-payload limits are enforced here instead of by the type.
+    assert len(requests.deposits) <= MAX_DEPOSIT_REQUESTS_PER_PAYLOAD
+    assert len(requests.withdrawals) <= MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD
+    assert len(requests.consolidations) <= MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD
+    # [New in Gloas:EIP8282]
+    assert len(requests.builder_deposits) <= MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD
+    assert len(requests.builder_exits) <= MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD
 
     for op in requests.deposits:
         process_deposit_request(state, op)
@@ -134,6 +155,11 @@ def apply_parent_execution_payload(state: "BeaconState", requests) -> None:
         process_withdrawal_request(state, op)
     for op in requests.consolidations:
         process_consolidation_request(state, op)
+    # [New in Gloas:EIP8282]
+    for op in requests.builder_deposits:
+        process_builder_deposit_request(state, op)
+    for op in requests.builder_exits:
+        process_builder_exit_request(state, op)
 
     current_epoch = get_current_epoch(state)
     previous_epoch = current_epoch - 1 if current_epoch > 0 else 0
@@ -166,7 +192,8 @@ def process_parent_execution_payload(state: "BeaconState", block) -> None:
     """
     from .....crypto import hash_tree_root
     from ....constants import SLOTS_PER_HISTORICAL_ROOT
-    from ....types.electra import ExecutionRequests
+    # [Modified in Gloas:EIP7688] Gloas ExecutionRequests (ProgressiveContainer)
+    from ....types.gloas import ExecutionRequests
 
     bid = block.body.signed_execution_payload_bid.message
     parent_bid = state.latest_execution_payload_bid

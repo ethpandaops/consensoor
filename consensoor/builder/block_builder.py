@@ -595,14 +595,23 @@ class BlockBuilder:
         return ElectraBeaconBlockBody(**base_fields)
 
     @staticmethod
-    def _decode_execution_requests_hex(execution_requests: list | None) -> ExecutionRequests:
+    def _decode_execution_requests_hex(
+        execution_requests: list | None, gloas: bool = False
+    ) -> ExecutionRequests:
         """Turn the EL's EIP-7685 hex-string list into an SSZ ExecutionRequests.
 
         Per EIP-7685, each entry is `<type_byte><concatenated SSZ records>`:
             type 0x00 → DepositRequest (192 bytes each)
             type 0x01 → WithdrawalRequest (76 bytes each)
             type 0x02 → ConsolidationRequest (116 bytes each)
+            type 0x03 → BuilderDepositRequest (184 bytes each, Gloas EIP-8282)
+            type 0x04 → BuilderExitRequest (68 bytes each, Gloas EIP-8282)
         Multiple records of the same type are packed into a single entry.
+
+        With ``gloas=True`` the Gloas ExecutionRequests (EIP-7688
+        ProgressiveContainer with EIP-8282 builder request fields) is
+        returned; hash_tree_root differs from the Electra type, so callers
+        MUST pass the flag matching the fork they are building for.
         """
         from ..spec.types.electra import (
             DepositRequest,
@@ -613,10 +622,25 @@ class BlockBuilder:
         DEPOSIT_SIZE = 48 + 32 + 8 + 96 + 8       # 192
         WITHDRAWAL_SIZE = 20 + 48 + 8             # 76
         CONSOLIDATION_SIZE = 20 + 48 + 48         # 116
+        BUILDER_DEPOSIT_SIZE = 48 + 32 + 8 + 96   # 184
+        BUILDER_EXIT_SIZE = 20 + 48               # 68
 
         deposits: list = []
         withdrawals: list = []
         consolidations: list = []
+        builder_deposits: list = []
+        builder_exits: list = []
+
+        decoders = {
+            0x00: (DEPOSIT_SIZE, DepositRequest, deposits),
+            0x01: (WITHDRAWAL_SIZE, WithdrawalRequest, withdrawals),
+            0x02: (CONSOLIDATION_SIZE, ConsolidationRequest, consolidations),
+        }
+        if gloas:
+            from ..spec.types.gloas import BuilderDepositRequest, BuilderExitRequest
+
+            decoders[0x03] = (BUILDER_DEPOSIT_SIZE, BuilderDepositRequest, builder_deposits)
+            decoders[0x04] = (BUILDER_EXIT_SIZE, BuilderExitRequest, builder_exits)
 
         for entry in execution_requests or []:
             if not isinstance(entry, str):
@@ -626,21 +650,10 @@ class BlockBuilder:
                 continue
             type_byte = data[0]
             body = data[1:]
-            if type_byte == 0x00:
-                size = DEPOSIT_SIZE
-                cls = DepositRequest
-                target = deposits
-            elif type_byte == 0x01:
-                size = WITHDRAWAL_SIZE
-                cls = WithdrawalRequest
-                target = withdrawals
-            elif type_byte == 0x02:
-                size = CONSOLIDATION_SIZE
-                cls = ConsolidationRequest
-                target = consolidations
-            else:
+            if type_byte not in decoders:
                 logger.warning(f"Unknown execution_request type 0x{type_byte:02x}; skipping")
                 continue
+            size, cls, target = decoders[type_byte]
             if len(body) % size != 0:
                 logger.error(
                     f"execution_request type 0x{type_byte:02x} body length "
@@ -649,6 +662,17 @@ class BlockBuilder:
                 continue
             for i in range(0, len(body), size):
                 target.append(cls.decode_bytes(body[i:i + size]))
+
+        if gloas:
+            from ..spec.types.gloas import ExecutionRequests as GloasExecutionRequests
+
+            return GloasExecutionRequests(
+                deposits=deposits,
+                withdrawals=withdrawals,
+                consolidations=consolidations,
+                builder_deposits=builder_deposits,
+                builder_exits=builder_exits,
+            )
 
         return ExecutionRequests(
             deposits=deposits,
@@ -788,7 +812,7 @@ class BlockBuilder:
         # entry like 0x00<dep1_192><dep2_192> must produce two DepositRequests.
         # The previous one-record-per-type decode silently dropped extras
         # and produced a wrong bid root for any block with >1 deposit.
-        exec_requests_obj = self._decode_execution_requests_hex(execution_requests)
+        exec_requests_obj = self._decode_execution_requests_hex(execution_requests, gloas=True)
         execution_requests_root = hash_tree_root(exec_requests_obj)
 
         bid = ExecutionPayloadBid(
@@ -869,13 +893,19 @@ class BlockBuilder:
             logger.warning(f"PTC aggregate fetch failed: {e}")
             payload_attestations = []
 
+        # [New in Gloas:EIP7688] pool attestations are Electra-typed; upgrade
+        # them so they merkleize as Gloas Attestations (ProgressiveBitlist).
+        from ..spec.state_transition.fork_upgrade import upgrade_attestation_to_gloas
+
+        gloas_attestations = [upgrade_attestation_to_gloas(a) for a in (attestations or [])]
+
         return GloasBeaconBlockBody(
             randao_reveal=randao_reveal,
             eth1_data=state.eth1_data,
             graffiti=Bytes32(self.node.config.graffiti_bytes),
             proposer_slashings=[],
             attester_slashings=[],
-            attestations=attestations or [],
+            attestations=gloas_attestations,
             deposits=[],
             voluntary_exits=[],
             sync_aggregate=sync_aggregate,

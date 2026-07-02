@@ -162,8 +162,10 @@ def build_spec_response() -> dict:
         # Gloas (ePBS)
         "PTC_SIZE": str(constants.PTC_SIZE()),
         "MAX_PAYLOAD_ATTESTATIONS": str(constants.MAX_PAYLOAD_ATTESTATIONS),
-        "BUILDER_REGISTRY_LIMIT": str(constants.BUILDER_REGISTRY_LIMIT),
-        "BUILDER_PENDING_WITHDRAWALS_LIMIT": str(constants.BUILDER_PENDING_WITHDRAWALS_LIMIT),
+        # [Removed in Gloas:EIP7688] BUILDER_REGISTRY_LIMIT and
+        # BUILDER_PENDING_WITHDRAWALS_LIMIT no longer exist (progressive lists)
+        "MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD": str(constants.MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD),
+        "MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD": str(constants.MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD),
         "MAX_BUILDERS_PER_WITHDRAWALS_SWEEP": str(constants.MAX_BUILDERS_PER_WITHDRAWALS_SWEEP()),
         "MIN_BUILDER_WITHDRAWABILITY_DELAY": str(net_config.min_builder_withdrawability_delay),
         "CHURN_LIMIT_QUOTIENT_GLOAS": str(net_config.churn_limit_quotient_gloas),
@@ -172,6 +174,7 @@ def build_spec_response() -> dict:
         "DOMAIN_BEACON_BUILDER": "0x" + constants.DOMAIN_BEACON_BUILDER.hex(),
         "DOMAIN_PTC_ATTESTER": "0x" + constants.DOMAIN_PTC_ATTESTER.hex(),
         "DOMAIN_PROPOSER_PREFERENCES": "0x" + constants.DOMAIN_PROPOSER_PREFERENCES.hex(),
+        "DOMAIN_BUILDER_DEPOSIT": "0x" + constants.DOMAIN_BUILDER_DEPOSIT.hex(),
         # Networking constants
         "MAX_PAYLOAD_SIZE": str(net_config.max_payload_size),
         "MAX_REQUEST_BLOCKS": str(net_config.max_request_blocks),

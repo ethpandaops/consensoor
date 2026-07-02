@@ -222,15 +222,26 @@ def get_ssz_type_by_name(fork: str, type_name: str) -> Optional[Type]:
         from consensoor.spec.types.gloas import DataColumnSidecar as GloasDataColumnSidecar
         return GloasDataColumnSidecar
 
-    # Gloas-specific overrides for types that exist in multiple forks
+    # Gloas-specific overrides for types that exist in multiple forks.
+    # [Modified in Gloas:EIP7688] Attestation/IndexedAttestation/
+    # AttesterSlashing/ExecutionRequests and the aggregate wrappers get
+    # Gloas-local progressive definitions.
     if fork == "gloas":
         gloas_only_types = {
-            "ExecutionPayload": "ExecutionPayload",
-            "PartialDataColumnSidecar": "PartialDataColumnSidecar",
+            "ExecutionPayload",
+            "PartialDataColumnSidecar",
+            "Attestation",
+            "IndexedAttestation",
+            "AttesterSlashing",
+            "AggregateAndProof",
+            "SignedAggregateAndProof",
+            "ExecutionRequests",
+            "BuilderDepositRequest",
+            "BuilderExitRequest",
         }
         if type_name in gloas_only_types:
             from consensoor.spec.types import gloas as gloas_mod
-            return getattr(gloas_mod, gloas_only_types[type_name], None)
+            return getattr(gloas_mod, type_name, None)
 
     if hasattr(types, type_name):
         t = getattr(types, type_name)
@@ -250,9 +261,21 @@ def get_operation_type_for_test(fork: str, op_name: str) -> Optional[Type]:
 
     pre_electra_forks = {"phase0", "altair", "bellatrix", "capella", "deneb"}
 
+    if fork == "gloas":
+        # [Modified in Gloas:EIP7688] progressive attestation types
+        from consensoor.spec.types import gloas as gloas_mod
+        attestation_type = gloas_mod.Attestation
+        attester_slashing_type = gloas_mod.AttesterSlashing
+    elif fork in pre_electra_forks:
+        attestation_type = types.Phase0Attestation
+        attester_slashing_type = types.Phase0AttesterSlashing
+    else:
+        attestation_type = types.Attestation
+        attester_slashing_type = types.AttesterSlashing
+
     op_type_map = {
-        "attestation": types.Phase0Attestation if fork in pre_electra_forks else types.Attestation,
-        "attester_slashing": types.Phase0AttesterSlashing if fork in pre_electra_forks else types.AttesterSlashing,
+        "attestation": attestation_type,
+        "attester_slashing": attester_slashing_type,
         "proposer_slashing": types.ProposerSlashing,
         "deposit": types.Deposit,
         "voluntary_exit": types.SignedVoluntaryExit,

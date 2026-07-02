@@ -27,6 +27,7 @@ from .encoding import (
     SYNC_COMMITTEE_SUBNET_TOPIC_PREFIX,
     BLOB_SIDECAR_TOPIC_PREFIX,
     EXECUTION_PAYLOAD_TOPIC,
+    EXECUTION_PAYLOAD_BID_TOPIC,
     PAYLOAD_ATTESTATION_MESSAGE_TOPIC,
     PROPOSER_PREFERENCES_TOPIC,
 )
@@ -308,6 +309,13 @@ class BeaconGossip:
         encoded = encode_message(payload_ssz)
         await self._host.publish(topic, encoded)
         logger.info(f"Published execution payload envelope: {len(payload_ssz)} bytes (topic={topic})")
+
+    async def publish_execution_payload_bid(self, bid_ssz: bytes) -> None:
+        """Publish a SignedExecutionPayloadBid (GLOAS/ePBS builder bid)."""
+        topic = get_topic_name(EXECUTION_PAYLOAD_BID_TOPIC, self.fork_digest)
+        encoded = encode_message(bid_ssz)
+        await self._host.publish(topic, encoded)
+        logger.info(f"Published execution payload bid: {len(bid_ssz)} bytes (topic={topic})")
 
     def set_status_provider(self, provider: Callable[[], dict]) -> None:
         """Set the status provider callback for P2P status messages.

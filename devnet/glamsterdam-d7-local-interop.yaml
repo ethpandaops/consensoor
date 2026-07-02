@@ -1,0 +1,45 @@
+# Local gloas interop: consensoor:local vs teku + nimbus (devnet-7 images,
+# consensus-specs v1.7.0-alpha.12 + EIP-7688/PR#4630 progressive containers).
+# Minimal preset, gloas at epoch 1.
+# Run from the ethereum-package checkout:
+#   kurtosis run . --args-file /Users/bbusa/Ethereum/consensoor/devnet/glamsterdam-d7-local-interop.yaml --enclave d7
+participants_matrix:
+  el:
+    - el_type: ethrex
+      el_image: ethpandaops/ethrex:glamsterdam-devnet-7
+
+  cl:
+    - cl_type: teku
+      cl_image: ethpandaops/teku:glamsterdam-devnet-7
+    - cl_type: nimbus
+      cl_image: ethpandaops/nimbus-eth2:glamsterdam-devnet-7-minimal
+    - cl_type: consensoor
+      cl_image: consensoor:local
+    # - cl_type: lighthouse
+    #   cl_image: ethpandaops/lighthouse:glamsterdam-devnet-7
+  # count multiplies every el×cl combination; 1 → one node per CL type
+  count: 1
+global_log_level: debug
+network_params:
+  preset: minimal
+  gloas_fork_epoch: 1
+  genesis_gaslimit: 300000000
+  gas_limit: 300000000
+  num_validator_keys_per_node: 2000
+
+# Slim local run: interop verification only. Add spamoor/assertoor/otel/
+# buildoor back (see notes.ethereum.org/@ethpandaops/glamsterdam-devnet-7
+# example) when running the full builder test alongside.
+additional_services:
+  - dora
+
+ethereum_genesis_generator_params:
+  image: ethpandaops/ethereum-genesis-generator:glamsterdam-devnet-7
+
+port_publisher:
+  cl:
+    enabled: true
+  el:
+    enabled: true
+  additional_services:
+    enabled: true

@@ -1,25 +1,31 @@
 """Gloas SSZ types (ePBS - Enshrined Proposer-Builder Separation).
 
-Updated for v1.7.0-alpha.10.
+Updated for consensus-specs master + PR #4630 (EIP-7688: forward compatible
+consensus data structures). Gloas containers use ProgressiveContainer
+(EIP-7495) and unbounded ProgressiveList/ProgressiveBitlist/ProgressiveByteList
+(EIP-7916) instead of bounded List/Bitlist. Per-block limits formerly enforced
+by SSZ bounds are now asserted in the state transition (process_operations et
+al.).
 """
 
 from .base import (
     Container, Vector, List,
     Bitvector, Bitlist,
+    ProgressiveContainer, ProgressiveList, ProgressiveBitlist, ProgressiveByteList,
     uint8, uint64, uint256, boolean,
     Bytes32, ByteVector, ByteList, BLSPubkey, BLSSignature,
     Slot, Epoch, ValidatorIndex, Gwei, Root, Hash32, ExecutionAddress,
-    ParticipationFlags, KZGCommitment, KZGProof, Transaction, WithdrawalIndex,
+    ParticipationFlags, KZGCommitment, KZGProof, WithdrawalIndex,
 )
 from .phase0 import (
-    Validator, Eth1Data, BeaconBlockHeader,
+    Validator, Eth1Data, BeaconBlockHeader, AttestationData,
     ProposerSlashing, Deposit, SignedVoluntaryExit,
 )
 from .altair import SyncCommittee, SyncAggregate
 from .capella import Withdrawal, SignedBLSToExecutionChange, HistoricalSummary
 from .electra import (
-    Attestation, AttesterSlashing, ExecutionRequests,
     PendingDeposit, PendingPartialWithdrawal, PendingConsolidation,
+    DepositRequest, WithdrawalRequest, ConsolidationRequest,
 )
 from .fulu import proposer_lookahead_length, Cell
 from ..constants import (
@@ -29,38 +35,31 @@ from ..constants import (
     EPOCHS_PER_SLASHINGS_VECTOR,
     EPOCHS_PER_ETH1_VOTING_PERIOD,
     HISTORICAL_ROOTS_LIMIT,
-    VALIDATOR_REGISTRY_LIMIT,
     JUSTIFICATION_BITS_LENGTH,
-    MAX_PROPOSER_SLASHINGS,
-    MAX_ATTESTER_SLASHINGS_ELECTRA,
-    MAX_ATTESTATIONS_ELECTRA,
-    MAX_DEPOSITS,
-    MAX_VOLUNTARY_EXITS,
-    MAX_BLS_TO_EXECUTION_CHANGES,
     MAX_BLOB_COMMITMENTS_PER_BLOCK,
-    MAX_WITHDRAWALS_PER_PAYLOAD,
-    MAX_TRANSACTIONS_PER_PAYLOAD,
-    MAX_BYTES_PER_TRANSACTION,
+    MAX_COMMITTEES_PER_SLOT,
     MAX_EXTRA_DATA_BYTES,
     BYTES_PER_LOGS_BLOOM,
-    PENDING_DEPOSITS_LIMIT,
-    PENDING_PARTIAL_WITHDRAWALS_LIMIT,
-    PENDING_CONSOLIDATIONS_LIMIT,
     PTC_SIZE,
-    MAX_PAYLOAD_ATTESTATIONS,
-    BUILDER_REGISTRY_LIMIT,
-    BUILDER_PENDING_WITHDRAWALS_LIMIT,
     MIN_SEED_LOOKAHEAD,
     EXECUTION_BLOCK_HASH_DEPTH_GLOAS,
-    FINALIZED_ROOT_DEPTH_ELECTRA,
-    CURRENT_SYNC_COMMITTEE_DEPTH_ELECTRA,
-    NEXT_SYNC_COMMITTEE_DEPTH_ELECTRA,
+    FINALIZED_ROOT_DEPTH_GLOAS,
+    CURRENT_SYNC_COMMITTEE_DEPTH_GLOAS,
+    NEXT_SYNC_COMMITTEE_DEPTH_GLOAS,
 )
 from .base import Checkpoint, Fork
 
 # Gloas-specific type aliases
 BuilderIndex = uint64
 PayloadStatus = uint8
+
+# [Modified in Gloas:EIP7688] progressive (unbounded) collection aliases
+AggregationBits = ProgressiveBitlist
+AttestingIndices = ProgressiveList[ValidatorIndex]
+Transaction = ProgressiveByteList
+DepositRequests = ProgressiveList[DepositRequest]
+WithdrawalRequests = ProgressiveList[WithdrawalRequest]
+ConsolidationRequests = ProgressiveList[ConsolidationRequest]
 
 
 class ForkChoiceNode(Container):
@@ -71,16 +70,18 @@ class ForkChoiceNode(Container):
 class DataColumnSidecar(Container):
     """Gloas DataColumnSidecar - simplified compared to Fulu."""
     index: uint64
-    column: List[Cell, MAX_BLOB_COMMITMENTS_PER_BLOCK]
-    kzg_proofs: List[KZGProof, MAX_BLOB_COMMITMENTS_PER_BLOCK]
+    # [Modified in Gloas:EIP7688]
+    column: ProgressiveList[Cell]
+    kzg_proofs: ProgressiveList[KZGProof]
     slot: Slot
     beacon_block_root: Root
 
 
 class PartialDataColumnSidecar(Container):
-    cells_present_bitmap: Bitlist[MAX_BLOB_COMMITMENTS_PER_BLOCK]
-    partial_column: List[Cell, MAX_BLOB_COMMITMENTS_PER_BLOCK]
-    kzg_proofs: List[KZGProof, MAX_BLOB_COMMITMENTS_PER_BLOCK]
+    # [Modified in Gloas:EIP7688]
+    cells_present_bitmap: ProgressiveBitlist
+    partial_column: ProgressiveList[Cell]
+    kzg_proofs: ProgressiveList[KZGProof]
 
 
 class PartialDataColumnPartsMetadata(Container):
@@ -111,6 +112,9 @@ class BuilderPendingWithdrawal(Container):
 class BuilderPendingPayment(Container):
     weight: Gwei
     withdrawal: BuilderPendingWithdrawal
+    # [New in alpha.11+] lets process_proposer_slashing drop only payments
+    # belonging to the slashed proposer
+    proposer_index: ValidatorIndex
 
 
 class PayloadAttestationData(Container):
@@ -120,7 +124,7 @@ class PayloadAttestationData(Container):
     blob_data_available: boolean
 
 
-class PayloadAttestation(Container):
+class PayloadAttestation(ProgressiveContainer(active_fields=[1] * 3)):
     aggregation_bits: Bitvector[PTC_SIZE()]
     data: PayloadAttestationData
     signature: BLSSignature
@@ -132,18 +136,77 @@ class PayloadAttestationMessage(Container):
     signature: BLSSignature
 
 
-class IndexedPayloadAttestation(Container):
+class IndexedPayloadAttestation(ProgressiveContainer(active_fields=[1] * 3)):
     attesting_indices: List[ValidatorIndex, PTC_SIZE()]
     data: PayloadAttestationData
     signature: BLSSignature
 
 
-class BlockAccessList(ByteList[MAX_BYTES_PER_TRANSACTION]):
-    """Block access list bytes (EIP-7928, new in Gloas)."""
-    pass
+# Block access list bytes (EIP-7928). [Modified in Gloas:EIP7688] unbounded.
+BlockAccessList = ProgressiveByteList
 
 
-class ExecutionPayload(Container):
+class BuilderDepositRequest(Container):
+    """Builder deposit request (EIP-8282, new in Gloas)."""
+    pubkey: BLSPubkey
+    withdrawal_credentials: Bytes32
+    amount: Gwei
+    signature: BLSSignature
+
+
+class BuilderExitRequest(Container):
+    """Builder exit request (EIP-8282, new in Gloas)."""
+    source_address: ExecutionAddress
+    pubkey: BLSPubkey
+
+
+BuilderDepositRequests = ProgressiveList[BuilderDepositRequest]
+BuilderExitRequests = ProgressiveList[BuilderExitRequest]
+
+
+# [Modified in Gloas:EIP7688]
+class ExecutionRequests(ProgressiveContainer(active_fields=[1] * 5)):
+    deposits: DepositRequests
+    withdrawals: WithdrawalRequests
+    consolidations: ConsolidationRequests
+    # [New in Gloas:EIP8282]
+    builder_deposits: BuilderDepositRequests
+    builder_exits: BuilderExitRequests
+
+
+# [Modified in Gloas:EIP7688]
+class Attestation(ProgressiveContainer(active_fields=[1] * 4)):
+    aggregation_bits: AggregationBits
+    data: AttestationData
+    signature: BLSSignature
+    committee_bits: Bitvector[MAX_COMMITTEES_PER_SLOT()]
+
+
+# [Modified in Gloas:EIP7688]
+class IndexedAttestation(ProgressiveContainer(active_fields=[1] * 3)):
+    attesting_indices: AttestingIndices
+    data: AttestationData
+    signature: BLSSignature
+
+
+class AttesterSlashing(Container):
+    attestation_1: IndexedAttestation
+    attestation_2: IndexedAttestation
+
+
+class AggregateAndProof(Container):
+    aggregator_index: ValidatorIndex
+    aggregate: Attestation
+    selection_proof: BLSSignature
+
+
+class SignedAggregateAndProof(Container):
+    message: AggregateAndProof
+    signature: BLSSignature
+
+
+# [Modified in Gloas:EIP7688]
+class ExecutionPayload(ProgressiveContainer(active_fields=[1] * 19)):
     """Gloas ExecutionPayload - adds block_access_list (EIP-7928) and slot_number (EIP-7843)."""
     parent_hash: Hash32
     fee_recipient: ExecutionAddress
@@ -158,15 +221,16 @@ class ExecutionPayload(Container):
     extra_data: List[uint8, MAX_EXTRA_DATA_BYTES]
     base_fee_per_gas: uint256
     block_hash: Hash32
-    transactions: List[Transaction, MAX_TRANSACTIONS_PER_PAYLOAD]
-    withdrawals: List[Withdrawal, MAX_WITHDRAWALS_PER_PAYLOAD()]
+    # [Modified in Gloas:EIP7688]
+    transactions: ProgressiveList[Transaction]
+    withdrawals: ProgressiveList[Withdrawal]
     blob_gas_used: uint64
     excess_blob_gas: uint64
     block_access_list: BlockAccessList
     slot_number: uint64
 
 
-class ExecutionPayloadBid(Container):
+class ExecutionPayloadBid(ProgressiveContainer(active_fields=[1] * 12)):
     parent_block_hash: Hash32
     parent_block_root: Root
     block_hash: Hash32
@@ -177,7 +241,8 @@ class ExecutionPayloadBid(Container):
     slot: Slot
     value: Gwei
     execution_payment: Gwei
-    blob_kzg_commitments: List[KZGCommitment, MAX_BLOB_COMMITMENTS_PER_BLOCK]
+    # [Modified in Gloas:EIP7688]
+    blob_kzg_commitments: ProgressiveList[KZGCommitment]
     execution_requests_root: Root
 
 
@@ -186,7 +251,7 @@ class SignedExecutionPayloadBid(Container):
     signature: BLSSignature
 
 
-class ExecutionPayloadEnvelope(Container):
+class ExecutionPayloadEnvelope(ProgressiveContainer(active_fields=[1] * 5)):
     payload: ExecutionPayload
     execution_requests: ExecutionRequests
     builder_index: BuilderIndex
@@ -214,20 +279,21 @@ class SignedProposerPreferences(Container):
     signature: BLSSignature
 
 
-class BeaconBlockBody(Container):
+# [Modified in Gloas:EIP7688]
+class BeaconBlockBody(ProgressiveContainer(active_fields=[1] * 13)):
     """Gloas BeaconBlockBody (ePBS)."""
     randao_reveal: BLSSignature
     eth1_data: Eth1Data
     graffiti: Bytes32
-    proposer_slashings: List[ProposerSlashing, MAX_PROPOSER_SLASHINGS]
-    attester_slashings: List[AttesterSlashing, MAX_ATTESTER_SLASHINGS_ELECTRA]
-    attestations: List[Attestation, MAX_ATTESTATIONS_ELECTRA()]
-    deposits: List[Deposit, MAX_DEPOSITS]
-    voluntary_exits: List[SignedVoluntaryExit, MAX_VOLUNTARY_EXITS]
+    proposer_slashings: ProgressiveList[ProposerSlashing]
+    attester_slashings: ProgressiveList[AttesterSlashing]
+    attestations: ProgressiveList[Attestation]
+    deposits: ProgressiveList[Deposit]
+    voluntary_exits: ProgressiveList[SignedVoluntaryExit]
     sync_aggregate: SyncAggregate
-    bls_to_execution_changes: List[SignedBLSToExecutionChange, MAX_BLS_TO_EXECUTION_CHANGES]
+    bls_to_execution_changes: ProgressiveList[SignedBLSToExecutionChange]
     signed_execution_payload_bid: SignedExecutionPayloadBid
-    payload_attestations: List[PayloadAttestation, MAX_PAYLOAD_ATTESTATIONS]
+    payload_attestations: ProgressiveList[PayloadAttestation]
     parent_execution_requests: ExecutionRequests
 
 
@@ -244,10 +310,12 @@ class SignedBeaconBlock(Container):
     signature: BLSSignature
 
 
-class BeaconState(Container):
+# [Modified in Gloas:EIP7688]
+class BeaconState(ProgressiveContainer(active_fields=[1] * 46)):
     """Gloas BeaconState (ePBS).
 
-    Field order matches v1.7.0-alpha.10 exactly. Critical for SSZ correctness.
+    Field order matches consensus-specs master + PR #4630 (EIP-7688) exactly.
+    Critical for SSZ correctness.
     """
     genesis_time: uint64
     genesis_validators_root: Root
@@ -260,17 +328,20 @@ class BeaconState(Container):
     eth1_data: Eth1Data
     eth1_data_votes: List[Eth1Data, EPOCHS_PER_ETH1_VOTING_PERIOD() * SLOTS_PER_EPOCH()]
     eth1_deposit_index: uint64
-    validators: List[Validator, VALIDATOR_REGISTRY_LIMIT]
-    balances: List[Gwei, VALIDATOR_REGISTRY_LIMIT]
+    # [Modified in Gloas:EIP7688]
+    validators: ProgressiveList[Validator]
+    balances: ProgressiveList[Gwei]
     randao_mixes: Vector[Bytes32, EPOCHS_PER_HISTORICAL_VECTOR()]
     slashings: Vector[Gwei, EPOCHS_PER_SLASHINGS_VECTOR()]
-    previous_epoch_participation: List[ParticipationFlags, VALIDATOR_REGISTRY_LIMIT]
-    current_epoch_participation: List[ParticipationFlags, VALIDATOR_REGISTRY_LIMIT]
+    # [Modified in Gloas:EIP7688]
+    previous_epoch_participation: ProgressiveList[ParticipationFlags]
+    current_epoch_participation: ProgressiveList[ParticipationFlags]
     justification_bits: Bitvector[JUSTIFICATION_BITS_LENGTH]
     previous_justified_checkpoint: Checkpoint
     current_justified_checkpoint: Checkpoint
     finalized_checkpoint: Checkpoint
-    inactivity_scores: List[uint64, VALIDATOR_REGISTRY_LIMIT]
+    # [Modified in Gloas:EIP7688]
+    inactivity_scores: ProgressiveList[uint64]
     current_sync_committee: SyncCommittee
     next_sync_committee: SyncCommittee
     # [New in Gloas:EIP7732] Replaces latest_execution_payload_header
@@ -284,18 +355,19 @@ class BeaconState(Container):
     earliest_exit_epoch: Epoch
     consolidation_balance_to_consume: Gwei
     earliest_consolidation_epoch: Epoch
-    pending_deposits: List[PendingDeposit, PENDING_DEPOSITS_LIMIT()]
-    pending_partial_withdrawals: List[PendingPartialWithdrawal, PENDING_PARTIAL_WITHDRAWALS_LIMIT()]
-    pending_consolidations: List[PendingConsolidation, PENDING_CONSOLIDATIONS_LIMIT()]
+    # [Modified in Gloas:EIP7688]
+    pending_deposits: ProgressiveList[PendingDeposit]
+    pending_partial_withdrawals: ProgressiveList[PendingPartialWithdrawal]
+    pending_consolidations: ProgressiveList[PendingConsolidation]
     proposer_lookahead: Vector[ValidatorIndex, proposer_lookahead_length()]
     # [New in Gloas:EIP7732] ePBS additions follow
-    builders: List[Builder, BUILDER_REGISTRY_LIMIT]
+    builders: ProgressiveList[Builder]
     next_withdrawal_builder_index: BuilderIndex
     execution_payload_availability: Bitvector[SLOTS_PER_HISTORICAL_ROOT()]
     builder_pending_payments: Vector[BuilderPendingPayment, 2 * SLOTS_PER_EPOCH()]
-    builder_pending_withdrawals: List[BuilderPendingWithdrawal, BUILDER_PENDING_WITHDRAWALS_LIMIT]
+    builder_pending_withdrawals: ProgressiveList[BuilderPendingWithdrawal]
     latest_execution_payload_bid: ExecutionPayloadBid
-    payload_expected_withdrawals: List[Withdrawal, MAX_WITHDRAWALS_PER_PAYLOAD()]
+    payload_expected_withdrawals: ProgressiveList[Withdrawal]
     # [New in Gloas:EIP7732] PTC window
     ptc_window: Vector[Vector[ValidatorIndex, PTC_SIZE()], (2 + MIN_SEED_LOOKAHEAD) * SLOTS_PER_EPOCH()]
 
@@ -316,7 +388,8 @@ class LightClientOptimisticUpdate(Container):
 class LightClientFinalityUpdate(Container):
     attested_header: LightClientHeader
     finalized_header: LightClientHeader
-    finality_branch: Vector[Bytes32, FINALIZED_ROOT_DEPTH_ELECTRA]
+    # [Modified in Gloas:EIP7688] progressive BeaconState moves the gindices
+    finality_branch: Vector[Bytes32, FINALIZED_ROOT_DEPTH_GLOAS]
     sync_aggregate: SyncAggregate
     signature_slot: Slot
 
@@ -324,9 +397,10 @@ class LightClientFinalityUpdate(Container):
 class LightClientUpdate(Container):
     attested_header: LightClientHeader
     next_sync_committee: SyncCommittee
-    next_sync_committee_branch: Vector[Bytes32, NEXT_SYNC_COMMITTEE_DEPTH_ELECTRA]
+    # [Modified in Gloas:EIP7688]
+    next_sync_committee_branch: Vector[Bytes32, NEXT_SYNC_COMMITTEE_DEPTH_GLOAS]
     finalized_header: LightClientHeader
-    finality_branch: Vector[Bytes32, FINALIZED_ROOT_DEPTH_ELECTRA]
+    finality_branch: Vector[Bytes32, FINALIZED_ROOT_DEPTH_GLOAS]
     sync_aggregate: SyncAggregate
     signature_slot: Slot
 
@@ -334,7 +408,8 @@ class LightClientUpdate(Container):
 class LightClientBootstrap(Container):
     header: LightClientHeader
     current_sync_committee: SyncCommittee
-    current_sync_committee_branch: Vector[Bytes32, CURRENT_SYNC_COMMITTEE_DEPTH_ELECTRA]
+    # [Modified in Gloas:EIP7688]
+    current_sync_committee_branch: Vector[Bytes32, CURRENT_SYNC_COMMITTEE_DEPTH_GLOAS]
 
 
 __all__ = [
@@ -350,6 +425,22 @@ __all__ = [
     "PayloadAttestationMessage",
     "IndexedPayloadAttestation",
     "BlockAccessList",
+    "AggregationBits",
+    "AttestingIndices",
+    "Transaction",
+    "Attestation",
+    "IndexedAttestation",
+    "AttesterSlashing",
+    "AggregateAndProof",
+    "SignedAggregateAndProof",
+    "DepositRequests",
+    "WithdrawalRequests",
+    "ConsolidationRequests",
+    "BuilderDepositRequest",
+    "BuilderExitRequest",
+    "BuilderDepositRequests",
+    "BuilderExitRequests",
+    "ExecutionRequests",
     "ExecutionPayload",
     "ExecutionPayloadBid",
     "SignedExecutionPayloadBid",

@@ -4,6 +4,12 @@ from remerkleable.basic import uint8, uint64, uint256, boolean
 from remerkleable.byte_arrays import Bytes4, Bytes32, Bytes48, Bytes96, ByteVector, ByteList
 from remerkleable.complex import Container, Vector, List
 from remerkleable.bitfields import Bitvector, Bitlist
+from remerkleable.progressive import (
+    ProgressiveContainer,
+    ProgressiveList,
+    ProgressiveBitlist,
+    ProgressiveByteList,
+)
 
 Bytes20 = ByteVector[20]
 
@@ -58,6 +64,7 @@ __all__ = [
     "Bytes4", "Bytes20", "Bytes32", "Bytes48", "Bytes96", "ByteVector",
     "Container", "Vector", "List",
     "Bitvector", "Bitlist",
+    "ProgressiveContainer", "ProgressiveList", "ProgressiveBitlist", "ProgressiveByteList",
     "Slot", "Epoch", "CommitteeIndex", "ValidatorIndex", "Gwei",
     "Root", "Hash32", "Version", "DomainType", "ForkDigest", "Domain",
     "BLSPubkey", "BLSSignature", "ExecutionAddress", "WithdrawalIndex",

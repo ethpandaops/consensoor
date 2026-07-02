@@ -303,7 +303,9 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
     Adds ePBS (enshrined Proposer-Builder Separation) fields per alpha 7 spec.
     """
     import time as _time
-    from ..types.electra import ExecutionRequests
+    # [Modified in Gloas:EIP7688] the empty-requests root must come from the
+    # Gloas ProgressiveContainer ExecutionRequests, not the Electra Container.
+    from ..types.gloas import ExecutionRequests
     from ...crypto import hash_tree_root
     from .helpers.ptc import compute_ptc
     from .helpers.misc import compute_start_slot_at_epoch
@@ -446,6 +448,50 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
         f"{(_time.monotonic() - _t0) * 1000:.0f}ms)"
     )
     return post
+
+
+def upgrade_attestation_to_gloas(pre):
+    """Upgrade a pre-Gloas (Electra/Fulu) attestation to the Gloas type.
+
+    [New in Gloas:EIP7688] A Gloas BeaconBlockBody can still contain earlier
+    attestations; they must be locally upgraded before packing into a block.
+    Returns ``pre`` unchanged if it is already a Gloas attestation.
+    """
+    from ..types.gloas import Attestation, AggregationBits
+
+    if isinstance(pre, Attestation):
+        return pre
+    return Attestation(
+        aggregation_bits=AggregationBits(list(pre.aggregation_bits)),
+        data=pre.data,
+        signature=pre.signature,
+        committee_bits=pre.committee_bits,
+    )
+
+
+def upgrade_indexed_attestation_to_gloas(pre):
+    """Upgrade a pre-Gloas indexed attestation to the Gloas type."""
+    from ..types.gloas import IndexedAttestation, AttestingIndices
+
+    if isinstance(pre, IndexedAttestation):
+        return pre
+    return IndexedAttestation(
+        attesting_indices=AttestingIndices(list(pre.attesting_indices)),
+        data=pre.data,
+        signature=pre.signature,
+    )
+
+
+def upgrade_attester_slashing_to_gloas(pre):
+    """Upgrade a pre-Gloas attester slashing to the Gloas type."""
+    from ..types.gloas import AttesterSlashing
+
+    if isinstance(pre, AttesterSlashing):
+        return pre
+    return AttesterSlashing(
+        attestation_1=upgrade_indexed_attestation_to_gloas(pre.attestation_1),
+        attestation_2=upgrade_indexed_attestation_to_gloas(pre.attestation_2),
+    )
 
 
 def _compute_earliest_exit_epoch(state: DenebBeaconState, epoch: int) -> int:
