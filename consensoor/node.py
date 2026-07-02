@@ -3604,13 +3604,17 @@ class BeaconNode:
             for idx, (root, signed) in enumerate(indexed_blocks):
                 try:
                     state = state_transition(state, signed, False)
-                    replayed = (
-                        signed.message if hasattr(signed, "message") else signed
-                    )
-                    # Canonical-chain pinning — see _apply_with_check.
-                    state.latest_block_header.state_root = bytes(
-                        replayed.state_root
-                    )
+                    # Do NOT pin latest_block_header.state_root to the
+                    # block's claimed root here. The claimed root hashes the
+                    # post-state with header.state_root == ZERO; writing it
+                    # into the header changes hash_tree_root(state), and the
+                    # next process_slot then caches that wrong hash into
+                    # state.state_roots — permanently diverging our state
+                    # from every other client (only latest_block_header +
+                    # state_roots differ, but every later computed state
+                    # root mismatches). Per spec the header's state_root
+                    # stays ZERO until the next process_slot fills it with
+                    # the actual post-state root.
                 except Exception as exc:
                     blk = signed.message if hasattr(signed, "message") else signed
                     raise RuntimeError(
@@ -3625,9 +3629,8 @@ class BeaconNode:
         # Push the (potentially expensive) replay onto a worker thread.
         new_state = await asyncio.to_thread(_replay, new_state, chain)
 
-        # latest_block_header.state_root is pinned to each block's claimed
-        # root inside _replay (canonical-chain pinning); nothing to fill
-        # here.
+        # latest_block_header.state_root stays ZERO after the target block
+        # per spec; the next process_slots fills it in.
 
         # Persist the new state under several keys so the API + dora can
         # find it back.
@@ -3731,16 +3734,27 @@ class BeaconNode:
                         f"computed={computed.hex()[:16]} "
                         f"claimed={claimed.hex()[:16]}"
                     )
-                # Pin the block's CLAIMED state_root into the header. Spec
-                # leaves it ZERO until the next process_slot fills it with
-                # our computed root — but when our transition diverges (see
-                # mismatch above) that filled root no longer hashes to the
-                # block root peers built on, the next canonical block fails
-                # its parent_root assert, and the node wedges permanently.
-                # The claimed root is by definition what peers hashed into
-                # the block root, so pinning it keeps us chained to the
-                # canonical chain even while our state content drifts.
-                pre_copy.latest_block_header.state_root = claimed
+                    # REJECT the block rather than adopting a state that no
+                    # other client agrees with. The caller keeps the old
+                    # head; a later reorg replay or backfill recovers.
+                    #
+                    # Historical note: we used to "pin" the block's CLAIMED
+                    # state_root into latest_block_header here (and accept
+                    # the block) so the parent_root assert on the next block
+                    # kept passing even while our state drifted. That pin
+                    # was itself a state-corruption source: the claimed root
+                    # hashes the post-state with header.state_root == ZERO,
+                    # so writing it into the header changed
+                    # hash_tree_root(state) and the next process_slot cached
+                    # the wrong hash into state.state_roots — guaranteeing
+                    # STATE_ROOT_MISMATCH on every subsequent block even
+                    # with a fully correct state transition. Per spec the
+                    # header's state_root must stay ZERO until the next
+                    # process_slot fills it with the actual post-state root.
+                    raise ValueError(
+                        f"state_root mismatch at slot={target}: "
+                        f"computed={computed.hex()} claimed={claimed.hex()}"
+                    )
                 return pre_copy
             new_state = await self._on_state_thread(
                 _apply_with_check, self.state, signed_block
@@ -3762,8 +3776,9 @@ class BeaconNode:
             if target_slot > int(state.slot):
                 state = process_slots(state, target_slot)
             process_block(state, block)
-            # Canonical-chain pinning — see _apply_with_check above.
-            state.latest_block_header.state_root = bytes(block.state_root)
+            # Do NOT pin latest_block_header.state_root — see
+            # _apply_with_check above; it must stay ZERO until the next
+            # process_slot fills it per spec.
             return state
 
         self.state = await self._on_state_thread(_apply_sync, self.state)

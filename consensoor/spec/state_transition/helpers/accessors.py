@@ -45,10 +45,27 @@ from ....crypto import sha256
 if TYPE_CHECKING:
     from ...types import BeaconState, Validator
 
-# Cache for expensive epoch-level computations (keyed by state slot)
-_total_active_balance_cache: dict[int, int] = {}
-_base_reward_per_increment_cache: dict[int, int] = {}
-_eligible_validator_indices_cache: dict[int, list[int]] = {}
+# Cache for expensive epoch-level computations.
+#
+# Keys MUST include a state-content identity, not just the slot/epoch:
+# two conflicting forks routinely reach the same slot with different
+# validator sets / participation, and a slot-only key lets one fork's
+# value leak into the other's state transition. That exact collision
+# wedged the node: attester-duty clones advanced the node's OWN fork
+# across an epoch boundary, populating slot-keyed entries, and the
+# subsequent reorg replay of the CANONICAL chain consumed them —
+# producing a wrong post-epoch state root and a permanent parent-root
+# mismatch on the next canonical block.
+#
+# We use the remerkleable backing Node of the field(s) the value is
+# derived from as the identity component. Copies share subtree nodes
+# structurally, so two states whose validators are untouched share the
+# SAME node object (cache hit, identical content); any mutation swaps
+# in a new node (cache miss, recompute). Keeping the node in the key
+# holds a strong reference, so ids can't be recycled into stale hits.
+_total_active_balance_cache: dict[tuple, int] = {}
+_base_reward_per_increment_cache: dict[tuple, int] = {}
+_eligible_validator_indices_cache: dict[tuple, list[int]] = {}
 _CACHE_MAX_SIZE = 64
 
 
@@ -368,15 +385,18 @@ def get_total_active_balance(state: "BeaconState") -> int:
     Returns:
         Total active balance
     """
-    slot = int(state.slot)
-    if slot in _total_active_balance_cache:
-        return _total_active_balance_cache[slot]
+    # Depends on the validator set and the current epoch only. Keyed by
+    # the validators subtree node so conflicting forks at the same slot
+    # can never serve each other's value (see cache comment above).
+    key = (get_current_epoch(state), state.validators.get_backing())
+    if key in _total_active_balance_cache:
+        return _total_active_balance_cache[key]
 
     result = get_total_balance(
         state, set(get_active_validator_indices(state, get_current_epoch(state)))
     )
 
-    _total_active_balance_cache[slot] = result
+    _total_active_balance_cache[key] = result
     _trim_cache(_total_active_balance_cache)
     return result
 
@@ -390,9 +410,10 @@ def get_base_reward_per_increment(state: "BeaconState") -> int:
     Returns:
         Base reward per increment in Gwei
     """
-    slot = int(state.slot)
-    if slot in _base_reward_per_increment_cache:
-        return _base_reward_per_increment_cache[slot]
+    # Derived from total_active_balance — same fork-safe key shape.
+    key = (get_current_epoch(state), state.validators.get_backing())
+    if key in _base_reward_per_increment_cache:
+        return _base_reward_per_increment_cache[key]
 
     result = (
         EFFECTIVE_BALANCE_INCREMENT
@@ -400,7 +421,7 @@ def get_base_reward_per_increment(state: "BeaconState") -> int:
         // integer_squareroot(get_total_active_balance(state))
     )
 
-    _base_reward_per_increment_cache[slot] = result
+    _base_reward_per_increment_cache[key] = result
     _trim_cache(_base_reward_per_increment_cache)
     return result
 
@@ -488,11 +509,13 @@ def get_eligible_validator_indices(state: "BeaconState") -> Sequence[int]:
     Returns:
         Sequence of eligible validator indices
     """
-    slot = int(state.slot)
-    if slot in _eligible_validator_indices_cache:
-        return _eligible_validator_indices_cache[slot]
-
+    # Depends on the validator set and the previous epoch only. Fork-safe
+    # key: validators subtree node (see cache comment above).
     previous_epoch = get_previous_epoch(state)
+    key = (previous_epoch, state.validators.get_backing())
+    if key in _eligible_validator_indices_cache:
+        return _eligible_validator_indices_cache[key]
+
     result = [
         i
         for i, v in enumerate(state.validators)
@@ -500,7 +523,7 @@ def get_eligible_validator_indices(state: "BeaconState") -> Sequence[int]:
         or (v.slashed and previous_epoch + 1 < int(v.withdrawable_epoch))
     ]
 
-    _eligible_validator_indices_cache[slot] = result
+    _eligible_validator_indices_cache[key] = result
     _trim_cache(_eligible_validator_indices_cache)
     return result
 

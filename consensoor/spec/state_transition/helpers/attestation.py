@@ -28,9 +28,21 @@ from .math import integer_squareroot
 if TYPE_CHECKING:
     from ...types import BeaconState, Attestation, IndexedAttestation, AttestationData
 
-# Cache for unslashed participating indices (keyed by (slot, flag_index, epoch))
-_unslashed_participating_cache: dict[tuple[int, int, int], Set[int]] = {}
-_active_validator_indices_cache: dict[tuple[int, int], list[int]] = {}
+# Caches for unslashed participating indices / active validator indices.
+#
+# Keys MUST include a state-content identity, not just slot/epoch: two
+# conflicting forks routinely reach the same slot with different
+# participation and validator sets, and slot-keyed entries let one
+# fork's value leak into the other's state transition (this wedged the
+# node: own-fork duty clones crossing an epoch boundary poisoned the
+# entries the canonical reorg replay then consumed, diverging the
+# post-epoch state root permanently). We key by the remerkleable
+# backing Node of the fields the value depends on: copies share
+# unmodified subtree nodes (same node object == same content, safe
+# hit), any mutation swaps in a new node (miss, recompute). Holding
+# the node in the key strongly prevents id-recycling staleness.
+_unslashed_participating_cache: dict[tuple, Set[int]] = {}
+_active_validator_indices_cache: dict[tuple, list[int]] = {}
 _CACHE_MAX_SIZE = 64
 
 
@@ -52,9 +64,8 @@ def clear_attestation_caches() -> None:
 
 
 def _get_active_validator_indices_cached(state: "BeaconState", epoch: int) -> list[int]:
-    """Cached version of active validator indices lookup."""
-    slot = int(state.slot)
-    key = (slot, epoch)
+    """Cached version of active validator indices lookup (fork-safe key)."""
+    key = (int(epoch), state.validators.get_backing())
     if key in _active_validator_indices_cache:
         return _active_validator_indices_cache[key]
 
@@ -278,37 +289,44 @@ def get_unslashed_participating_indices(
     Returns:
         Set of unslashed validator indices with the flag set
     """
-    # Check cache first
-    slot = int(state.slot)
-    cache_key = (slot, flag_index, epoch)
-    if cache_key in _unslashed_participating_cache:
-        return _unslashed_participating_cache[cache_key]
-
     previous_epoch = get_previous_epoch(state)
     current_epoch = get_current_epoch(state)
 
     assert epoch in (previous_epoch, current_epoch)
 
     # Check if this is a Phase0 state (uses PendingAttestation) or Altair+ (uses participation flags)
-    if hasattr(state, "previous_epoch_participation"):
-        # Altair+ path: use participation flags
-        if epoch == current_epoch:
-            epoch_participation = state.current_epoch_participation
-        else:
-            epoch_participation = state.previous_epoch_participation
+    if not hasattr(state, "previous_epoch_participation"):
+        # Phase0 path: use PendingAttestation objects (uncached; spec-test
+        # only in practice — the live client never runs phase0 states).
+        return get_unslashed_participating_indices_phase0(state, flag_index, epoch)
 
-        # Use cached active validator indices
-        active_validator_indices = _get_active_validator_indices_cached(state, epoch)
-
-        result = set(
-            i
-            for i in active_validator_indices
-            if has_flag(int(epoch_participation[i]), flag_index)
-            and not state.validators[i].slashed
-        )
+    # Altair+ path: use participation flags
+    if epoch == current_epoch:
+        epoch_participation = state.current_epoch_participation
     else:
-        # Phase0 path: use PendingAttestation objects
-        result = get_unslashed_participating_indices_phase0(state, flag_index, epoch)
+        epoch_participation = state.previous_epoch_participation
+
+    # Fork-safe cache key: the value depends on the chosen participation
+    # list and the validator set (slashed bits) — key by their backing
+    # nodes, never by slot (see cache comment above).
+    cache_key = (
+        int(flag_index),
+        int(epoch),
+        epoch_participation.get_backing(),
+        state.validators.get_backing(),
+    )
+    if cache_key in _unslashed_participating_cache:
+        return _unslashed_participating_cache[cache_key]
+
+    # Use cached active validator indices
+    active_validator_indices = _get_active_validator_indices_cached(state, epoch)
+
+    result = set(
+        i
+        for i in active_validator_indices
+        if has_flag(int(epoch_participation[i]), flag_index)
+        and not state.validators[i].slashed
+    )
 
     _unslashed_participating_cache[cache_key] = result
     _trim_cache(_unslashed_participating_cache)
