@@ -449,7 +449,7 @@ DOMAIN_PTC_ATTESTER: Final[bytes] = b"\x0c\x00\x00\x00"
 DOMAIN_PROPOSER_PREFERENCES: Final[bytes] = b"\x0d\x00\x00\x00"
 DOMAIN_BUILDER_DEPOSIT: Final[bytes] = b"\x0e\x00\x00\x00"
 
-BUILDER_WITHDRAWAL_PREFIX: Final[bytes] = b"\x03"
+BUILDER_WITHDRAWAL_PREFIX: Final[bytes] = b"\xb0"
 
 
 # Gloas churn limits (EIP-8061): split exit and activation churn limits
