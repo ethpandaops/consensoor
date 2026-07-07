@@ -8,9 +8,8 @@ from typing import TYPE_CHECKING
 from ...constants import (
     SLOTS_PER_EPOCH,
     MIN_SEED_LOOKAHEAD,
-    DOMAIN_BEACON_PROPOSER,
 )
-from ..helpers.accessors import get_current_epoch, get_active_validator_indices, get_seed
+from ..helpers.accessors import get_current_epoch
 from ..helpers.beacon_committee import get_beacon_proposer_indices
 
 if TYPE_CHECKING:
@@ -30,7 +29,6 @@ def process_proposer_lookahead(state: "BeaconState") -> None:
         return
 
     slots_per_epoch = SLOTS_PER_EPOCH()
-    lookahead_length = (MIN_SEED_LOOKAHEAD + 1) * slots_per_epoch
 
     # Rotate the lookahead: shift by one epoch
     # Remove the first epoch's worth of slots

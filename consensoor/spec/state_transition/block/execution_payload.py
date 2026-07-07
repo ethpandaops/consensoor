@@ -5,7 +5,7 @@ Reference: https://github.com/ethereum/consensus-specs/blob/master/specs/bellatr
 
 from typing import TYPE_CHECKING
 
-from ..helpers.predicates import is_merge_transition_complete, is_execution_enabled
+from ..helpers.predicates import is_merge_transition_complete
 from ..helpers.accessors import get_current_epoch, get_randao_mix
 from ..helpers.misc import compute_time_at_slot
 from ....crypto import hash_tree_root

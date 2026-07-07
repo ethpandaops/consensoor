@@ -2,14 +2,11 @@
 
 from .base import (
     Container, Vector, List,
-    Bitvector, Bitlist,
-    uint64, boolean,
-    Bytes32, BLSPubkey, BLSSignature,
-    Slot, Epoch, ValidatorIndex, Gwei, Root, Hash32,
-    Checkpoint, Fork, ParticipationFlags,
+    Bitvector, uint64, Bytes32, BLSPubkey, BLSSignature,
+    Slot, ValidatorIndex, Gwei, Root, Checkpoint, Fork, ParticipationFlags,
 )
 from .phase0 import (
-    Validator, AttestationData, Eth1Data, BeaconBlockHeader,
+    Validator, Eth1Data, BeaconBlockHeader,
     ProposerSlashing, Deposit, SignedVoluntaryExit,
     Phase0Attestation, Phase0AttesterSlashing,
 )

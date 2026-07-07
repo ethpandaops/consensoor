@@ -11,7 +11,7 @@ from ...constants import (
     EPOCHS_PER_ETH1_VOTING_PERIOD,
     SLOTS_PER_HISTORICAL_ROOT,
 )
-from ..helpers.accessors import get_current_epoch, get_block_root, get_randao_mix
+from ..helpers.accessors import get_current_epoch, get_randao_mix
 from ....crypto import hash_tree_root
 
 if TYPE_CHECKING:

@@ -20,11 +20,7 @@ from .spec.types import (
     AltairBeaconState,
     Phase0BeaconState,
     SignedBeaconBlock,
-    SignedExecutionPayloadBid,
-    SignedExecutionPayloadEnvelope,
     ExecutionPayloadEnvelope,
-    PayloadAttestationMessage,
-    Attestation,
     SignedElectraBeaconBlock,
     BLSSignature,
     Eth1Data,
@@ -60,7 +56,7 @@ from .spec.state_transition import process_slots
 from .engine import EngineAPIClient, ForkchoiceState, PayloadStatusEnum
 from .store import Store
 from .beacon_api import BeaconAPI
-from .crypto import hash_tree_root, sign_async, compute_signing_root
+from .crypto import hash_tree_root, sign_async
 from .validator import ValidatorClient, load_keystores_teku_style
 from .builder import BlockBuilder
 from .attestation_pool import AttestationPool
@@ -886,7 +882,6 @@ class BeaconNode:
         fork transitions correctly.
         """
         from .p2p.encoding import compute_fork_digest
-        from .spec import constants
 
         FAR_FUTURE_EPOCH = 2**64 - 1
         digests = []
@@ -1402,8 +1397,6 @@ class BeaconNode:
             network_config = get_config()
             next_slot = slot + 1
             timestamp = self._genesis_time + next_slot * (network_config.slot_duration_ms // 1000)
-            import time as time_mod
-            current_time = int(time_mod.time())
             logger.info(
                 f"Forkchoice prep for slot {next_slot}: head_hash={head_block_hash.hex()[:16]}, "
                 f"finalized_epoch={finalized_epoch}, timestamp={timestamp}, state_slot={self.state.slot}"
@@ -1594,7 +1587,6 @@ class BeaconNode:
         epoch = slot // slots_per_epoch
         slot_start = self._genesis_time + slot * slot_duration
         time_into_slot = time.time() - slot_start
-        expected_offset = network_config.get_attestation_due_offset(epoch)
 
         duties = self._attester_duties.get(epoch, [])
         slot_duties = [d for d in duties if d.slot == slot]
@@ -1799,7 +1791,6 @@ class BeaconNode:
             return
 
         from .spec.state_transition.helpers.ptc import get_ptc
-        from .spec.types.gloas import PayloadAttestationMessage
 
         try:
             ptc = list(get_ptc(self.state, slot))
@@ -2134,7 +2125,7 @@ class BeaconNode:
         )
         from .spec.state_transition.helpers.domain import get_domain, compute_signing_root
         from .spec.state_transition.helpers.beacon_committee import (
-            get_beacon_committee, get_committee_count_per_slot,
+            get_beacon_committee,
         )
         from .spec.types import Slot
         from .crypto import sha256
@@ -2225,7 +2216,7 @@ class BeaconNode:
             ExecutionPayloadEnvelope,
             SignedExecutionPayloadEnvelope,
         )
-        from .spec.types import BLSSignature, Root, Slot, KZGCommitment
+        from .spec.types import BLSSignature, Root, KZGCommitment
         from .spec.types.base import List
         from .spec.constants import BUILDER_INDEX_SELF_BUILD
         # MAX_BLOB_COMMITMENTS_PER_BLOCK is 4096
@@ -2236,9 +2227,9 @@ class BeaconNode:
             execution_payload_dict, "gloas"
         )
 
-        # Build execution requests. [Modified in Gloas:EIP7688] use the block
-        # builder's decoder so the envelope carries the Gloas ExecutionRequests
-        # (ProgressiveContainer) and its root matches bid.execution_requests_root.
+        # Build execution requests. Use the block builder's decoder so the
+        # envelope carries the Gloas ExecutionRequests (EIP-8282 builder
+        # fields) and its root matches bid.execution_requests_root.
         exec_requests_obj = self.block_builder._decode_execution_requests_hex(
             execution_requests, gloas=True
         )
@@ -2781,7 +2772,7 @@ class BeaconNode:
                 # because someone earlier in the round-robin missed theirs.
                 if start_slot + count - 1 >= current_slot - 1:
                     self._sync_empty_confirmed_for_slot = current_slot
-                logger.warning(f"No blocks received from req/resp request")
+                logger.warning("No blocks received from req/resp request")
                 return
 
             logger.info(f"Received {len(blocks)} blocks via req/resp")
@@ -2881,7 +2872,7 @@ class BeaconNode:
                 elif not self.store.get_block(parent_root):
                     # Check if parent is genesis
                     if parent_root == genesis_root:
-                        logger.info(f"P2P: Block parent is genesis, will process")
+                        logger.info("P2P: Block parent is genesis, will process")
                     else:
                         logger.warning(
                             f"P2P: Ignoring block slot={block.slot} - parent {parent_root.hex()[:16]} "
@@ -3412,9 +3403,6 @@ class BeaconNode:
 
     def _store_received_blob_sidecar(self, block_root: bytes, slot: int, sidecar) -> None:
         """Store a received blob sidecar in the store."""
-        # Get existing blobs for this block (if any)
-        existing_blobs = self.store.get_blobs(block_root)
-
         # Convert sidecar to JSON format for storage
         index = int(sidecar.index)
 
@@ -3802,7 +3790,7 @@ class BeaconNode:
         if not self.state:
             raise ValueError("No state available")
 
-        from .spec.state_transition import state_transition, process_slots, process_block
+        from .spec.state_transition import process_slots, process_block
 
         from_slot = int(self.state.slot)
         target_slot = int(block.slot)

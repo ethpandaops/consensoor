@@ -4,9 +4,9 @@ from .base import (
     Container, Vector, List,
     Bitvector,
     uint8, uint64, uint256,
-    Bytes32, ByteVector, BLSPubkey, BLSSignature,
+    Bytes32, ByteVector, BLSSignature,
     Hash32, ExecutionAddress, Transaction,
-    Slot, Epoch, ValidatorIndex, Gwei, Root,
+    Slot, ValidatorIndex, Gwei, Root,
     Checkpoint, Fork, ParticipationFlags,
 )
 from .phase0 import (

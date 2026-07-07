@@ -1,13 +1,11 @@
 """Attestation pool for collecting and aggregating attestations."""
 
 import logging
-from dataclasses import dataclass, field
-from typing import Optional
+from dataclasses import dataclass
 from collections import defaultdict
 
 from typing import Union
 from .spec.constants import SLOTS_PER_EPOCH, MAX_VALIDATORS_PER_COMMITTEE, MAX_COMMITTEES_PER_SLOT
-from .spec.types import AttestationData
 from .spec.types.electra import Attestation as ElectraAttestation
 from .spec.types.phase0 import Phase0Attestation
 from .crypto import hash_tree_root, aggregate_signatures

@@ -13,9 +13,7 @@ from ...constants import (
     DOMAIN_BEACON_BUILDER,
     BUILDER_INDEX_SELF_BUILD,
 )
-from ..helpers.accessors import get_current_epoch
 from ..helpers.domain import get_domain, compute_signing_root
-from ..helpers.beacon_committee import get_beacon_proposer_index
 from ....crypto import bls_verify, hash_tree_root
 
 if TYPE_CHECKING:

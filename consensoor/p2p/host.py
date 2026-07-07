@@ -20,7 +20,6 @@ import threading
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Optional
 
-from .. import metrics
 
 logger = logging.getLogger(__name__)
 

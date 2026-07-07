@@ -7,7 +7,6 @@ in the block body. Per gloas/EIP-7732.
 """
 
 import logging
-from typing import Optional
 
 from .spec.constants import MAX_PAYLOAD_ATTESTATIONS, PTC_SIZE
 from .spec.types.gloas import (

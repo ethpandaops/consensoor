@@ -11,7 +11,6 @@ from ...constants import (
     MAX_WITHDRAWALS_PER_PAYLOAD,
     MAX_PENDING_PARTIALS_PER_WITHDRAWALS_SWEEP,
     MAX_BUILDERS_PER_WITHDRAWALS_SWEEP,
-    SLOTS_PER_HISTORICAL_ROOT,
     FAR_FUTURE_EPOCH,
     MIN_ACTIVATION_BALANCE,
     MAX_EFFECTIVE_BALANCE,
@@ -20,7 +19,6 @@ from ..helpers.accessors import get_current_epoch
 from ..helpers.predicates import (
     is_fully_withdrawable_validator,
     is_partially_withdrawable_validator,
-    has_execution_withdrawal_credential,
     has_eth1_withdrawal_credential,
 )
 from ..helpers.mutators import decrease_balance

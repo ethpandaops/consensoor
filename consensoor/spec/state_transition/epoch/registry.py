@@ -7,9 +7,7 @@ Reference (Electra): https://github.com/ethereum/consensus-specs/blob/master/spe
 from typing import TYPE_CHECKING
 
 from ...constants import (
-    FAR_FUTURE_EPOCH,
     EJECTION_BALANCE,
-    MAX_EFFECTIVE_BALANCE,
     MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT,
 )
 from ..helpers.accessors import (

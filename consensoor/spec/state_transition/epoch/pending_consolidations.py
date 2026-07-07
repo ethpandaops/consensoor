@@ -7,7 +7,6 @@ from typing import TYPE_CHECKING
 
 from ..helpers.accessors import get_current_epoch
 from ..helpers.mutators import increase_balance, decrease_balance
-from ..helpers.predicates import is_active_validator
 
 if TYPE_CHECKING:
     from ...types import BeaconState

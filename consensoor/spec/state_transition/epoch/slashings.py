@@ -17,7 +17,6 @@ from ..helpers.accessors import (
     get_total_active_balance,
 )
 from ..helpers.mutators import decrease_balance
-from ..helpers.math import saturating_sub
 
 if TYPE_CHECKING:
     from ...types import BeaconState

@@ -10,7 +10,6 @@ from ...constants import (
     HYSTERESIS_QUOTIENT,
     HYSTERESIS_DOWNWARD_MULTIPLIER,
     HYSTERESIS_UPWARD_MULTIPLIER,
-    MAX_EFFECTIVE_BALANCE,
 )
 from ..helpers.accessors import get_max_effective_balance
 

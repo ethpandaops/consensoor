@@ -441,7 +441,6 @@ class BeaconAPI:
 
     async def get_validator(self, request: web.Request) -> web.Response:
         """GET /eth/v1/beacon/states/{state_id}/validators/{validator_id}"""
-        state_id = request.match_info["state_id"]
         validator_id = request.match_info["validator_id"]
 
         if not self.node.state:
@@ -505,7 +504,6 @@ class BeaconAPI:
 
     async def get_validator_balances(self, request: web.Request) -> web.Response:
         """GET /eth/v1/beacon/states/{state_id}/validator_balances"""
-        state_id = request.match_info["state_id"]
 
         if not self.node.state:
             return web.json_response({"message": "State not found"}, status=404)

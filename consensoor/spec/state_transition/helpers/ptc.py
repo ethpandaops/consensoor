@@ -21,6 +21,7 @@ from ....crypto import sha256
 
 if TYPE_CHECKING:
     from ...types import BeaconState
+    from ...types.gloas import IndexedPayloadAttestation
 
 
 def compute_ptc(state: "BeaconState", slot: int) -> Sequence[int]:

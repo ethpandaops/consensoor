@@ -37,8 +37,6 @@ def process_randao(state: "BeaconState", body: "BeaconBlockBody") -> None:
     domain = get_domain(state, DOMAIN_RANDAO, epoch)
 
     # Epoch as signing root (just the uint64 encoded)
-    from ...types import Root
-    from ...types.base import uint64
     from remerkleable.basic import uint64 as ssz_uint64
 
     signing_root = compute_signing_root(ssz_uint64(epoch), domain)

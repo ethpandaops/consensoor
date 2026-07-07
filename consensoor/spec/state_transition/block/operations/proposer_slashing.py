@@ -11,7 +11,7 @@ from ...helpers.accessors import get_current_epoch, get_previous_epoch
 from ...helpers.domain import get_domain, compute_signing_root
 from ...helpers.mutators import slash_validator
 from ...helpers.misc import compute_epoch_at_slot
-from .....crypto import bls_verify, hash_tree_root
+from .....crypto import bls_verify
 
 if TYPE_CHECKING:
     from ....types import BeaconState

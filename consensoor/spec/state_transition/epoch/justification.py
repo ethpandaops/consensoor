@@ -19,7 +19,7 @@ from ..helpers.attestation import get_unslashed_participating_indices
 from ..helpers.accessors import get_total_balance
 
 if TYPE_CHECKING:
-    from ...types import BeaconState, Checkpoint
+    from ...types import BeaconState
 
 
 def process_justification_and_finalization(state: "BeaconState") -> None:

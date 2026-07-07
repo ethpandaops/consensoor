@@ -15,7 +15,6 @@ from ..spec.types import (
     Hash32,
     BLSSignature,
     Slot,
-    Epoch,
     ValidatorIndex,
     Gwei,
     ExecutionAddress,
@@ -27,9 +26,7 @@ from ..spec.types.gloas import (
     SignedBeaconBlock as SignedGloasBeaconBlock,
     ExecutionPayloadBid,
     SignedExecutionPayloadBid,
-    PayloadAttestation,
 )
-from ..spec.types.phase0 import ProposerSlashing, Deposit, SignedVoluntaryExit
 from ..spec.types.bellatrix import (
     ExecutionPayloadBellatrix,
     BellatrixBeaconBlock,
@@ -41,7 +38,6 @@ from ..spec.types.capella import (
     CapellaBeaconBlock,
     CapellaBeaconBlockBody,
     SignedCapellaBeaconBlock,
-    SignedBLSToExecutionChange,
     Withdrawal,
 )
 from ..spec.types.deneb import (
@@ -57,7 +53,6 @@ from ..spec.constants import (
     MAX_ATTESTATIONS,
     MAX_ATTESTATIONS_ELECTRA,
     BUILDER_INDEX_SELF_BUILD,
-    MAX_PAYLOAD_ATTESTATIONS,
 )
 from ..spec.network_config import get_config
 from ..crypto import sign, compute_signing_root, hash_tree_root
@@ -80,7 +75,6 @@ logger = logging.getLogger(__name__)
 def compute_domain(domain_type: bytes, fork_version: bytes, genesis_validators_root: bytes) -> bytes:
     """Compute the domain for signing."""
     from ..spec.types import ForkData
-    from ..crypto import sha256
 
     fork_data = ForkData(
         current_version=fork_version,
@@ -311,7 +305,7 @@ class BlockBuilder:
             state_root = hash_tree_root(temp_state)
             t1 = time_mod.time()
             logger.debug(f"state_root hash_tree_root took {(t1-t0)*1000:.1f}ms")
-            logger.debug(f"State root computed successfully")
+            logger.debug("State root computed successfully")
         except Exception as e:
             # Zero state_root means the block we're about to publish is
             # spec-invalid — every peer will reject it. Surface this loudly.
@@ -608,10 +602,10 @@ class BlockBuilder:
             type 0x04 → BuilderExitRequest (68 bytes each, Gloas EIP-8282)
         Multiple records of the same type are packed into a single entry.
 
-        With ``gloas=True`` the Gloas ExecutionRequests (EIP-7688
-        ProgressiveContainer with EIP-8282 builder request fields) is
-        returned; hash_tree_root differs from the Electra type, so callers
-        MUST pass the flag matching the fork they are building for.
+        With ``gloas=True`` the Gloas ExecutionRequests (with EIP-8282
+        builder request fields) is returned; hash_tree_root differs from
+        the Electra type, so callers MUST pass the flag matching the fork
+        they are building for.
         """
         from ..spec.types.electra import (
             DepositRequest,
@@ -893,8 +887,8 @@ class BlockBuilder:
             logger.warning(f"PTC aggregate fetch failed: {e}")
             payload_attestations = []
 
-        # [New in Gloas:EIP7688] pool attestations are Electra-typed; upgrade
-        # them so they merkleize as Gloas Attestations (ProgressiveBitlist).
+        # Pool attestations are Electra-typed; upgrade them to the Gloas
+        # Attestation class so they fit the block body's list element type.
         from ..spec.state_transition.fork_upgrade import upgrade_attestation_to_gloas
 
         gloas_attestations = [upgrade_attestation_to_gloas(a) for a in (attestations or [])]

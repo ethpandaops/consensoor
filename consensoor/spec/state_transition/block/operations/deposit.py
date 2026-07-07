@@ -4,7 +4,7 @@ Reference: https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/
 Reference (Electra): https://github.com/ethereum/consensus-specs/blob/master/specs/electra/beacon-chain.md
 """
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from ....constants import (
     FAR_FUTURE_EPOCH,
@@ -12,7 +12,6 @@ from ....constants import (
     MAX_EFFECTIVE_BALANCE,
     EFFECTIVE_BALANCE_INCREMENT,
     DOMAIN_DEPOSIT,
-    BLS_WITHDRAWAL_PREFIX,
 )
 from ....network_config import get_config
 from ...helpers.predicates import is_valid_merkle_branch
@@ -162,7 +161,6 @@ def add_validator_to_registry(
         amount: Initial deposit amount in Gwei
     """
     from ....types.phase0 import Validator
-    from ...helpers.accessors import get_current_epoch
 
     # Create validator
     effective_balance = min(

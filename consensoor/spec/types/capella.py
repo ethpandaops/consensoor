@@ -16,7 +16,6 @@ from .phase0 import (
 )
 from .altair import (
     SyncCommittee, SyncAggregate,
-    LightClientHeader as AltairLightClientHeader,
 )
 from ..constants import (
     BYTES_PER_LOGS_BLOOM,

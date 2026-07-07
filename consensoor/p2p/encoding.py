@@ -4,8 +4,6 @@ Ethereum consensus uses SSZ encoding with snappy compression for all gossip mess
 Topic strings follow the format: /eth2/{fork_digest}/{topic_name}/{encoding}
 """
 
-import snappy
-from typing import Union
 
 from ..crypto import sha256
 

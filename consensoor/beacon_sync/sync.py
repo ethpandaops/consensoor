@@ -332,11 +332,9 @@ class StateSyncManager:
                 return
 
             finalized = checkpoints.get("finalized", {})
-            current_justified = checkpoints.get("current_justified", {})
 
             if finalized:
                 epoch = int(finalized.get("epoch", 0))
-                root = bytes.fromhex(finalized.get("root", "0" * 64).replace("0x", ""))
                 if epoch > int(self.node.state.finalized_checkpoint.epoch):
                     logger.info(f"Finality advanced: epoch {epoch}")
 

@@ -14,12 +14,12 @@ from ...constants import (
     SLOTS_PER_EPOCH,
     EFFECTIVE_BALANCE_INCREMENT,
 )
-from ..helpers.accessors import get_current_epoch, get_total_active_balance, get_base_reward_per_increment
+from ..helpers.accessors import get_total_active_balance, get_base_reward_per_increment
 from ..helpers.misc import compute_epoch_at_slot
 from ..helpers.domain import get_domain, compute_signing_root
 from ..helpers.beacon_committee import get_beacon_proposer_index
 from ..helpers.mutators import increase_balance, decrease_balance
-from ....crypto import bls_verify, bls_aggregate_pubkeys
+from ....crypto import bls_verify
 
 if TYPE_CHECKING:
     from ...types import BeaconState

@@ -17,25 +17,19 @@ from ...constants import (
     PROPOSER_REWARD_QUOTIENT,
     PROPOSER_WEIGHT,
     WEIGHT_DENOMINATOR,
-    EFFECTIVE_BALANCE_INCREMENT,
-    MAX_EFFECTIVE_BALANCE,
-    MAX_EFFECTIVE_BALANCE_ELECTRA,
     MIN_VALIDATOR_WITHDRAWABILITY_DELAY,
     EPOCHS_PER_SLASHINGS_VECTOR,
     MIN_BUILDER_WITHDRAWABILITY_DELAY,
 )
-from .misc import compute_activation_exit_epoch, compute_epoch_at_slot
+from .misc import compute_activation_exit_epoch
 from .accessors import (
     get_current_epoch,
     get_validator_churn_limit,
     get_activation_exit_churn_limit,
     get_consolidation_churn_limit,
 )
-from .beacon_committee import get_beacon_proposer_index
-from .predicates import has_compounding_withdrawal_credential
-
 if TYPE_CHECKING:
-    from ...types import BeaconState, PendingPartialWithdrawal
+    from ...types import BeaconState
 
 
 def increase_balance(state: "BeaconState", index: int, delta: int) -> None:
@@ -340,36 +334,3 @@ def compute_consolidation_epoch_and_update_churn(
     state.earliest_consolidation_epoch = earliest_consolidation_epoch
 
     return int(state.earliest_consolidation_epoch)
-
-
-def get_beacon_proposer_index(state: "BeaconState") -> int:
-    """Get the beacon proposer index for the current slot.
-
-    For Fulu+, uses the proposer_lookahead vector.
-    For earlier forks, computes on demand.
-
-    Args:
-        state: Beacon state
-
-    Returns:
-        Proposer validator index
-    """
-    # Check if we have Fulu proposer_lookahead
-    if hasattr(state, "proposer_lookahead") and len(state.proposer_lookahead) > 0:
-        from ...constants import SLOTS_PER_EPOCH, MIN_SEED_LOOKAHEAD
-
-        slot = int(state.slot)
-        epoch = compute_epoch_at_slot(slot)
-        # Calculate index into lookahead vector
-        # Lookahead covers (MIN_SEED_LOOKAHEAD + 1) epochs
-        lookahead_epoch_start = epoch  # Current epoch is at start of lookahead
-        slot_in_epoch = slot % SLOTS_PER_EPOCH()
-        epoch_offset = epoch - lookahead_epoch_start
-        lookahead_index = epoch_offset * SLOTS_PER_EPOCH() + slot_in_epoch
-        if 0 <= lookahead_index < len(state.proposer_lookahead):
-            return int(state.proposer_lookahead[lookahead_index])
-
-    # Fall back to computing on demand
-    from .beacon_committee import _compute_proposer_index_on_demand
-
-    return _compute_proposer_index_on_demand(state)

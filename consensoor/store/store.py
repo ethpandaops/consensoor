@@ -237,14 +237,14 @@ class Store:
         """Get a beacon state by root."""
         logger.info(f"get_state called with root={root.hex()[:16]}, cache_size={len(self._state_cache)}")
         if root in self._state_cache:
-            logger.info(f"get_state: found in cache")
+            logger.info("get_state: found in cache")
             return self._state_cache[root]
 
         try:
-            logger.info(f"get_state: checking LevelDB")
+            logger.info("get_state: checking LevelDB")
             value = self._db.get(PREFIX_STATE + root)
             if value:
-                logger.info(f"get_state: found in LevelDB, decoding...")
+                logger.info("get_state: found in LevelDB, decoding...")
                 fork, data = self._decode_value(value)
                 state_types = self._get_state_types()
                 state_type = state_types.get(fork)
@@ -256,7 +256,7 @@ class Store:
                 else:
                     logger.warning(f"get_state: no state type for fork={fork}")
             else:
-                logger.info(f"get_state: not found in LevelDB")
+                logger.info("get_state: not found in LevelDB")
         except Exception as e:
             logger.warning(f"Failed to load state from LevelDB: {e}")
 

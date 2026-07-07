@@ -4,7 +4,6 @@ Implements: integer_squareroot, xor, saturating_sub
 Reference: https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/beacon-chain.md
 """
 
-from typing import Union
 
 
 def integer_squareroot(n: int) -> int:

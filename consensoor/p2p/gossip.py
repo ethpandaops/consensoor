@@ -22,10 +22,7 @@ from .encoding import (
     VOLUNTARY_EXIT_TOPIC,
     PROPOSER_SLASHING_TOPIC,
     ATTESTER_SLASHING_TOPIC,
-    BLS_TO_EXECUTION_CHANGE_TOPIC,
     SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_TOPIC,
-    SYNC_COMMITTEE_SUBNET_TOPIC_PREFIX,
-    BLOB_SIDECAR_TOPIC_PREFIX,
     EXECUTION_PAYLOAD_TOPIC,
     EXECUTION_PAYLOAD_BID_TOPIC,
     PAYLOAD_ATTESTATION_MESSAGE_TOPIC,
@@ -215,7 +212,7 @@ class BeaconGossip:
                     topic = get_blob_sidecar_topic(subnet_id, fork_digest)
                     await self._host.subscribe(topic, wrapped_handler)
                     blob_subnet_count += 1
-            subscribed_topics.append(f"blob_sidecar (6 subnets)")
+            subscribed_topics.append("blob_sidecar (6 subnets)")
 
         # Subscribe to sync committee subnets (one per subcommittee).
         # Aggregators must be in the mesh for these subnets to collect

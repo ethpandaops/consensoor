@@ -7,7 +7,6 @@ Reference: https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/
 from ...constants import (
     SLOTS_PER_EPOCH,
     MAX_SEED_LOOKAHEAD,
-    MIN_SEED_LOOKAHEAD,
     BUILDER_INDEX_FLAG,
 )
 from ...types import ForkData, Root

@@ -12,12 +12,9 @@ from typing import TYPE_CHECKING
 from ...constants import (
     DOMAIN_BEACON_BUILDER,
     BUILDER_INDEX_SELF_BUILD,
-    SLOTS_PER_EPOCH,
-    SLOTS_PER_HISTORICAL_ROOT,
 )
 from ..helpers.domain import get_domain, compute_signing_root
-from ..helpers.misc import compute_time_at_slot, compute_epoch_at_slot
-from ..helpers.accessors import get_current_epoch, get_blob_parameters
+from ..helpers.misc import compute_time_at_slot
 from ....crypto import bls_verify, hash_tree_root
 from ...network_config import get_config
 

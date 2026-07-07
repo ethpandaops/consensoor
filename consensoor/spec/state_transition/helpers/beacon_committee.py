@@ -14,7 +14,6 @@ from ...constants import (
     DOMAIN_BEACON_PROPOSER,
     DOMAIN_BEACON_ATTESTER,
     MAX_EFFECTIVE_BALANCE,
-    EFFECTIVE_BALANCE_INCREMENT,
     MAX_EFFECTIVE_BALANCE_ELECTRA,
     MIN_SEED_LOOKAHEAD,
 )
@@ -28,6 +27,8 @@ from .accessors import (
 from ....crypto import sha256
 
 if TYPE_CHECKING:
+    from collections import OrderedDict
+
     from ...types import BeaconState
 
 
@@ -318,10 +319,7 @@ def get_beacon_proposer_index(state: "BeaconState") -> int:
     """
     # Check if we have Fulu proposer_lookahead
     if hasattr(state, "proposer_lookahead") and len(state.proposer_lookahead) > 0:
-        from ...constants import MIN_SEED_LOOKAHEAD
-
         slot = int(state.slot)
-        epoch = compute_epoch_at_slot(slot)
         slot_in_epoch = slot % SLOTS_PER_EPOCH()
 
         # In Fulu, the lookahead is populated at the start of the epoch

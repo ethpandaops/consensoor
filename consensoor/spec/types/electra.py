@@ -3,18 +3,17 @@
 from .base import (
     Container, Vector, List,
     Bitvector, Bitlist,
-    uint64, boolean,
-    Bytes32, BLSPubkey, BLSSignature,
-    Slot, Epoch, ValidatorIndex, Gwei, Root, Hash32, ExecutionAddress,
+    uint64, Bytes32, BLSPubkey, BLSSignature,
+    Slot, Epoch, ValidatorIndex, Gwei, Root, ExecutionAddress,
     ParticipationFlags, KZGCommitment,
 )
 from .phase0 import (
     Validator, AttestationData, Eth1Data, BeaconBlockHeader,
-    SignedBeaconBlockHeader, ProposerSlashing, Deposit, SignedVoluntaryExit,
+    ProposerSlashing, Deposit, SignedVoluntaryExit,
 )
 from .altair import SyncCommittee, SyncAggregate
-from .capella import Withdrawal, SignedBLSToExecutionChange, HistoricalSummary
-from .deneb import ExecutionPayloadHeader, ExecutionPayload, DenebLightClientHeader
+from .capella import SignedBLSToExecutionChange, HistoricalSummary
+from .deneb import ExecutionPayloadHeader, ExecutionPayload
 from ..constants import (
     SLOTS_PER_EPOCH,
     SLOTS_PER_HISTORICAL_ROOT,

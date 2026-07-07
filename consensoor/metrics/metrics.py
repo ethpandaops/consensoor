@@ -10,8 +10,6 @@ from prometheus_client import (
     Histogram,
     Info,
     start_http_server,
-    REGISTRY,
-    CollectorRegistry,
 )
 
 logger = logging.getLogger(__name__)
@@ -169,7 +167,7 @@ def start_metrics_server(port: int = DEFAULT_METRICS_PORT) -> bool:
 
     with _server_lock:
         if _server_started:
-            logger.warning(f"Metrics server already running")
+            logger.warning("Metrics server already running")
             return False
 
         try:

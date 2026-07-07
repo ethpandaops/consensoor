@@ -14,14 +14,13 @@ from ...constants import (
     SLOTS_PER_HISTORICAL_ROOT,
     MIN_ATTESTATION_INCLUSION_DELAY,
 )
-from .misc import compute_epoch_at_slot, compute_start_slot_at_epoch
 from .accessors import (
     get_current_epoch,
     get_previous_epoch,
     get_block_root,
     get_block_root_at_slot,
 )
-from .beacon_committee import get_beacon_committee, get_committee_count_per_slot
+from .beacon_committee import get_beacon_committee
 from .predicates import is_active_validator
 from .math import integer_squareroot
 
@@ -218,11 +217,6 @@ def get_attestation_participation_flag_indices(
     Returns:
         Sequence of flag indices to set
     """
-    from ...constants import (
-        TIMELY_SOURCE_WEIGHT,
-        TIMELY_TARGET_WEIGHT,
-        TIMELY_HEAD_WEIGHT,
-    )
 
     # Check if source/target/head are correct
     justified_checkpoint = state.current_justified_checkpoint
@@ -259,7 +253,6 @@ def get_attestation_participation_flag_indices(
         participation_flags.append(TIMELY_SOURCE_FLAG_INDEX)
 
     # Target flag - must be within target epoch
-    target_epoch = int(data.target.epoch)
     current_epoch = get_current_epoch(state)
     if is_matching_target and int(data.target.epoch) == current_epoch:
         # Target must be included within the target epoch

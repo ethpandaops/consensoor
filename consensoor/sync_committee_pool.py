@@ -3,10 +3,10 @@
 import logging
 from dataclasses import dataclass
 from collections import defaultdict
-from typing import Optional, Union
+from typing import Optional
 
 from .spec.constants import SYNC_COMMITTEE_SIZE, SYNC_COMMITTEE_SUBNET_COUNT
-from .spec.types import BLSSignature, Root
+from .spec.types import BLSSignature
 from .spec.types.altair import SyncAggregate, SyncCommitteeMessage, SyncCommitteeContribution
 from .spec.types.base import Bitvector
 from .crypto import aggregate_signatures
