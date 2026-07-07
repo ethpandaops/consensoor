@@ -152,8 +152,10 @@ def get_ssz_type_by_name(fork: str, type_name: str) -> Optional[Type]:
         if hasattr(types, prefixed_name):
             return getattr(types, prefixed_name)
 
+    # Gloas is handled by gloas_only_types below: its AggregateAndProof wraps
+    # the progressive (EIP-7688) Attestation, so the Electra type's root differs.
     electra_aggregate_types = {"AggregateAndProof", "SignedAggregateAndProof"}
-    if fork in {"electra", "fulu", "gloas"} and type_name in electra_aggregate_types:
+    if fork in {"electra", "fulu"} and type_name in electra_aggregate_types:
         electra_name = f"Electra{type_name}"
         if hasattr(types, electra_name):
             return getattr(types, electra_name)
