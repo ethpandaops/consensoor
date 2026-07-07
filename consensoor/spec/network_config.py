@@ -52,7 +52,8 @@ class NetworkConfig:
     min_validator_withdrawability_delay: int = 256
     shard_committee_period: int = 256
     eth1_follow_distance: int = 2048
-    min_builder_withdrawability_delay: int = 8192
+    # Reduced from 8192 to 64 epochs upstream (consensus-specs #5426)
+    min_builder_withdrawability_delay: int = 64
 
     min_genesis_active_validator_count: int = 16384
     min_genesis_time: int = 0

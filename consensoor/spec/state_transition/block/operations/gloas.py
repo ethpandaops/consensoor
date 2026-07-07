@@ -22,10 +22,10 @@ from ...helpers.ptc import get_indexed_payload_attestation
 from .....crypto import bls_verify
 
 if TYPE_CHECKING:
-    from ....types.gloas import BeaconState, SignedExecutionPayloadBid, PayloadAttestation
+    from ....types.gloas import BeaconState, PayloadAttestation
 
 
-def process_execution_payload_bid(state: "BeaconState", bid_source) -> None:
+def process_execution_payload_bid(state: "BeaconState", signed_bid) -> None:
     """Process an execution payload bid (ePBS).
 
     Args:
@@ -35,22 +35,14 @@ def process_execution_payload_bid(state: "BeaconState", bid_source) -> None:
     Raises:
         AssertionError: If validation fails
     """
-    if hasattr(bid_source, "body") and hasattr(bid_source.body, "signed_execution_payload_bid"):
-        block = bid_source
-        signed_bid = block.body.signed_execution_payload_bid
-        expected_slot = int(block.slot)
-        expected_parent_root = bytes(block.parent_root)
-    else:
-        block = None
-        signed_bid = bid_source
-        expected_slot = int(state.slot)
-        from .....crypto import hash_tree_root
-        expected_parent_root = hash_tree_root(state.latest_block_header)
+    from ....constants import GENESIS_SLOT, PAYLOAD_BUILDER_VERSION
+    from ...helpers.accessors import get_block_root_at_slot
 
     bid = signed_bid.message
     builder_index = int(bid.builder_index)
     amount = int(bid.value)
 
+    # For self-builds, amount must be zero regardless of withdrawal credential prefix
     if builder_index == BUILDER_INDEX_SELF_BUILD:
         assert amount == 0, "Self-build bid must have zero value"
         g2_point_at_infinity = b"\xc0" + b"\x00" * 95
@@ -59,6 +51,9 @@ def process_execution_payload_bid(state: "BeaconState", bid_source) -> None:
         )
     else:
         assert is_active_builder(state, builder_index), "Builder is not active"
+        assert int(state.builders[builder_index].version) == PAYLOAD_BUILDER_VERSION, (
+            "Builder is not a payload builder"
+        )
         assert can_builder_cover_bid(state, builder_index, amount), "Builder cannot cover bid"
         domain = compute_domain(
             DOMAIN_BEACON_BUILDER, state.fork.current_version, state.genesis_validators_root
@@ -76,9 +71,12 @@ def process_execution_payload_bid(state: "BeaconState", bid_source) -> None:
         "blob_kzg_commitments exceeds limit"
     )
 
-    assert int(bid.slot) == expected_slot, "Bid slot mismatch"
+    assert int(bid.slot) == int(state.slot), "Bid slot mismatch"
+    assert int(state.slot) > GENESIS_SLOT, "Bid in genesis slot"
     assert bytes(bid.parent_block_hash) == bytes(state.latest_block_hash), "Parent block hash mismatch"
-    assert bytes(bid.parent_block_root) == expected_parent_root, "Parent block root mismatch"
+    assert bytes(bid.parent_block_root) == bytes(
+        get_block_root_at_slot(state, int(state.slot) - 1)
+    ), "Parent block root mismatch"
     assert bytes(bid.prev_randao) == bytes(get_randao_mix(state, get_current_epoch(state))), (
         "Prev randao mismatch"
     )
@@ -140,8 +138,6 @@ def apply_parent_execution_payload(state: "BeaconState", requests) -> None:
     parent_slot = int(parent_bid.slot)
     parent_epoch = compute_epoch_at_slot(parent_slot)
 
-    # [New in Gloas:EIP7688] request lists are unbounded SSZ ProgressiveLists;
-    # the per-payload limits are enforced here instead of by the type.
     assert len(requests.deposits) <= MAX_DEPOSIT_REQUESTS_PER_PAYLOAD
     assert len(requests.withdrawals) <= MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD
     assert len(requests.consolidations) <= MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD
@@ -192,7 +188,7 @@ def process_parent_execution_payload(state: "BeaconState", block) -> None:
     """
     from .....crypto import hash_tree_root
     from ....constants import SLOTS_PER_HISTORICAL_ROOT
-    # [Modified in Gloas:EIP7688] Gloas ExecutionRequests (ProgressiveContainer)
+    # Gloas ExecutionRequests (adds EIP-8282 builder request fields)
     from ....types.gloas import ExecutionRequests
 
     bid = block.body.signed_execution_payload_bid.message

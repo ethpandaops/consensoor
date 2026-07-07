@@ -333,6 +333,8 @@ CURRENT_SYNC_COMMITTEE_DEPTH_ELECTRA: Final[int] = 6
 NEXT_SYNC_COMMITTEE_DEPTH_ELECTRA: Final[int] = 6
 
 # Gloas LightClient (EIP-7688 progressive BeaconState/BeaconBlockBody move the gindices)
+# EIP-7688 progressive BeaconState/BeaconBlockBody gindices
+# (consensus-specs PR #4630, merged 2026-07-06).
 FINALIZED_ROOT_GINDEX_GLOAS: Final[int] = 735
 CURRENT_SYNC_COMMITTEE_GINDEX_GLOAS: Final[int] = 2945
 NEXT_SYNC_COMMITTEE_GINDEX_GLOAS: Final[int] = 2946
@@ -430,9 +432,14 @@ def PTC_SIZE() -> int:
 
 MAX_PAYLOAD_ATTESTATIONS: Final[int] = 4
 
+# Builder versions
+PAYLOAD_BUILDER_VERSION: Final[int] = 0
+
 # EIP-8282 (builder deposit/exit requests)
-MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD: Final[int] = 2**8
+MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD: Final[int] = 2**6
 MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD: Final[int] = 2**4
+BUILDER_REGISTRY_LIMIT: Final[int] = 2**40
+BUILDER_PENDING_WITHDRAWALS_LIMIT: Final[int] = 2**20
 BUILDER_DEPOSIT_REQUEST_TYPE: Final[bytes] = b"\x03"
 BUILDER_EXIT_REQUEST_TYPE: Final[bytes] = b"\x04"
 

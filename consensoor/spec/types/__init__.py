@@ -156,6 +156,7 @@ from .fulu import (
     PartialDataColumnHeader,
     PartialDataColumnSidecar,
     PartialDataColumnPartsMetadata,
+    PartialDataColumnGroupID,
     FuluBeaconState,
 )
 
@@ -164,7 +165,6 @@ from .gloas import (
     BuilderIndex,
     PayloadStatus,
     ForkChoiceNode,
-    PartialDataColumnGroupID,
     Builder,
     BuilderPendingWithdrawal,
     BuilderPendingPayment,
@@ -173,6 +173,8 @@ from .gloas import (
     PayloadAttestationMessage,
     IndexedPayloadAttestation,
     BlockAccessList,
+    BuilderDepositRequest,
+    BuilderExitRequest,
     ExecutionPayload as GloasExecutionPayload,
     ExecutionPayloadBid,
     SignedExecutionPayloadBid,
@@ -241,6 +243,7 @@ __all__ = [
     # Gloas
     "BuilderIndex", "PayloadStatus", "ForkChoiceNode", "PartialDataColumnGroupID", "Builder",
     "BuilderPendingPayment", "BuilderPendingWithdrawal",
+    "BuilderDepositRequest", "BuilderExitRequest",
     "PayloadAttestationData", "PayloadAttestation", "PayloadAttestationMessage",
     "IndexedPayloadAttestation",
     "ExecutionPayloadBid", "SignedExecutionPayloadBid",

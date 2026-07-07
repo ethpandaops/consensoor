@@ -46,41 +46,13 @@ def process_voluntary_exit(
     current_fork_version = bytes(state.fork.current_version)
     is_deneb_or_later = current_fork_version >= config.deneb_fork_version
     is_electra_or_later = current_fork_version >= config.electra_fork_version
-    is_gloas_or_later = current_fork_version >= config.gloas_fork_version
 
     # Exits must specify an epoch when they become valid; they are not valid before then
     assert current_epoch >= int(voluntary_exit.epoch), (
         "Exit epoch has not been reached"
     )
 
-    # [New in Gloas:EIP7732] Check if this is a builder exit
-    if is_gloas_or_later:
-        from ...helpers.predicates import is_builder_index, is_active_builder
-        from ...helpers.misc import convert_validator_index_to_builder_index
-        from ...helpers.accessors import get_pending_balance_to_withdraw_for_builder
-        from ...helpers.mutators import initiate_builder_exit
-
-        if is_builder_index(validator_index):
-            builder_index = convert_validator_index_to_builder_index(validator_index)
-            assert is_active_builder(state, builder_index), "Builder is not active"
-            assert get_pending_balance_to_withdraw_for_builder(state, builder_index) == 0, (
-                "Builder has pending withdrawals"
-            )
-            pubkey = state.builders[builder_index].pubkey
-            domain = compute_domain(
-                DOMAIN_VOLUNTARY_EXIT,
-                config.capella_fork_version,
-                bytes(state.genesis_validators_root),
-            )
-            signing_root = compute_signing_root(voluntary_exit, domain)
-            assert bls_verify(
-                [bytes(pubkey)],
-                signing_root,
-                bytes(signed_voluntary_exit.signature),
-            ), "Invalid builder voluntary exit signature"
-            initiate_builder_exit(state, builder_index)
-            return
-
+    # Builder exits happen via BuilderExitRequest (EIP-8282), not VoluntaryExit.
     validator = state.validators[validator_index]
 
     # Verify the validator is active

@@ -61,7 +61,7 @@ class SigningData(Container):
 
 __all__ = [
     "uint8", "uint64", "uint256", "boolean",
-    "Bytes4", "Bytes20", "Bytes32", "Bytes48", "Bytes96", "ByteVector",
+    "Bytes4", "Bytes20", "Bytes32", "Bytes48", "Bytes96", "ByteVector", "ByteList",
     "Container", "Vector", "List",
     "Bitvector", "Bitlist",
     "ProgressiveContainer", "ProgressiveList", "ProgressiveBitlist", "ProgressiveByteList",

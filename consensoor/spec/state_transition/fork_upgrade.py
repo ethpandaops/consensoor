@@ -13,25 +13,23 @@ from typing import TYPE_CHECKING
 
 from ..types import Fork
 from ..types.base import Version, Epoch, Gwei, ValidatorIndex, uint64, Bytes32, Hash32, Root, Bitvector
-from ..types.bellatrix import BellatrixBeaconState, ExecutionPayloadHeaderBellatrix
+from ..types.bellatrix import BellatrixBeaconState
 from ..types.capella import (
     CapellaBeaconState,
     ExecutionPayloadHeaderCapella,
-    HistoricalSummary,
-    Withdrawal,
 )
 from ..types.deneb import DenebBeaconState, ExecutionPayloadHeader
 from ..types.electra import ElectraBeaconState
-from ..types.fulu import FuluBeaconState, proposer_lookahead_length
+from ..types.fulu import FuluBeaconState
 from ..types.gloas import (
     BeaconState as GloasBeaconState,
     ExecutionPayloadBid,
     BuilderPendingPayment,
     BuilderPendingWithdrawal,
 )
-from ..constants import SLOTS_PER_EPOCH, SLOTS_PER_HISTORICAL_ROOT, FAR_FUTURE_EPOCH, MIN_SEED_LOOKAHEAD, MAX_WITHDRAWALS_PER_PAYLOAD
+from ..constants import SLOTS_PER_EPOCH, SLOTS_PER_HISTORICAL_ROOT, FAR_FUTURE_EPOCH, MIN_SEED_LOOKAHEAD
 from ..network_config import get_config
-from .helpers.accessors import get_activation_exit_churn_limit, get_current_epoch
+from .helpers.accessors import get_current_epoch
 from .helpers.beacon_committee import get_beacon_proposer_indices
 
 if TYPE_CHECKING:
@@ -303,8 +301,8 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
     Adds ePBS (enshrined Proposer-Builder Separation) fields per alpha 7 spec.
     """
     import time as _time
-    # [Modified in Gloas:EIP7688] the empty-requests root must come from the
-    # Gloas ProgressiveContainer ExecutionRequests, not the Electra Container.
+    # The empty-requests root must come from the Gloas ExecutionRequests
+    # (EIP-8282 builder request fields), not the Electra container.
     from ..types.gloas import ExecutionRequests
     from ...crypto import hash_tree_root
     from .helpers.ptc import compute_ptc
@@ -453,8 +451,9 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
 def upgrade_attestation_to_gloas(pre):
     """Upgrade a pre-Gloas (Electra/Fulu) attestation to the Gloas type.
 
-    [New in Gloas:EIP7688] A Gloas BeaconBlockBody can still contain earlier
-    attestations; they must be locally upgraded before packing into a block.
+    A Gloas BeaconBlockBody's attestations list requires the Gloas class;
+    pool attestations are Electra-typed and must be locally upgraded before
+    packing into a block.
     Returns ``pre`` unchanged if it is already a Gloas attestation.
     """
     from ..types.gloas import Attestation, AggregationBits

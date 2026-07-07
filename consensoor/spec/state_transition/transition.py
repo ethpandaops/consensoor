@@ -7,11 +7,9 @@ Implements the complete state transition function for Ethereum consensus layer.
 """
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 from ..constants import SLOTS_PER_EPOCH, SLOTS_PER_HISTORICAL_ROOT
-from .helpers.misc import compute_epoch_at_slot
-from .helpers.accessors import get_current_epoch
 from ...crypto import hash_tree_root
 
 if TYPE_CHECKING:
@@ -377,7 +375,7 @@ def process_block(state: "BeaconState", block: "BeaconBlock") -> None:
         process_parent_execution_payload(state, block)
         process_block_header(state, block)
         process_withdrawals(state)
-        process_execution_payload_bid(state, block)
+        process_execution_payload_bid(state, block.body.signed_execution_payload_bid)
         process_randao(state, block.body)
         process_eth1_data(state, block.body)
         process_operations(state, block.body, is_gloas=True)

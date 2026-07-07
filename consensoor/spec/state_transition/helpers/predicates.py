@@ -8,13 +8,11 @@ from typing import TYPE_CHECKING, Sequence
 
 from ...constants import (
     FAR_FUTURE_EPOCH,
-    BLS_WITHDRAWAL_PREFIX,
     ETH1_ADDRESS_WITHDRAWAL_PREFIX,
     COMPOUNDING_WITHDRAWAL_PREFIX,
     MAX_EFFECTIVE_BALANCE,
     MAX_EFFECTIVE_BALANCE_ELECTRA,
     MIN_ACTIVATION_BALANCE,
-    EFFECTIVE_BALANCE_INCREMENT,
     BUILDER_INDEX_FLAG,
     BUILDER_WITHDRAWAL_PREFIX,
     DOMAIN_PTC_ATTESTER,
@@ -186,8 +184,7 @@ def is_valid_indexed_attestation(
     if len(indices) == 0:
         logger.warning("IndexedAttestation validation failed: no indices")
         return False
-    # [New in Gloas:EIP7688] attesting_indices is an unbounded ProgressiveList;
-    # enforce the former SSZ bound here. (No-op for pre-Gloas bounded types.)
+    # Redundant with the SSZ list bound, kept as defense in depth.
     from ...constants import MAX_VALIDATORS_PER_COMMITTEE, MAX_COMMITTEES_PER_SLOT
     if len(indices) > MAX_VALIDATORS_PER_COMMITTEE() * MAX_COMMITTEES_PER_SLOT():
         logger.warning(
@@ -207,7 +204,6 @@ def is_valid_indexed_attestation(
     # Verify aggregate signature
     from .domain import get_domain, compute_signing_root
     from ...constants import DOMAIN_BEACON_ATTESTER
-    from .misc import compute_epoch_at_slot
 
     pubkeys = [bytes(state.validators[i].pubkey) for i in indices]
     target_epoch = int(indexed_attestation.data.target.epoch)

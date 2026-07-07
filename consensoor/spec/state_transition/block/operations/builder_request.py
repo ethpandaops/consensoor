@@ -105,13 +105,13 @@ def process_builder_deposit_request(
         builder_index = builder_pubkeys.index(request.pubkey)
         builder = state.builders[builder_index]
 
-        # Increase balance by deposit amount
-        builder.balance = int(builder.balance) + int(request.amount)
-
-        # If exited, reset the withdrawable epoch
-        if int(builder.withdrawable_epoch) != FAR_FUTURE_EPOCH:
+        # If exited and swept, reset the withdrawable epoch
+        if int(builder.withdrawable_epoch) != FAR_FUTURE_EPOCH and int(builder.balance) == 0:
             epoch = get_current_epoch(state)
             builder.withdrawable_epoch = epoch + MIN_BUILDER_WITHDRAWABILITY_DELAY()
+
+        # Increase balance by deposit amount
+        builder.balance = int(builder.balance) + int(request.amount)
 
 
 def process_builder_exit_request(

@@ -13,7 +13,7 @@ from .base import (
     Bitvector, Bitlist,
     ProgressiveContainer, ProgressiveList, ProgressiveBitlist, ProgressiveByteList,
     uint8, uint64, uint256, boolean,
-    Bytes32, ByteVector, ByteList, BLSPubkey, BLSSignature,
+    Bytes32, ByteVector, BLSPubkey, BLSSignature,
     Slot, Epoch, ValidatorIndex, Gwei, Root, Hash32, ExecutionAddress,
     ParticipationFlags, KZGCommitment, KZGProof, WithdrawalIndex,
 )
@@ -90,8 +90,9 @@ class PartialDataColumnPartsMetadata(Container):
 
 
 class PartialDataColumnGroupID(Container):
-    slot: Slot
+    # [Modified in Gloas:EIP7732] adds `slot` after `beacon_block_root`
     beacon_block_root: Root
+    slot: Slot
 
 
 class Builder(Container):

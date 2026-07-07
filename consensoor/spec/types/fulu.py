@@ -4,8 +4,7 @@ from .base import (
     Container, Vector, List,
     Bitvector, Bitlist, ByteVector,
     uint64,
-    Bytes32, BLSPubkey,
-    Slot, Epoch, ValidatorIndex, Gwei, Root,
+    Bytes32, Slot, Epoch, ValidatorIndex, Gwei, Root,
     ParticipationFlags, KZGCommitment, KZGProof,
 )
 from .phase0 import Validator, Eth1Data, BeaconBlockHeader, SignedBeaconBlockHeader
@@ -82,6 +81,10 @@ class PartialDataColumnPartsMetadata(Container):
     requests: Bitlist[MAX_BLOB_COMMITMENTS_PER_BLOCK]
 
 
+class PartialDataColumnGroupID(Container):
+    beacon_block_root: Root
+
+
 def proposer_lookahead_length() -> int:
     """Length of proposer_lookahead Vector: (MIN_SEED_LOOKAHEAD + 1) * SLOTS_PER_EPOCH."""
     return (MIN_SEED_LOOKAHEAD + 1) * SLOTS_PER_EPOCH()
@@ -141,6 +144,7 @@ __all__ = [
     "DataColumnSidecar",
     "DataColumnsByRootIdentifier",
     "MatrixEntry",
+    "PartialDataColumnGroupID",
     "FuluBeaconState",
     "FuluBeaconBlockBody",
     "FuluBeaconBlock",

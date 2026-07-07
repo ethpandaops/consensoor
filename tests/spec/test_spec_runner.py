@@ -230,6 +230,7 @@ def get_ssz_type_by_name(fork: str, type_name: str) -> Optional[Type]:
         gloas_only_types = {
             "ExecutionPayload",
             "PartialDataColumnSidecar",
+            "PartialDataColumnGroupID",
             "Attestation",
             "IndexedAttestation",
             "AttesterSlashing",
@@ -288,9 +289,11 @@ def get_operation_type_for_test(fork: str, op_name: str) -> Optional[Type]:
         "deposit_request": types.DepositRequest if hasattr(types, "DepositRequest") else None,
         "withdrawal_request": types.WithdrawalRequest if hasattr(types, "WithdrawalRequest") else None,
         "consolidation_request": types.ConsolidationRequest if hasattr(types, "ConsolidationRequest") else None,
-        "execution_payload_bid": None,  # Uses block.ssz_snappy, special handling
+        "execution_payload_bid": types.SignedExecutionPayloadBid if hasattr(types, "SignedExecutionPayloadBid") else None,
         "parent_execution_payload": None,  # Uses block.ssz_snappy, special handling
         "payload_attestation": types.PayloadAttestation if hasattr(types, "PayloadAttestation") else None,
+        "builder_deposit_request": types.BuilderDepositRequest if hasattr(types, "BuilderDepositRequest") else None,
+        "builder_exit_request": types.BuilderExitRequest if hasattr(types, "BuilderExitRequest") else None,
     }
     return op_type_map.get(op_name)
 
@@ -310,6 +313,10 @@ def get_operation_processor(op_name: str) -> Optional[Callable]:
         process_execution_payload_bid,
         process_parent_execution_payload,
         process_payload_attestation,
+    )
+    from consensoor.spec.state_transition.block.operations.builder_request import (
+        process_builder_deposit_request,
+        process_builder_exit_request,
     )
     from consensoor.spec.state_transition.block import (
         process_block_header,
@@ -336,6 +343,8 @@ def get_operation_processor(op_name: str) -> Optional[Callable]:
         "execution_payload_bid": process_execution_payload_bid,
         "parent_execution_payload": process_parent_execution_payload,
         "payload_attestation": process_payload_attestation,
+        "builder_deposit_request": process_builder_deposit_request,
+        "builder_exit_request": process_builder_exit_request,
     }
     return processors.get(op_name)
 
@@ -406,7 +415,7 @@ def discover_ssz_static_tests(spec_tests_dir: Path):
             if not type_dir.is_dir():
                 continue
             type_name = type_dir.name
-            for ssz_file in type_dir.rglob("serialized.ssz_snappy"):
+            for ssz_file in sorted(type_dir.rglob("serialized.ssz_snappy")):
                 case_path = ssz_file.parent
                 case_id = f"{fork}/{type_name}/{case_path.parent.name}/{case_path.name}"
                 test_cases.append((case_id, fork, type_name, case_path))
@@ -664,73 +673,33 @@ def discover_random_tests(spec_tests_dir: Path):
     return test_cases
 
 
+CASE_FIXTURES = [
+    ("ssz_case", discover_ssz_static_tests),
+    ("operations_case", discover_operations_tests),
+    ("epoch_case", discover_epoch_processing_tests),
+    ("sanity_blocks_case", discover_sanity_blocks_tests),
+    ("sanity_slots_case", discover_sanity_slots_tests),
+    ("finality_case", discover_finality_tests),
+    ("rewards_case", discover_rewards_tests),
+    ("shuffling_case", discover_shuffling_tests),
+    ("random_case", discover_random_tests),
+    ("compliance_case", discover_fork_choice_compliance_tests),
+]
+
+
 def pytest_generate_tests(metafunc):
-    """Generate test cases from spec test directories."""
+    """Generate test cases from spec test directories.
+
+    Always parametrize (with an empty list if fixtures aren't downloaded)
+    so pytest collects zero tests rather than raising "fixture not found"
+    at setup time.
+    """
     spec_tests_dir = get_spec_tests_dir(metafunc.config)
-    if not spec_tests_dir.exists():
-        return
-
-    if "ssz_case" in metafunc.fixturenames:
-        test_cases = discover_ssz_static_tests(spec_tests_dir)
-        if test_cases:
+    for fixture_name, discover in CASE_FIXTURES:
+        if fixture_name in metafunc.fixturenames:
+            test_cases = discover(spec_tests_dir) if spec_tests_dir.exists() else []
             ids = [tc[0] for tc in test_cases]
-            metafunc.parametrize("ssz_case", test_cases, ids=ids)
-
-    if "operations_case" in metafunc.fixturenames:
-        test_cases = discover_operations_tests(spec_tests_dir)
-        if test_cases:
-            ids = [tc[0] for tc in test_cases]
-            metafunc.parametrize("operations_case", test_cases, ids=ids)
-
-    if "epoch_case" in metafunc.fixturenames:
-        test_cases = discover_epoch_processing_tests(spec_tests_dir)
-        if test_cases:
-            ids = [tc[0] for tc in test_cases]
-            metafunc.parametrize("epoch_case", test_cases, ids=ids)
-
-    if "sanity_blocks_case" in metafunc.fixturenames:
-        test_cases = discover_sanity_blocks_tests(spec_tests_dir)
-        if test_cases:
-            ids = [tc[0] for tc in test_cases]
-            metafunc.parametrize("sanity_blocks_case", test_cases, ids=ids)
-
-    if "sanity_slots_case" in metafunc.fixturenames:
-        test_cases = discover_sanity_slots_tests(spec_tests_dir)
-        if test_cases:
-            ids = [tc[0] for tc in test_cases]
-            metafunc.parametrize("sanity_slots_case", test_cases, ids=ids)
-
-    if "finality_case" in metafunc.fixturenames:
-        test_cases = discover_finality_tests(spec_tests_dir)
-        if test_cases:
-            ids = [tc[0] for tc in test_cases]
-            metafunc.parametrize("finality_case", test_cases, ids=ids)
-
-    if "rewards_case" in metafunc.fixturenames:
-        test_cases = discover_rewards_tests(spec_tests_dir)
-        if test_cases:
-            ids = [tc[0] for tc in test_cases]
-            metafunc.parametrize("rewards_case", test_cases, ids=ids)
-
-    if "shuffling_case" in metafunc.fixturenames:
-        test_cases = discover_shuffling_tests(spec_tests_dir)
-        if test_cases:
-            ids = [tc[0] for tc in test_cases]
-            metafunc.parametrize("shuffling_case", test_cases, ids=ids)
-
-    if "random_case" in metafunc.fixturenames:
-        test_cases = discover_random_tests(spec_tests_dir)
-        if test_cases:
-            ids = [tc[0] for tc in test_cases]
-            metafunc.parametrize("random_case", test_cases, ids=ids)
-
-    if "compliance_case" in metafunc.fixturenames:
-        test_cases = discover_fork_choice_compliance_tests(spec_tests_dir)
-        # Always parametrize (with empty list if comptests fixtures aren't
-        # downloaded) so pytest collects zero tests rather than raising
-        # "fixture 'compliance_case' not found" at setup time.
-        ids = [tc[0] for tc in test_cases]
-        metafunc.parametrize("compliance_case", test_cases, ids=ids)
+            metafunc.parametrize(fixture_name, test_cases, ids=ids)
 
 
 class TestSSZStatic:
@@ -806,7 +775,7 @@ class TestOperations:
                 if not block_file.exists():
                     pytest.skip(f"Block file not found for {case_id}")
                 operation = load_ssz_snappy(block_file, block_type)
-            elif op_name in ("execution_payload", "withdrawals", "execution_payload_bid", "parent_execution_payload"):
+            elif op_name in ("execution_payload", "withdrawals", "parent_execution_payload"):
                 # These have special handling below - operation loaded differently
                 operation = None
             else:
@@ -858,12 +827,6 @@ class TestOperations:
                     payload_file = case_path / "execution_payload.ssz_snappy"
                     payload = load_ssz_snappy(payload_file, payload_type)
                     processor(state_copy, payload)
-            elif op_name == "execution_payload_bid":
-                # Load unsigned block and extract signed_execution_payload_bid from body
-                block_type = get_unsigned_block_type_for_fork(fork)
-                block_file = case_path / "block.ssz_snappy"
-                block = load_ssz_snappy(block_file, block_type)
-                processor(state_copy, block)
             elif op_name == "parent_execution_payload":
                 block_type = get_unsigned_block_type_for_fork(fork)
                 block_file = case_path / "block.ssz_snappy"
@@ -1097,7 +1060,6 @@ class TestShuffling:
         case_id, fork, case_file = shuffling_case
 
         from consensoor.spec.state_transition.helpers.beacon_committee import compute_shuffled_index
-        from consensoor.spec.constants import SHUFFLE_ROUND_COUNT
 
         data = load_yaml(case_file)
         if data is None:
