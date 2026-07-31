@@ -25,12 +25,17 @@ if TYPE_CHECKING:
     from ....types.gloas import BeaconState, PayloadAttestation
 
 
-def process_execution_payload_bid(state: "BeaconState", signed_bid) -> None:
+def process_execution_payload_bid(state: "BeaconState", signed_bid) -> int:
     """Process an execution payload bid (ePBS).
 
     Args:
         state: Beacon state (modified in place)
         signed_bid: Signed execution payload bid
+
+    Returns:
+        The parent block's slot, read from the bid in the state before it is
+        overwritten by the new bid. Later given to process_attestation to
+        look up the payload availability of the attested block.
 
     Raises:
         AssertionError: If validation fails
@@ -100,7 +105,12 @@ def process_execution_payload_bid(state: "BeaconState", signed_bid) -> None:
             SLOTS_PER_EPOCH() + int(bid.slot) % SLOTS_PER_EPOCH()
         ] = pending_payment
 
+    # Cache the parent block's slot before overwriting the bid
+    parent_slot = int(state.latest_execution_payload_bid.slot)
+
     state.latest_execution_payload_bid = bid
+
+    return parent_slot
 
 
 def settle_builder_payment(state: "BeaconState", payment_index: int) -> None:
@@ -122,7 +132,6 @@ def apply_parent_execution_payload(state: "BeaconState", requests) -> None:
     from ....constants import (
         SLOTS_PER_EPOCH,
         SLOTS_PER_HISTORICAL_ROOT,
-        MAX_DEPOSIT_REQUESTS_PER_PAYLOAD,
         MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD,
         MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD,
         MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD,
@@ -138,7 +147,7 @@ def apply_parent_execution_payload(state: "BeaconState", requests) -> None:
     parent_slot = int(parent_bid.slot)
     parent_epoch = compute_epoch_at_slot(parent_slot)
 
-    assert len(requests.deposits) <= MAX_DEPOSIT_REQUESTS_PER_PAYLOAD
+    # [Modified in alpha.13] MAX_DEPOSIT_REQUESTS_PER_PAYLOAD removed in Gloas (specs #5436)
     assert len(requests.withdrawals) <= MAX_WITHDRAWAL_REQUESTS_PER_PAYLOAD
     assert len(requests.consolidations) <= MAX_CONSOLIDATION_REQUESTS_PER_PAYLOAD
     # [New in Gloas:EIP8282]

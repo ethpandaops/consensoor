@@ -206,6 +206,7 @@ def get_attestation_participation_flag_indices(
     state: "BeaconState",
     data: "AttestationData",
     inclusion_delay: int,
+    parent_slot: int | None = None,
 ) -> Sequence[int]:
     """Return the participation flag indices to set for an attestation.
 
@@ -213,6 +214,11 @@ def get_attestation_participation_flag_indices(
         state: Beacon state
         data: Attestation data
         inclusion_delay: Slots between attestation and inclusion
+        parent_slot: [Gloas] Slot of the parent of the block being processed.
+            The timely head flag requires attesting to the parent block, so
+            the payload availability of the attested block is tracked at
+            ``parent_slot``, even when ``data.slot`` is a skipped slot
+            (specs #5473).
 
     Returns:
         Sequence of flag indices to set
@@ -238,7 +244,13 @@ def get_attestation_participation_flag_indices(
             assert int(data.index) == 0
             payload_matches = True
         else:
-            slot_index = int(data.slot) % SLOTS_PER_HISTORICAL_ROOT()
+            # [Modified in alpha.13] look up availability at the parent
+            # block's slot, not the attestation slot (specs #5473)
+            if parent_slot is None:
+                # Outside of block processing the bid in the state is still
+                # the parent block's bid, so its slot is the parent's slot.
+                parent_slot = int(state.latest_execution_payload_bid.slot)
+            slot_index = parent_slot % SLOTS_PER_HISTORICAL_ROOT()
             payload_index = int(state.execution_payload_availability[slot_index])
             payload_matches = int(data.index) == payload_index
         is_matching_head = is_matching_target and head_root_matches and payload_matches

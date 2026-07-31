@@ -53,7 +53,9 @@ if TYPE_CHECKING:
     from ....types.electra import Attestation
 
 
-def process_attestation(state: "BeaconState", attestation: "Attestation") -> None:
+def process_attestation(
+    state: "BeaconState", attestation: "Attestation", parent_slot: int | None = None
+) -> None:
     """Process an attestation.
 
     Handles both Phase0 (PendingAttestation) and Altair+ (participation flags).
@@ -61,13 +63,17 @@ def process_attestation(state: "BeaconState", attestation: "Attestation") -> Non
     Args:
         state: Beacon state (modified in place)
         attestation: Attestation to process
+        parent_slot: [Gloas] Slot of the parent of the block being processed,
+            used for the payload availability lookup (specs #5473). Outside of
+            block processing this may be None, in which case the bid still in
+            the state is the parent block's bid and its slot is used.
 
     Raises:
         AssertionError: If validation fails
     """
     # Check if Phase0 (uses previous_epoch_attestations) or Altair+ (uses participation flags)
     if hasattr(state, "previous_epoch_participation"):
-        process_attestation_altair(state, attestation)
+        process_attestation_altair(state, attestation, parent_slot=parent_slot)
     else:
         process_attestation_phase0(state, attestation)
 
@@ -135,7 +141,9 @@ def process_attestation_phase0(state: "BeaconState", attestation: "Attestation")
     )
 
 
-def process_attestation_altair(state: "BeaconState", attestation: "Attestation") -> None:
+def process_attestation_altair(
+    state: "BeaconState", attestation: "Attestation", parent_slot: int | None = None
+) -> None:
     """Process an attestation in Altair+ style (participation flags)."""
     data = attestation.data
     current_epoch = get_current_epoch(state)
@@ -257,8 +265,9 @@ def process_attestation_altair(state: "BeaconState", attestation: "Attestation")
     inclusion_delay = int(state.slot) - int(data.slot)
 
     # Get participation flag indices
+    # [Modified in alpha.13] Gloas threads the parent block's slot (specs #5473)
     participation_flags = get_attestation_participation_flag_indices(
-        state, data, inclusion_delay
+        state, data, inclusion_delay, parent_slot=parent_slot
     )
 
     # Update epoch participation

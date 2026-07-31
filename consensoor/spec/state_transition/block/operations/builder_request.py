@@ -90,13 +90,22 @@ def process_builder_deposit_request(
     reassigned to a different builder with a new public key. Deposits to an
     exited builder are withdrawn to the builder's execution address.
     """
+    from ....constants import PAYLOAD_BUILDER_VERSION
+    from ...helpers.predicates import is_builder_withdrawal_credential
+
+    # [Modified in alpha.13] ignore deposits with unexpected withdrawal
+    # credential prefixes; funds are lost (specs #5439)
+    if not is_builder_withdrawal_credential(bytes(request.withdrawal_credentials)):
+        return
+
     builder_pubkeys = [b.pubkey for b in state.builders]
     if request.pubkey not in builder_pubkeys:
         if is_valid_builder_deposit_signature(request):
             add_builder_to_registry(
                 state,
                 request.pubkey,
-                int(bytes(request.withdrawal_credentials)[0]),
+                # [Modified in alpha.13] always a payload builder (specs #5439)
+                PAYLOAD_BUILDER_VERSION,
                 bytes(request.withdrawal_credentials)[12:],
                 int(request.amount),
                 int(state.slot),

@@ -3338,6 +3338,28 @@ class BeaconNode:
         key = (dependent_root, proposal_slot, validator_index)
         if key in self.proposer_preferences:
             return False, "ignore"
+        # [Modified in alpha.13] dependent-root checks (specs #5443)
+        # [IGNORE] the block with root dependent_root has been seen
+        dependent_block = self.store.get_block(dependent_root)
+        if dependent_block is None:
+            return False, "ignore"
+        dependent_slot = int(dependent_block.message.slot)
+        from .spec.state_transition.helpers.misc import compute_start_slot_at_epoch
+
+        lookahead_epoch = max(0, proposal_epoch - MIN_SEED_LOOKAHEAD)
+        epoch_start_slot = compute_start_slot_at_epoch(lookahead_epoch)
+        # [REJECT] the dependent block predates the lookahead epoch
+        if dependent_slot >= epoch_start_slot:
+            return False, "reject"
+        # [IGNORE] is_valid_dependent_root: the dependent block is, or could
+        # become, the latest block prior to the start of the lookahead epoch —
+        # i.e. it has a descendant at or past the epoch start, or it is head
+        has_post_epoch_child = any(
+            int(child.message.slot) >= epoch_start_slot
+            for child in self.store.get_blocks_by_parent(dependent_root)
+        )
+        if not has_post_epoch_child and dependent_root != self.head_root:
+            return False, "ignore"
         # [REJECT] validator is the scheduled proposer for the slot
         if not is_valid_proposal_slot(self.state, prefs):
             return False, "reject"

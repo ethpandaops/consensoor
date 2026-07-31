@@ -375,10 +375,12 @@ def process_block(state: "BeaconState", block: "BeaconBlock") -> None:
         process_parent_execution_payload(state, block)
         process_block_header(state, block)
         process_withdrawals(state)
-        process_execution_payload_bid(state, block.body.signed_execution_payload_bid)
+        # [Modified in alpha.13] bid returns the parent block's slot, which
+        # process_attestation needs for payload availability lookups (specs #5473)
+        parent_slot = process_execution_payload_bid(state, block.body.signed_execution_payload_bid)
         process_randao(state, block.body)
         process_eth1_data(state, block.body)
-        process_operations(state, block.body, is_gloas=True)
+        process_operations(state, block.body, is_gloas=True, parent_slot=parent_slot)
         if hasattr(block.body, "sync_aggregate"):
             process_sync_aggregate(state, block.body.sync_aggregate)
         return
@@ -397,7 +399,9 @@ def process_block(state: "BeaconState", block: "BeaconBlock") -> None:
         process_sync_aggregate(state, block.body.sync_aggregate)
 
 
-def process_operations(state: "BeaconState", body, is_gloas: bool = False) -> None:
+def process_operations(
+    state: "BeaconState", body, is_gloas: bool = False, parent_slot: int | None = None
+) -> None:
     """Process all block operations.
 
     Processes in order:
@@ -470,8 +474,9 @@ def process_operations(state: "BeaconState", body, is_gloas: bool = False) -> No
         process_attester_slashing(state, attester_slashing)
 
     # Process attestations
+    # [Modified in alpha.13] Gloas passes the parent block's slot (specs #5473)
     for attestation in body.attestations:
-        process_attestation(state, attestation)
+        process_attestation(state, attestation, parent_slot=parent_slot)
 
     # Process deposits
     if hasattr(state, "proposer_lookahead"):
