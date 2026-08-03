@@ -1,8 +1,9 @@
 //! Native Rust libp2p stack for consensoor.
 //!
 //! This is a thin Python binding around `rust-libp2p` configured the same way
-//! Lighthouse configures its `lighthouse_network` crate (TCP + Noise + Yamux,
-//! gossipsub with the Eth2 message-id rules, identify, ping, request/response).
+//! Lighthouse configures its `lighthouse_network` crate (QUIC as the primary
+//! transport with TCP + Noise + Yamux as the fallback, gossipsub with the
+//! Eth2 message-id rules, identify, ping, request/response).
 //!
 //! The Python API exposed here mirrors what consensoor needs from a gossipsub
 //! host: subscribe to a topic, publish to a topic, get a callback for each

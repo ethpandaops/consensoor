@@ -9,7 +9,7 @@ use async_channel::{bounded, Receiver, Sender};
 use enr::{CombinedKey, Enr};
 use futures::StreamExt;
 use libp2p::{
-    core::{upgrade, ConnectedPoint},
+    core::{muxing::StreamMuxerBox, upgrade, ConnectedPoint},
     gossipsub::{self, IdentTopic, ValidationMode},
     identify, identity, noise,
     request_response,
@@ -107,6 +107,12 @@ pub struct NetworkConfig {
     /// External IPv4 to advertise in the ENR. None = omit ip field.
     #[pyo3(get, set)]
     pub external_ip: Option<String>,
+    /// UDP port for the libp2p QUIC transport (p2p-interface: QUIC is a
+    /// MUST-support primary transport). None = tcp_port + 1, mirroring
+    /// Lighthouse's default. Must differ from the discv5 UDP port, which
+    /// binds tcp_port.
+    #[pyo3(get, set)]
+    pub quic_port: Option<u16>,
 }
 
 #[pymethods]
@@ -126,6 +132,7 @@ impl NetworkConfig {
         syncnets=vec![0u8; 1],
         cgc=4,
         external_ip=None,
+        quic_port=None,
     ))]
     pub fn new(
         listen_addr: String,
@@ -141,6 +148,7 @@ impl NetworkConfig {
         syncnets: Vec<u8>,
         cgc: u64,
         external_ip: Option<String>,
+        quic_port: Option<u16>,
     ) -> Self {
         Self {
             listen_addr,
@@ -156,6 +164,7 @@ impl NetworkConfig {
             syncnets,
             cgc,
             external_ip,
+            quic_port,
         }
     }
 }
@@ -167,6 +176,43 @@ fn parse_tcp_port(addr: &Multiaddr) -> Option<u16> {
         Protocol::Tcp(port) => Some(port),
         _ => None,
     })
+}
+
+/// Dial a peer that may expose several endpoints. Callers pass the
+/// addresses QUIC-first (p2p-interface: "clients SHOULD prioritise peer's
+/// QUIC addresses"); with `dial_concurrency_factor(1)` the swarm walks the
+/// list sequentially, so TCP naturally serves as the fallback when the
+/// QUIC endpoint is unreachable.
+fn dial_peer(
+    swarm: &mut Swarm<Eth2Behaviour>,
+    mut addrs: Vec<Multiaddr>,
+) -> Result<(), libp2p::swarm::DialError> {
+    use libp2p::multiaddr::Protocol;
+    use libp2p::swarm::dial_opts::DialOpts;
+    match addrs.len() {
+        0 => Ok(()),
+        1 => swarm.dial(addrs.remove(0)),
+        _ => {
+            let peer_id = addrs.iter().flat_map(|a| a.iter()).find_map(|p| match p {
+                Protocol::P2p(pid) => Some(pid),
+                _ => None,
+            });
+            match peer_id {
+                Some(pid) => swarm.dial(DialOpts::peer_id(pid).addresses(addrs).build()),
+                None => {
+                    // No peer id to group the dial attempts under — fall back
+                    // to independent per-address dials (best effort).
+                    let mut result = Ok(());
+                    for a in addrs {
+                        if let Err(e) = swarm.dial(a) {
+                            result = Err(e);
+                        }
+                    }
+                    result
+                }
+            }
+        }
+    }
 }
 
 /// Build (or rebuild) our local Eth2 ENR using the libp2p secp256k1 key.
@@ -182,6 +228,7 @@ fn build_local_enr(
     enr_key: &CombinedKey,
     cfg: &NetworkConfig,
     tcp_port: u16,
+    quic_port: u16,
     seq: u64,
 ) -> Result<Enr<CombinedKey>, Box<dyn std::error::Error>> {
     use bytes::Bytes;
@@ -189,8 +236,16 @@ fn build_local_enr(
     builder.seq(seq);
     builder.tcp4(tcp_port);
     builder.udp4(tcp_port);
+    // libp2p QUIC (UDP) listening port. p2p-interface lists `quic`/`quic6`
+    // among the MAY ENR entries; advertising them is what makes us dialable
+    // over the primary transport. The enr crate has no quic builder helper,
+    // so write the raw key the way Lighthouse does (RLP-encoded u16).
+    builder.add_value("quic", &quic_port);
     if let Some(ip_str) = &cfg.external_ip {
         if let Ok(ip) = ip_str.parse::<IpAddr>() {
+            if ip.is_ipv6() {
+                builder.add_value("quic6", &quic_port);
+            }
             builder.ip(ip);
         }
     }
@@ -240,7 +295,7 @@ pub fn generate_keypair() -> PyResult<(Vec<u8>, String)> {
 enum Command {
     Subscribe(String),
     Publish { topic: String, data: Vec<u8> },
-    Dial(Multiaddr),
+    Dial(Vec<Multiaddr>),
     SendStatus { peer: String, status: StatusMessage },
     AnswerStatus { id: u64, status: StatusMessage },
     SendPing { peer: String, ping: PingMessage },
@@ -299,6 +354,7 @@ pub struct Network {
     /// Cached for ENR rebuilds.
     cfg: Arc<Mutex<NetworkConfig>>,
     tcp_port: u16,
+    quic_port: u16,
     /// Latest StatusMessage snapshot pushed from Python. When `Some`, the
     /// swarm task answers inbound Status RPC requests immediately from this
     /// cache, avoiding the round-trip into Python (which can stall multiple
@@ -348,16 +404,20 @@ impl Network {
 
         // Pull out the tcp port for the ENR (Multiaddr like /ip4/.../tcp/9000).
         let tcp_port = parse_tcp_port(&listen_addr).unwrap_or(9000);
+        // QUIC shares neither the TCP port (different transport) nor the
+        // discv5 UDP socket (which binds tcp_port), so default to tcp+1 —
+        // the same convention Lighthouse uses.
+        let quic_port = config.quic_port.unwrap_or_else(|| tcp_port.wrapping_add(1));
 
-        let initial_enr = build_local_enr(&enr_key, &config, tcp_port, 1)
+        let initial_enr = build_local_enr(&enr_key, &config, tcp_port, quic_port, 1)
             .map_err(|e| PyRuntimeError::new_err(format!("build local ENR: {e}")))?;
         tracing::info!("local ENR: {}", initial_enr.to_base64());
 
-        let dial_targets: Vec<Multiaddr> = config
+        let dial_targets: Vec<Vec<Multiaddr>> = config
             .bootnodes
             .iter()
             .map(|b| {
-                bootnode::parse_dial_target(b)
+                bootnode::parse_dial_targets(b)
                     .map_err(|e| PyValueError::new_err(format!("bootnode {b}: {e}")))
             })
             .collect::<Result<_, _>>()?;
@@ -425,6 +485,7 @@ impl Network {
                 discv5_enr_key,
                 bootnode_enrs,
                 tcp_port,
+                quic_port,
                 cached_status_swarm,
             )
             .await
@@ -455,6 +516,7 @@ impl Network {
             enr_seq: Arc::new(Mutex::new(1)),
             cfg: Arc::new(Mutex::new(config)),
             tcp_port,
+            quic_port,
             cached_status,
         })
     }
@@ -503,7 +565,7 @@ impl Network {
         }
         let mut seq = self.enr_seq.lock();
         *seq += 1;
-        let new_enr = build_local_enr(&self.enr_key, &cfg, self.tcp_port, *seq)
+        let new_enr = build_local_enr(&self.enr_key, &cfg, self.tcp_port, self.quic_port, *seq)
             .map_err(|e| PyRuntimeError::new_err(format!("rebuild ENR: {e}")))?;
         let b64 = new_enr.to_base64();
         *self.local_enr.lock() = new_enr;
@@ -629,10 +691,10 @@ impl Network {
     }
 
     pub fn dial(&self, addr: String) -> PyResult<()> {
-        let addr = bootnode::parse_dial_target(&addr)
+        let addrs = bootnode::parse_dial_targets(&addr)
             .map_err(|e| PyValueError::new_err(format!("dial addr: {e}")))?;
         self.cmd_tx
-            .send_blocking(Command::Dial(addr))
+            .send_blocking(Command::Dial(addrs))
             .map_err(|e| PyRuntimeError::new_err(format!("dial: {e}")))
     }
 
@@ -928,7 +990,7 @@ impl Network {
 async fn run_swarm(
     key: identity::Keypair,
     listen_addr: Multiaddr,
-    dial_targets: Vec<Multiaddr>,
+    dial_targets: Vec<Vec<Multiaddr>>,
     agent_version: String,
     cmd_rx: Receiver<Command>,
     msg_tx: Sender<GossipMessage>,
@@ -948,6 +1010,7 @@ async fn run_swarm(
     discv5_enr_key: CombinedKey,
     bootnode_enrs: Vec<Enr<CombinedKey>>,
     udp_port: u16,
+    quic_port: u16,
     cached_status: Arc<Mutex<Option<StatusMessage>>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let local_peer_id = key.public().to_peer_id();
@@ -959,13 +1022,28 @@ async fn run_swarm(
     // for peers that also support both (lighthouse, prysm, teku, grandine).
     // Peers that ONLY know mplex (lodestar js-libp2p, nimbus nim-libp2p)
     // fall through and negotiate mplex.
-    let transport = tcp::tokio::Transport::default()
+    let tcp_transport = tcp::tokio::Transport::default()
         .upgrade(upgrade::Version::V1)
         .authenticate(noise::Config::new(&key)?)
         .multiplex(upgrade::SelectUpgrade::new(
             yamux::Config::default(),
             libp2p_mplex::Config::default(),
         ))
+        .boxed();
+
+    // QUIC is the MUST-support primary transport since consensus-specs
+    // PR #5330; TCP above stays as the MUST-support fallback. QUIC skips
+    // the Noise/muxer upgrade path entirely — TLS 1.3 (libp2p tls spec)
+    // and native stream multiplexing are part of the transport itself.
+    // QUIC first in the OrTransport so quic-v1 multiaddrs are claimed by
+    // it and everything else falls through to TCP.
+    let quic_transport =
+        libp2p::quic::tokio::Transport::new(libp2p::quic::Config::new(&key));
+
+    let transport = quic_transport
+        .map(|(peer_id, muxer), _| (peer_id, StreamMuxerBox::new(muxer)))
+        .or_transport(tcp_transport)
+        .map(|either, _| either.into_inner())
         .boxed();
 
     // Eth2 gossipsub configuration per consensus-specs phase0/p2p-interface.md
@@ -1061,20 +1139,46 @@ async fn run_swarm(
             ),
     );
 
-    swarm.listen_on(listen_addr)?;
+    swarm.listen_on(listen_addr.clone())?;
 
-    for addr in dial_targets {
-        if let Err(e) = swarm.dial(addr) {
+    // QUIC listener: same interface as the TCP listen addr, UDP quic_port.
+    // Per p2p-interface, a supported transport MUST be enabled for both
+    // dialing and listening. Non-fatal on failure (e.g. port already
+    // bound) — we keep running TCP-only rather than killing the swarm.
+    {
+        use libp2p::multiaddr::Protocol;
+        let ip_component = listen_addr.iter().find_map(|p| match p {
+            Protocol::Ip4(_) | Protocol::Ip6(_) => Some(p),
+            _ => None,
+        });
+        match ip_component {
+            Some(ip) => {
+                let mut quic_addr = Multiaddr::empty();
+                quic_addr.push(ip);
+                quic_addr.push(Protocol::Udp(quic_port));
+                quic_addr.push(Protocol::QuicV1);
+                if let Err(e) = swarm.listen_on(quic_addr.clone()) {
+                    tracing::warn!("quic listen on {quic_addr} failed: {e} (continuing TCP-only)");
+                }
+            }
+            None => {
+                tracing::warn!("listen_addr has no ip component; skipping QUIC listener");
+            }
+        }
+    }
+
+    for addrs in dial_targets {
+        if let Err(e) = dial_peer(&mut swarm, addrs) {
             tracing::warn!("initial dial failed: {e}");
         }
     }
 
     // Spawn discv5 alongside libp2p. As it discovers ENRs, it pushes a
-    // `(PeerId, base64 ENR, Multiaddr)` triple onto `discovered_rx`, which
-    // we drain in the main select! loop: we stash the ENR keyed by peer
-    // id (for the beacon API) and feed the multiaddr to swarm.dial().
+    // `(PeerId, base64 ENR, Vec<Multiaddr>)` triple onto `discovered_rx`,
+    // which we drain in the main select! loop: we stash the ENR keyed by
+    // peer id (for the beacon API) and dial the addresses QUIC-first.
     let (discovered_tx, discovered_rx) =
-        bounded::<(libp2p::PeerId, String, Multiaddr)>(64);
+        bounded::<(libp2p::PeerId, String, Vec<Multiaddr>)>(64);
     if let Err(e) = crate::discovery::spawn_discovery(
         discv5_local_enr,
         discv5_enr_key,
@@ -1115,7 +1219,7 @@ async fn run_swarm(
             // Drain peers discovered by discv5 and dial them via libp2p.
             // Skip peers we already dialed (or that match our local id).
             disc = discovered_rx.recv() => match disc {
-                Ok((peer_id, enr_b64, addr)) => {
+                Ok((peer_id, enr_b64, addrs)) => {
                     if peer_id == local_peer_id {
                         continue;
                     }
@@ -1126,10 +1230,15 @@ async fn run_swarm(
                     if !dialed_via_discovery.insert(peer_id) {
                         continue;
                     }
-                    if let Err(e) = swarm.dial(addr.clone()) {
-                        tracing::debug!("discv5-dial failed for {addr}: {e}");
+                    let addrs_desc = addrs
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if let Err(e) = dial_peer(&mut swarm, addrs) {
+                        tracing::debug!("discv5-dial failed for {peer_id} ({addrs_desc}): {e}");
                     } else {
-                        tracing::info!("discv5: dialing {addr}");
+                        tracing::info!("discv5: dialing {peer_id} via [{addrs_desc}]");
                     }
                 }
                 Err(_) => {
@@ -1146,7 +1255,10 @@ async fn run_swarm(
                         ConnectedPoint::Dialer { .. } => "outbound",
                         ConnectedPoint::Listener { .. } => "inbound",
                     };
-                    tracing::info!("connection established with {peer_id} ({direction})");
+                    tracing::info!(
+                        "connection established with {peer_id} ({direction}) via {}",
+                        endpoint.get_remote_address()
+                    );
                     connected_peers.lock().insert(peer_id.to_string(), direction);
                 }
                 SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
@@ -1356,8 +1468,8 @@ async fn run_swarm(
                         }
                     }
                 }
-                Ok(Command::Dial(addr)) => {
-                    if let Err(e) = swarm.dial(addr) {
+                Ok(Command::Dial(addrs)) => {
+                    if let Err(e) = dial_peer(&mut swarm, addrs) {
                         tracing::warn!("dial failed: {e}");
                     }
                 }
@@ -1721,5 +1833,40 @@ async fn handle_metadata_event(
                 .await;
         }
         Event::ResponseSent { .. } => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_enr_advertises_quic_port() {
+        let key = enr::CombinedKey::generate_secp256k1();
+        let cfg = NetworkConfig::new(
+            "/ip4/0.0.0.0/tcp/9000".to_string(),
+            None,
+            Vec::new(),
+            vec![0u8; 4],
+            None,
+            64,
+            ETH2_AGENT_VERSION.to_string(),
+            vec![0u8; 4],
+            u64::MAX,
+            vec![0u8; 8],
+            vec![0u8; 1],
+            4,
+            Some("192.0.2.7".to_string()),
+            None,
+        );
+        let enr = build_local_enr(&key, &cfg, 9000, 9001, 1).unwrap();
+        assert_eq!(enr.tcp4(), Some(9000));
+        assert_eq!(enr.udp4(), Some(9000));
+        assert_eq!(
+            enr.get_decodable::<u16>("quic").and_then(Result::ok),
+            Some(9001)
+        );
+        // v4-only external ip → no quic6 field
+        assert!(enr.get_decodable::<u16>("quic6").is_none());
     }
 }

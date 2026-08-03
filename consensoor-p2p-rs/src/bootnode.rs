@@ -3,58 +3,25 @@
 //! advertise themselves via ENR, so consensoor needs to accept those directly
 //! until we grow our own discv5.
 
-use enr::{CombinedKey, CombinedPublicKey, Enr, EnrPublicKey};
-use libp2p::{identity, multiaddr::Protocol, Multiaddr, PeerId};
+use enr::{CombinedKey, Enr};
+use libp2p::Multiaddr;
 
 /// Parse a bootnode/dial target. Accepts either a multiaddr string
 /// (`/ip4/.../tcp/.../p2p/...`) or an ENR (`enr:-...`).
-pub fn parse_dial_target(s: &str) -> Result<Multiaddr, String> {
+///
+/// ENRs may yield several addresses, ordered QUIC-first per p2p-interface
+/// ("clients SHOULD prioritise peer's QUIC addresses") with TCP as the
+/// fallback; a plain multiaddr yields exactly one.
+pub fn parse_dial_targets(s: &str) -> Result<Vec<Multiaddr>, String> {
     if s.starts_with("enr:") {
-        enr_to_multiaddr(s)
+        let enr: Enr<CombinedKey> = s.parse().map_err(|e| format!("enr decode: {e}"))?;
+        let (_peer_id, addrs) = crate::discovery::enr_to_peer_id_and_multiaddrs(&enr)
+            .ok_or_else(|| "enr has no dialable (ip, quic/tcp) endpoint".to_string())?;
+        Ok(addrs)
     } else {
-        s.parse::<Multiaddr>()
-            .map_err(|e| format!("multiaddr parse: {e}"))
-    }
-}
-
-fn enr_to_multiaddr(s: &str) -> Result<Multiaddr, String> {
-    let enr: Enr<CombinedKey> = s.parse().map_err(|e| format!("enr decode: {e}"))?;
-
-    let ip_proto = if let Some(ip) = enr.ip4() {
-        Protocol::Ip4(ip)
-    } else if let Some(ip) = enr.ip6() {
-        Protocol::Ip6(ip)
-    } else {
-        return Err("enr has no ip4/ip6".to_string());
-    };
-
-    let tcp_port = enr
-        .tcp4()
-        .or_else(|| enr.tcp6())
-        .ok_or_else(|| "enr has no tcp port".to_string())?;
-
-    let peer_id = pubkey_to_peer_id(&enr.public_key())?;
-
-    let mut addr = Multiaddr::empty();
-    addr.push(ip_proto);
-    addr.push(Protocol::Tcp(tcp_port));
-    addr.push(Protocol::P2p(peer_id));
-    Ok(addr)
-}
-
-fn pubkey_to_peer_id(pk: &CombinedPublicKey) -> Result<PeerId, String> {
-    let bytes = pk.encode();
-    match pk {
-        CombinedPublicKey::Secp256k1(_) => {
-            let pk = identity::secp256k1::PublicKey::try_from_bytes(&bytes)
-                .map_err(|e| format!("secp256k1 decode: {e}"))?;
-            Ok(PeerId::from_public_key(&identity::PublicKey::from(pk)))
-        }
-        CombinedPublicKey::Ed25519(_) => {
-            let pk = identity::ed25519::PublicKey::try_from_bytes(&bytes)
-                .map_err(|e| format!("ed25519 decode: {e}"))?;
-            Ok(PeerId::from_public_key(&identity::PublicKey::from(pk)))
-        }
+        Ok(vec![s
+            .parse::<Multiaddr>()
+            .map_err(|e| format!("multiaddr parse: {e}"))?])
     }
 }
 
@@ -65,13 +32,14 @@ mod tests {
     #[test]
     fn parses_a_plain_multiaddr() {
         let s = "/ip4/127.0.0.1/tcp/9000";
-        let addr = parse_dial_target(s).expect("multiaddr should parse");
-        assert_eq!(addr.to_string(), s);
+        let addrs = parse_dial_targets(s).expect("multiaddr should parse");
+        assert_eq!(addrs.len(), 1);
+        assert_eq!(addrs[0].to_string(), s);
     }
 
     #[test]
     fn rejects_garbage() {
-        assert!(parse_dial_target("not a real address").is_err());
-        assert!(parse_dial_target("enr:not-base64!").is_err());
+        assert!(parse_dial_targets("not a real address").is_err());
+        assert!(parse_dial_targets("enr:not-base64!").is_err());
     }
 }
