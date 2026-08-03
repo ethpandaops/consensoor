@@ -72,6 +72,9 @@ class P2PConfig:
 
     listen_host: str = "0.0.0.0"
     listen_port: int = 9000
+    # UDP port for the QUIC libp2p transport. None = listen_port + 1
+    # (resolved in the Rust binding, matching Lighthouse's convention).
+    quic_port: Optional[int] = None
     static_peers: list[str] = field(default_factory=list)
     fork_digest: bytes = field(default_factory=lambda: b"\x00\x00\x00\x00")
     next_fork_version: bytes = field(default_factory=lambda: b"\x00\x00\x00\x00")
@@ -241,6 +244,7 @@ class P2PHost:
             syncnets=list(self.config.syncnets),
             cgc=int(self.config.custody_group_count),
             external_ip=get_local_ip(),
+            quic_port=self.config.quic_port,
         )
         self._network = cp.Network.start(net_cfg)
         self._peer_id = self._network.peer_id()

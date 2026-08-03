@@ -698,6 +698,7 @@ class BeaconNode:
                 fork_version=fork_version,
                 genesis_validators_root=genesis_validators_root,
                 listen_port=self.config.listen_port,
+                quic_port=self.config.quic_port,
                 static_peers=self.config.peers,
                 next_fork_version=next_fork_version,
                 next_fork_epoch=next_fork_epoch,

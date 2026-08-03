@@ -19,6 +19,9 @@ class Config:
     preset: str = "mainnet"
     listen_host: str = "0.0.0.0"
     listen_port: int = 9000
+    # UDP port for the QUIC libp2p transport. None = listen_port + 1
+    # (resolved in the Rust binding, matching Lighthouse's convention).
+    quic_port: Optional[int] = None
     beacon_api_port: int = 5052
     metrics_port: int = 8008
     data_dir: str = "./data"

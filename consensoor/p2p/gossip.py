@@ -72,6 +72,7 @@ class BeaconGossip:
         fork_version: bytes,
         genesis_validators_root: bytes,
         listen_port: int = 9000,
+        quic_port: Optional[int] = None,
         static_peers: Optional[list[str]] = None,
         next_fork_version: Optional[bytes] = None,
         next_fork_epoch: int = 2**64 - 1,
@@ -112,6 +113,7 @@ class BeaconGossip:
         initial_cgc = 128 if supernode else 4
         config = P2PConfig(
             listen_port=listen_port,
+            quic_port=quic_port,
             static_peers=static_peers or [],
             fork_digest=self.fork_digest,
             next_fork_version=next_fork_version or fork_version,

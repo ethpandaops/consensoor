@@ -121,6 +121,13 @@ def cli():
     envvar="CONSENSOOR_P2P_HOST",
 )
 @click.option(
+    "--quic-port",
+    default=None,
+    type=int,
+    help="UDP port for the QUIC libp2p transport (default: p2p-port + 1)",
+    envvar="CONSENSOOR_QUIC_PORT",
+)
+@click.option(
     "--beacon-api-port",
     default=5052,
     type=int,
@@ -223,6 +230,7 @@ def run(
     preset: str,
     p2p_port: int,
     p2p_host: str,
+    quic_port: Optional[int],
     beacon_api_port: int,
     metrics_port: int,
     peers: tuple[str, ...],
@@ -265,6 +273,7 @@ def run(
         preset=preset,
         listen_port=p2p_port,
         listen_host=p2p_host,
+        quic_port=quic_port,
         beacon_api_port=beacon_api_port,
         metrics_port=metrics_port,
         peers=all_peers,
@@ -285,7 +294,7 @@ def run(
     if engine_force_json:
         logger.info("  Engine transport: JSON-RPC forced (--engine-force-json)")
     logger.info(f"  Target gas limit: {target_gas_limit}M ({target_gas_limit_wei:,} gas)")
-    logger.info(f"  P2P: {p2p_host}:{p2p_port}")
+    logger.info(f"  P2P: {p2p_host}:{p2p_port} (QUIC udp/{quic_port if quic_port is not None else p2p_port + 1})")
     logger.info(f"  Beacon API: port {beacon_api_port}")
     logger.info(f"  Metrics: port {metrics_port}")
     if peers:
