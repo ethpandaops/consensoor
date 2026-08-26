@@ -219,4 +219,11 @@ def build_spec_response() -> dict:
             for entry in net_config.blob_schedule
         ]
 
+    # [New in Gloas:EIP8261] optional gas limit schedule (consensus-specs #5533)
+    if net_config.gas_limit_schedule:
+        spec["GAS_LIMIT_SCHEDULE"] = [
+            {k.upper(): str(v) for k, v in entry.items()}
+            for entry in net_config.gas_limit_schedule
+        ]
+
     return spec

@@ -51,7 +51,7 @@ from .spec.network_config import (
     load_config_from_upstream,
     get_config,
 )
-from .spec.constants import SLOTS_PER_EPOCH
+from .spec.constants import SLOTS_PER_EPOCH, MIN_SEED_LOOKAHEAD
 from .spec.state_transition import process_slots
 from .engine import EngineAPIClient, ForkchoiceState, PayloadStatusEnum
 from .store import Store
@@ -864,7 +864,14 @@ class BeaconNode:
             fork_version = net_config.get_fork_version(epoch)
             genesis_validators_root = bytes(self.state.genesis_validators_root) if self.state else b"\x00" * 32
 
-            fork_digest = compute_fork_digest(fork_version, genesis_validators_root)
+            # Context bytes must be the digest we gossip on: forks at or after
+            # Fulu XOR the blob params into it — a plain digest makes teku fail
+            # the response (UnrecognizedContextBytesException) and penalise us.
+            fork_digest = compute_fork_digest(
+                fork_version,
+                genesis_validators_root,
+                blob_params=self._get_blob_params_for_epoch(net_config, epoch),
+            )
 
             return (block_ssz, fork_digest)
 
@@ -897,7 +904,14 @@ class BeaconNode:
             genesis_validators_root = (
                 bytes(self.state.genesis_validators_root) if self.state else b"\x00" * 32
             )
-            fork_digest = compute_fork_digest(fork_version, genesis_validators_root)
+            # Context bytes must be the digest we gossip on: forks at or after
+            # Fulu XOR the blob params into it — a plain digest makes teku fail
+            # the response (UnrecognizedContextBytesException) and penalise us.
+            fork_digest = compute_fork_digest(
+                fork_version,
+                genesis_validators_root,
+                blob_params=self._get_blob_params_for_epoch(net_config, epoch),
+            )
 
             return (block_ssz, fork_digest)
 
@@ -1708,6 +1722,12 @@ class BeaconNode:
             return False
         return hasattr(self.state, "pending_deposits")
 
+    def _is_gloas_fork(self) -> bool:
+        """Check if current state is at Gloas or later fork."""
+        if not self.state:
+            return False
+        return hasattr(self.state, "builders")
+
     async def _compute_sync_committee_duties(self) -> None:
         """Compute which of our validators are in the current sync committee.
 
@@ -1982,6 +2002,14 @@ class BeaconNode:
                     continue
 
                 proposal_epoch = proposal_slot // slots_per_epoch
+                if proposal_epoch <= MIN_SEED_LOOKAHEAD:
+                    # The dependent root for these epochs is the genesis block
+                    # (specs #5515), which sits at the lookahead epoch's start
+                    # slot — validate_proposer_preferences_gossip REJECTs any
+                    # dependent block at/after that slot, so publishing here
+                    # only costs us peer score (teku/nimbus devnet-8 both
+                    # reject it).
+                    continue
                 try:
                     dependent_root = get_proposer_dependent_root(state, proposal_epoch)
                 except Exception:
@@ -2182,6 +2210,11 @@ class BeaconNode:
         """
         from .spec.types.electra import ElectraAggregateAndProof, SignedElectraAggregateAndProof
         from .spec.types.phase0 import AggregateAndProof, SignedAggregateAndProof
+        from .spec.types.gloas import (
+            Attestation as GloasAttestation,
+            AggregateAndProof as GloasAggregateAndProof,
+            SignedAggregateAndProof as GloasSignedAggregateAndProof,
+        )
         from .spec.types.base import BLSSignature
         from .spec.constants import (
             DOMAIN_SELECTION_PROOF, DOMAIN_AGGREGATE_AND_PROOF,
@@ -2221,8 +2254,21 @@ class BeaconNode:
             return
 
         is_electra = self._is_electra_fork()
+        is_gloas = self._is_gloas_fork()
 
-        if is_electra:
+        if is_gloas:
+            # [Gloas:EIP7688] AggregateAndProof wraps the progressive
+            # Attestation. Wire bytes are identical to Electra's, but the
+            # hash_tree_root (hence the signing root) differs — signing the
+            # Electra container gets every aggregate REJECTed by peers
+            # ("invalid aggregator signature"); the gossip-score penalties
+            # then graylist us and our blocks stop propagating.
+            aggregate_and_proof = GloasAggregateAndProof(
+                aggregator_index=validator_index,
+                aggregate=GloasAttestation.decode_bytes(attestation.encode_bytes()),
+                selection_proof=BLSSignature(selection_proof),
+            )
+        elif is_electra:
             aggregate_and_proof = ElectraAggregateAndProof(
                 aggregator_index=validator_index,
                 aggregate=attestation,
@@ -2240,7 +2286,12 @@ class BeaconNode:
         signing_root = compute_signing_root(aggregate_and_proof, domain)
         signature = await sign_async(key.privkey, signing_root)
 
-        if is_electra:
+        if is_gloas:
+            signed_aggregate = GloasSignedAggregateAndProof(
+                message=aggregate_and_proof,
+                signature=BLSSignature(signature),
+            )
+        elif is_electra:
             signed_aggregate = SignedElectraAggregateAndProof(
                 message=aggregate_and_proof,
                 signature=BLSSignature(signature),
