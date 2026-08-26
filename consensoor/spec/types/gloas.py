@@ -85,8 +85,9 @@ class PartialDataColumnSidecar(Container):
 
 
 class PartialDataColumnPartsMetadata(Container):
-    available: Bitlist[MAX_BLOB_COMMITMENTS_PER_BLOCK]
-    requests: Bitlist[MAX_BLOB_COMMITMENTS_PER_BLOCK]
+    # [Modified in Gloas:EIP7688] CellsBitList = ProgressiveBitList (alpha.14)
+    available: ProgressiveBitlist
+    requests: ProgressiveBitlist
 
 
 class PartialDataColumnGroupID(Container):

@@ -552,6 +552,8 @@ class EngineAPIClient:
         }
         if el_fork == "amsterdam":
             # Custody set unchanged when the optional field is absent.
+            if isinstance(custody_columns, (bytes, bytearray)):
+                custody_columns = ssz.CustodyColumns.decode_bytes(bytes(custody_columns))
             kwargs["custody_columns"] = [custody_columns] if custody_columns is not None else []
         req = fcu_cls(**kwargs)
         raw = await self._v2_request(
@@ -567,10 +569,23 @@ class EngineAPIClient:
         return ForkchoiceUpdateResponse.from_dict(self._fcu_response_ssz_to_dict(decoded))
 
     async def forkchoice_updated_v4(
-        self, forkchoice_state: ForkchoiceState, payload_attributes: Optional[dict] = None
+        self,
+        forkchoice_state: ForkchoiceState,
+        payload_attributes: Optional[dict] = None,
+        custody_columns: Optional[bytes] = None,
     ) -> ForkchoiceUpdateResponse:
-        """JSON-RPC engine_forkchoiceUpdatedV4 (Amsterdam / Gloas)."""
-        params = [forkchoice_state.to_dict(), payload_attributes]
+        """JSON-RPC engine_forkchoiceUpdatedV4 (Amsterdam / Gloas).
+
+        ``custody_columns`` is the 16-byte SSZ ``Bitvector[CELLS_PER_EXT_BLOB]``
+        of columns this node custodies (consensus-specs #5549 / EIP-8070); the
+        EL uses it as its blob-transaction sampling set. ``None`` leaves the
+        EL's custody set unchanged.
+        """
+        params = [
+            forkchoice_state.to_dict(),
+            payload_attributes,
+            "0x" + custody_columns.hex() if custody_columns is not None else None,
+        ]
         result = await self._call("engine_forkchoiceUpdatedV4", params)
         return ForkchoiceUpdateResponse.from_dict(result)
 
@@ -612,19 +627,28 @@ class EngineAPIClient:
         forkchoice_state: ForkchoiceState,
         payload_attributes: Optional[dict] = None,
         timestamp: Optional[int] = None,
+        custody_columns: Optional[bytes] = None,
     ) -> ForkchoiceUpdateResponse:
-        """Update forkchoice via v2 REST when available, else JSON-RPC."""
+        """Update forkchoice via v2 REST when available, else JSON-RPC.
+
+        ``custody_columns`` (16-byte SSZ bitvector) is only forwarded on
+        Gloas/Amsterdam; earlier engine versions have no such parameter.
+        """
         if timestamp is None:
             timestamp = int(time.time())
 
         el_fork = self._el_fork_for_timestamp(timestamp)
         if self._use_v2(el_fork):
-            return await self._forkchoice_updated_v2(el_fork, forkchoice_state, payload_attributes)
+            return await self._forkchoice_updated_v2(
+                el_fork, forkchoice_state, payload_attributes, custody_columns=custody_columns
+            )
 
         fork = self._get_fork_for_timestamp(timestamp)
         logger.debug(f"forkchoice_updated (JSON-RPC): timestamp={timestamp}, fork={fork}")
         if fork == "gloas":
-            return await self.forkchoice_updated_v4(forkchoice_state, payload_attributes)
+            return await self.forkchoice_updated_v4(
+                forkchoice_state, payload_attributes, custody_columns=custody_columns
+            )
         if fork in ("fulu", "electra", "deneb"):
             return await self.forkchoice_updated_v3(forkchoice_state, payload_attributes)
         elif fork == "capella":

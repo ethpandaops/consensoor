@@ -16,6 +16,7 @@ from ...constants import (
     MAX_EFFECTIVE_BALANCE,
     MAX_EFFECTIVE_BALANCE_ELECTRA,
     MIN_SEED_LOOKAHEAD,
+    GENESIS_SLOT,
 )
 from .misc import compute_epoch_at_slot, compute_start_slot_at_epoch
 from .accessors import (
@@ -417,14 +418,30 @@ def is_valid_proposal_slot(state: "BeaconState", preferences) -> bool:
     return int(state.proposer_lookahead[index]) == int(preferences.validator_index)
 
 
+def compute_shuffling_dependent_slot(epoch: int) -> int:
+    """``compute_shuffling_dependent_slot`` from phase0/fork-choice.md.
+
+    [New in alpha.14] (specs #5515) the first two epochs depend on the
+    genesis block (slot GENESIS_SLOT) rather than a zero root.
+    """
+    if epoch <= MIN_SEED_LOOKAHEAD:
+        return GENESIS_SLOT
+    return compute_start_slot_at_epoch(epoch - MIN_SEED_LOOKAHEAD) - 1
+
+
 def get_proposer_dependent_root(state: "BeaconState", epoch: int) -> bytes | None:
     """Return the dependent root for the proposer lookahead at ``epoch``.
 
-    Returns None on underflow (epoch <= MIN_SEED_LOOKAHEAD, where the spec
-    slot would be negative) — callers should substitute the genesis block
-    root per gloas/validator.md.
+    For ``epoch <= MIN_SEED_LOOKAHEAD`` the dependent root is the genesis
+    block root (specs #5515). That root is only addressable through
+    ``state.block_roots`` while ``state.slot < SLOTS_PER_HISTORICAL_ROOT``;
+    past that this returns None and callers must substitute the genesis
+    block root they track themselves.
     """
-    if epoch <= MIN_SEED_LOOKAHEAD:
-        return None
-    slot = compute_start_slot_at_epoch(epoch - MIN_SEED_LOOKAHEAD) - 1
-    return get_block_root_at_slot(state, slot)
+    slot = compute_shuffling_dependent_slot(epoch)
+    try:
+        return get_block_root_at_slot(state, slot)
+    except AssertionError:
+        if epoch <= MIN_SEED_LOOKAHEAD:
+            return None
+        raise

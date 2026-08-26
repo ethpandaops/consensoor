@@ -290,6 +290,10 @@ def process_attestation_altair(
             epoch_participation = state.previous_epoch_participation
 
         if is_gloas:
+            # [Modified in alpha.14] a validator only adds weight to the
+            # builder payment the first time it participates in the epoch
+            # (specs #5543: fixes double-counting under target equivocation).
+            had_no_participation = int(epoch_participation[index]) == 0
             will_set_new_flag = False
             for flag_index, weight in enumerate(PARTICIPATION_FLAG_WEIGHTS):
                 if flag_index in participation_flags and not has_flag(
@@ -304,6 +308,7 @@ def process_attestation_altair(
 
             if (
                 will_set_new_flag
+                and had_no_participation
                 and is_attestation_same_slot(state, data)
                 and int(payment.withdrawal.amount) > 0
             ):

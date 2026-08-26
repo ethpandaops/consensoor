@@ -311,18 +311,22 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
     _t0 = _time.monotonic()
     pre_header = pre.latest_execution_payload_header
 
-    # Spec: latest_execution_payload_bid sets block_hash, gas_limit (alpha 8),
-    # and execution_requests_root from the pre-fork execution payload header.
+    # Spec (alpha.14, #5550/#5553): the upgraded bid mirrors the pre-fork
+    # execution payload header / latest block header — parent_block_hash,
+    # parent_block_root, block_hash, prev_randao, gas_limit and slot are
+    # carried over, builder_index is BUILDER_INDEX_SELF_BUILD, and the
+    # remaining fields are explicitly zero/empty.
+    from ..constants import BUILDER_INDEX_SELF_BUILD
     empty_requests_root = hash_tree_root(ExecutionRequests())
     empty_bid = ExecutionPayloadBid(
-        parent_block_hash=Hash32(),
-        parent_block_root=Root(b"\x00" * 32),
+        parent_block_hash=Hash32(pre_header.parent_hash),
+        parent_block_root=Root(pre.latest_block_header.parent_root),
         block_hash=pre_header.block_hash,
-        prev_randao=Bytes32(),
+        prev_randao=Bytes32(pre_header.prev_randao),
         fee_recipient=b"\x00" * 20,
         gas_limit=uint64(pre_header.gas_limit),
-        builder_index=uint64(0),
-        slot=uint64(0),
+        builder_index=uint64(BUILDER_INDEX_SELF_BUILD),
+        slot=uint64(pre.latest_block_header.slot),
         value=Gwei(0),
         execution_payment=Gwei(0),
         blob_kzg_commitments=[],

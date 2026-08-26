@@ -358,6 +358,16 @@ class BeaconGossip:
         return self._host.peer_id
 
     @property
+    def enr(self) -> Optional[str]:
+        """Latest signed local ENR (`enr:` base64 string), if the host is up."""
+        return self._host.enr
+
+    @property
+    def custody_group_count(self) -> int:
+        """Currently advertised PeerDAS custody_group_count."""
+        return int(self._host.config.custody_group_count)
+
+    @property
     def peer_count(self) -> int:
         """Get the number of connected peers."""
         return self._host.peer_count

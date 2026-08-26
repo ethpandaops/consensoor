@@ -215,8 +215,7 @@ def cli():
 @click.option(
     "--target-gas-limit",
     type=int,
-    default=60,
-    show_default=True,
+    default=None,
     help="Proposer's preferred target gas limit, in millions of gas (e.g. 200 for 200M). "
          "Sent as targetGasLimit in PayloadAttributesV4 on Gloas fcU calls and embedded in "
          "broadcast SignedProposerPreferences.",
@@ -258,9 +257,11 @@ def run(
 
     all_peers = list(peers) + list(bootnodes)
 
-    if target_gas_limit <= 0:
-        raise click.BadParameter("--target-gas-limit must be a positive integer (millions of gas)")
-    target_gas_limit_wei = target_gas_limit * 1_000_000
+    target_gas_limit_wei: Optional[int] = None
+    if target_gas_limit is not None:
+        if target_gas_limit <= 0:
+            raise click.BadParameter("--target-gas-limit must be a positive integer (millions of gas)")
+        target_gas_limit_wei = target_gas_limit * 1_000_000
 
     config = Config(
         engine_api_url=engine_api_url,
@@ -293,7 +294,10 @@ def run(
     logger.info(f"  Engine API: {engine_api_url}")
     if engine_force_json:
         logger.info("  Engine transport: JSON-RPC forced (--engine-force-json)")
-    logger.info(f"  Target gas limit: {target_gas_limit}M ({target_gas_limit_wei:,} gas)")
+    if target_gas_limit_wei is not None:
+        logger.info(f"  Target gas limit: {target_gas_limit}M ({target_gas_limit_wei:,} gas)")
+    else:
+        logger.info("  Target gas limit: network GAS_LIMIT_SCHEDULE (EIP-8261), default 60M")
     logger.info(f"  P2P: {p2p_host}:{p2p_port} (QUIC udp/{quic_port if quic_port is not None else p2p_port + 1})")
     logger.info(f"  Beacon API: port {beacon_api_port}")
     logger.info(f"  Metrics: port {metrics_port}")

@@ -25,6 +25,9 @@ class NetworkConfig:
     config_name: str = "mainnet"
     preset_base: str = "mainnet"
     blob_schedule: list = field(default_factory=list)
+    # [New in Gloas:EIP8261] (consensus-specs #5533) list of {epoch, gas_limit}
+    # entries; optional and introduces no validity rules.
+    gas_limit_schedule: list = field(default_factory=list)
 
     slot_duration_ms: int = 12000
     seconds_per_eth1_block: int = 14
@@ -233,7 +236,7 @@ class NetworkConfig:
                     value = bytes.fromhex(value[2:])
                 elif attr_name in fork_version_fields and isinstance(value, int):
                     value = value.to_bytes(4, "big")
-                elif attr_name == "blob_schedule" and isinstance(value, list):
+                elif attr_name in ("blob_schedule", "gas_limit_schedule") and isinstance(value, list):
                     value = [
                         {k.lower(): v for k, v in entry.items()} for entry in value
                     ]
@@ -246,6 +249,19 @@ class NetworkConfig:
             f"electra_fork_epoch={config.electra_fork_epoch}"
         )
         return config
+
+    def get_scheduled_gas_limit(self, epoch: int) -> int | None:
+        """Return the scheduled gas limit at ``epoch``, if any.
+
+        Mirrors ``get_scheduled_gas_limit`` from gloas/beacon-chain.md
+        (EIP-8261): the entry with the greatest epoch <= ``epoch`` wins.
+        """
+        for entry in sorted(
+            self.gas_limit_schedule, key=lambda e: int(e["epoch"]), reverse=True
+        ):
+            if epoch >= int(entry["epoch"]):
+                return int(entry["gas_limit"])
+        return None
 
     def get_fork_version(self, epoch: int) -> bytes:
         """Get the fork version active at the given epoch."""

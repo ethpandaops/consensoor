@@ -233,6 +233,7 @@ def get_ssz_type_by_name(fork: str, type_name: str) -> Optional[Type]:
             "ExecutionPayload",
             "PartialDataColumnSidecar",
             "PartialDataColumnGroupID",
+            "PartialDataColumnPartsMetadata",
             "Attestation",
             "IndexedAttestation",
             "AttesterSlashing",

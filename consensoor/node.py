@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
 
-from .config import Config
+from .config import Config, DEFAULT_TARGET_GAS_LIMIT
 from .beacon_sync import RemoteBeaconClient, StateSyncManager
 from .p2p import BeaconGossip
 from .spec.types import (
@@ -170,6 +170,10 @@ class BeaconNode:
         self.state_sync: Optional[StateSyncManager] = None
         self.block_builder: Optional[BlockBuilder] = None
         self.beacon_gossip: Optional[BeaconGossip] = None
+        # discv5 NodeID (from our ENR) + cached custody column bitvector for
+        # engine_forkchoiceUpdated (EIP-8070), keyed by (node_id, cgc).
+        self._node_id: Optional[int] = None
+        self._custody_column_bits_cache: Optional[tuple[tuple[int, int], bytes]] = None
         self.attestation_pool = AttestationPool()
         self.sync_committee_pool = SyncCommitteePool()
         from .payload_attestation_pool import PayloadAttestationPool
@@ -589,6 +593,57 @@ class BeaconNode:
             f"ceil=NUMBER_OF_CUSTODY_GROUPS={net_config.number_of_custody_groups})"
         )
         self.beacon_gossip.update_custody_group_count(cgc)
+
+    def _target_gas_limit_for_slot(self, slot: int) -> int:
+        """Proposer target gas limit advertised for ``slot``.
+
+        CLI/env override wins; otherwise follow the network's
+        GAS_LIMIT_SCHEDULE for the slot's epoch (EIP-8261, consensus-specs
+        #5533), falling back to DEFAULT_TARGET_GAS_LIMIT when the schedule
+        has no entry yet.
+        """
+        if self.config.target_gas_limit is not None:
+            return int(self.config.target_gas_limit)
+        scheduled = get_config().get_scheduled_gas_limit(int(slot) // SLOTS_PER_EPOCH())
+        return int(scheduled) if scheduled is not None else DEFAULT_TARGET_GAS_LIMIT
+
+    def _custody_column_bits(self) -> Optional[bytes]:
+        """SSZ ``Bitvector[NUMBER_OF_COLUMNS]`` of the columns we custody.
+
+        Forwarded on Gloas ``notify_forkchoice_updated`` as the EL's
+        blob-transaction sampling set (consensus-specs #5549 / EIP-8070):
+        ``get_custody_column_bits(node_id, custody_group_count)`` with the
+        node id derived from our ENR. Returns None (custody set unchanged
+        on the EL) when the p2p host isn't up yet. Cached per
+        (node_id, custody_group_count).
+        """
+        if self.beacon_gossip is None:
+            return None
+        try:
+            from .p2p.enr import node_id_from_enr
+            from .spec.state_transition.helpers.custody import get_custody_column_bits
+
+            node_id = self._node_id
+            if node_id is None:
+                enr = self.beacon_gossip.enr
+                node_id = node_id_from_enr(enr) if enr else None
+                if node_id is None:
+                    return None
+                self._node_id = node_id
+            cgc = int(self.beacon_gossip.custody_group_count)
+            cached = self._custody_column_bits_cache
+            if cached is not None and cached[0] == (node_id, cgc):
+                return cached[1]
+            bits = get_custody_column_bits(node_id, cgc)
+            self._custody_column_bits_cache = ((node_id, cgc), bits)
+            logger.info(
+                f"Custody columns for EL sampling: cgc={cgc} "
+                f"columns={sum(bin(b).count('1') for b in bits)} bits=0x{bits.hex()}"
+            )
+            return bits
+        except Exception as e:
+            logger.debug(f"custody column bits unavailable: {e}")
+            return None
 
     async def _init_engine_client(self) -> None:
         """Initialize the Engine API client."""
@@ -1099,7 +1154,7 @@ class BeaconNode:
             }
             if hasattr(self.state, "ptc_window"):
                 payload_attributes["slotNumber"] = hex(int(slot))
-                payload_attributes["targetGasLimit"] = hex(int(self.config.target_gas_limit))
+                payload_attributes["targetGasLimit"] = hex(self._target_gas_limit_for_slot(slot))
 
             # Debug: compare head_root with hash of latest_block_header
             latest_header_hash = hash_tree_root(self.state.latest_block_header)
@@ -1112,7 +1167,10 @@ class BeaconNode:
             )
 
             response = await self.engine.forkchoice_updated(
-                forkchoice_state, payload_attributes, timestamp=timestamp
+                forkchoice_state,
+                payload_attributes,
+                timestamp=timestamp,
+                custody_columns=self._custody_column_bits(),
             )
 
             if response.payload_id:
@@ -1359,7 +1417,7 @@ class BeaconNode:
             }
             if is_gloas:
                 payload_attributes["target_gas_limit"] = str(
-                    int(self.config.target_gas_limit)
+                    self._target_gas_limit_for_slot(proposal_slot)
                 )
 
             await self.beacon_api.emit_payload_attributes(
@@ -1446,10 +1504,15 @@ class BeaconNode:
             gloas_fork_epoch = getattr(network_config, "gloas_fork_epoch", None)
             if gloas_fork_epoch is not None and next_slot // SLOTS_PER_EPOCH() >= gloas_fork_epoch:
                 payload_attributes["slotNumber"] = hex(int(next_slot))
-                payload_attributes["targetGasLimit"] = hex(int(self.config.target_gas_limit))
+                payload_attributes["targetGasLimit"] = hex(
+                    self._target_gas_limit_for_slot(next_slot)
+                )
 
             response = await self.engine.forkchoice_updated(
-                forkchoice_state, payload_attributes, timestamp=timestamp
+                forkchoice_state,
+                payload_attributes,
+                timestamp=timestamp,
+                custody_columns=self._custody_column_bits(),
             )
 
             if response.payload_id:
@@ -1939,7 +2002,7 @@ class BeaconNode:
                     key,
                     bytes(dependent_root),
                     self.config.fee_recipient_bytes,
-                    self.config.target_gas_limit,
+                    self._target_gas_limit_for_slot(proposal_slot),
                 )
                 if signed is None:
                     continue
@@ -1960,7 +2023,7 @@ class BeaconNode:
                     logger.info(
                         f"Proposer preferences: vi={vi} slot={proposal_slot} "
                         f"fee_recipient={self.config.fee_recipient} "
-                        f"target_gas_limit={self.config.target_gas_limit}"
+                        f"target_gas_limit={self._target_gas_limit_for_slot(proposal_slot)}"
                     )
                 except Exception as e:
                     logger.warning(
@@ -2597,7 +2660,11 @@ class BeaconNode:
                 finalized_block_hash=self._resolve_finalized_block_hash() or b"\x00" * 32,
             )
 
-            fc_response = await self.engine.forkchoice_updated(forkchoice_state, timestamp=payload_timestamp)
+            fc_response = await self.engine.forkchoice_updated(
+                forkchoice_state,
+                timestamp=payload_timestamp,
+                custody_columns=self._custody_column_bits(),
+            )
             logger.info(
                 f"Block forkchoice updated: status={fc_response.payload_status.status}, "
                 f"new_head={new_block_hash.hex()[:16]}"
@@ -4419,7 +4486,9 @@ class BeaconNode:
                 finalized_block_hash=b"\x00" * 32,
             )
 
-            response = await self.engine.forkchoice_updated(forkchoice_state, timestamp=timestamp)
+            response = await self.engine.forkchoice_updated(
+                forkchoice_state, timestamp=timestamp, custody_columns=self._custody_column_bits()
+            )
             logger.debug(
                 f"Forkchoice updated (no payload prep): head={head_block_hash.hex()[:16]}, "
                 f"status={response.payload_status.status}"

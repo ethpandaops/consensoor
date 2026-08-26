@@ -4,6 +4,9 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 
+DEFAULT_TARGET_GAS_LIMIT = 60_000_000
+
+
 @dataclass
 class Config:
     """Node configuration."""
@@ -34,8 +37,10 @@ class Config:
     emit_payload_attributes: bool = False
     # Proposer's preferred target gas limit, in gas (not millions). Sent as
     # targetGasLimit on Gloas PayloadAttributesV4 and as
-    # ProposerPreferences.target_gas_limit. Default: 60_000_000.
-    target_gas_limit: int = 60_000_000
+    # ProposerPreferences.target_gas_limit. None = follow the network's
+    # GAS_LIMIT_SCHEDULE (EIP-8261) for the epoch, falling back to
+    # DEFAULT_TARGET_GAS_LIMIT when the schedule has no entry.
+    target_gas_limit: Optional[int] = None
     _el_client_info: Optional[dict] = field(default=None, repr=False)
 
     @property
