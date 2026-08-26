@@ -37,3 +37,6 @@ py-libp2p-local/
 tests/spec-tests-mainnet/
 tests/spec-tests-nightly/
 .claude/
+
+# Local devnet/kurtosis args files (machine-specific, kept out of the repo)
+devnet/
