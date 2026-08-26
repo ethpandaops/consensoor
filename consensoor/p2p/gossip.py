@@ -89,6 +89,12 @@ class BeaconGossip:
             genesis_validators_root,
             blob_params=blob_params,
         )
+        # Publish digest. When a resolver is installed (see
+        # set_fork_digest_resolver) the *current wall-clock epoch's* digest
+        # is used for every publish, so messages never go out on the old
+        # fork's topics after a fork boundary just because the node's slot
+        # loop is lagging (peers reject those and penalise our score).
+        self._fork_digest_resolver = None
         if fork_digest_override:
             self.fork_digest = fork_digest_override
             if fork_digest_override != computed_digest:
@@ -254,15 +260,34 @@ class BeaconGossip:
 
         return wrapped
 
+    @property
+    def fork_digest(self) -> bytes:
+        if self._fork_digest_resolver is not None:
+            try:
+                resolved = self._fork_digest_resolver()
+                if resolved:
+                    return resolved
+            except Exception as e:
+                logger.debug(f"fork digest resolver failed: {e}")
+        return self._fork_digest
+
+    @fork_digest.setter
+    def fork_digest(self, value: bytes) -> None:
+        self._fork_digest = value
+
+    def set_fork_digest_resolver(self, resolver) -> None:
+        """Install a zero-arg callable returning the digest to publish on now."""
+        self._fork_digest_resolver = resolver
+
     def update_fork_digest(self, fork_digest: bytes) -> None:
         """Update the current fork digest for publishing messages.
 
         Call this when crossing fork boundaries to ensure messages are
         published to the correct topic.
         """
-        if fork_digest != self.fork_digest:
-            logger.info(f"Updating fork_digest for publishing: {self.fork_digest.hex()} -> {fork_digest.hex()}")
-            self.fork_digest = fork_digest
+        if fork_digest != self._fork_digest:
+            logger.info(f"Updating fork_digest for publishing: {self._fork_digest.hex()} -> {fork_digest.hex()}")
+            self._fork_digest = fork_digest
             self._host.update_fork_digest(fork_digest)
 
     def update_custody_group_count(self, new_count: int) -> None:

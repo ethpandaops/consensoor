@@ -124,6 +124,7 @@ class BlockBuilder:
         execution_payload_dict: dict,
         blobs_bundle: dict | None = None,
         execution_requests: list | None = None,
+        execution_head_hash: bytes | None = None,
     ) -> Optional[AnySignedBeaconBlock]:
         """Build a complete signed beacon block."""
         import time as time_mod
@@ -261,7 +262,8 @@ class BlockBuilder:
         if fork == "gloas":
             # GLOAS (ePBS): Build execution payload bid for self-build mode
             execution_payload_bid = self._build_execution_payload_bid(
-                temp_state, slot, execution_payload_dict, blobs_bundle, execution_requests
+                temp_state, slot, execution_payload_dict, blobs_bundle, execution_requests,
+                execution_head_hash=execution_head_hash,
             )
             # Self-build uses G2 point-at-infinity signature (no actual signing needed)
             g2_point_at_infinity = b"\xc0" + b"\x00" * 95
@@ -432,8 +434,11 @@ class BlockBuilder:
 
         transactions = []
         for tx_hex in payload_dict.get("transactions") or []:
-            tx_bytes = hex_to_bytes(tx_hex)
-            transactions.append(list(tx_bytes))
+            # Keep each tx as ``bytes``: remerkleable coerces a lone list-of-ints
+            # element as if it were the whole element collection, so a payload
+            # with exactly ONE transaction blew up the Gloas ProgressiveList
+            # ("ProgressiveByteList() argument after * must be an iterable").
+            transactions.append(hex_to_bytes(tx_hex))
 
         extra_data_bytes = hex_to_bytes(payload_dict.get("extraData", "0x"))
 
@@ -747,6 +752,7 @@ class BlockBuilder:
         execution_payload_dict: dict,
         blobs_bundle: dict | None = None,
         execution_requests: list | None = None,
+        execution_head_hash: bytes | None = None,
     ) -> ExecutionPayloadBid:
         """Build an ExecutionPayloadBid for self-build mode (ePBS).
 
@@ -778,7 +784,14 @@ class BlockBuilder:
         # and the slot N envelope phase-2 assertion
         #   payload.parent_hash == state.latest_block_hash
         # fires on every self-built gloas slot.
-        if hasattr(state, "latest_execution_payload_bid"):
+        if execution_head_hash is not None:
+            # The node tracks whether the parent's payload was actually
+            # revealed (envelope seen / EL validated) — if not, the bid must
+            # build on the last *full* payload (state.latest_block_hash),
+            # otherwise on the parent's committed bid hash.
+            # See Node._gloas_el_head_hash.
+            parent_block_hash = bytes(execution_head_hash)
+        elif hasattr(state, "latest_execution_payload_bid"):
             committed_bid_hash = bytes(state.latest_execution_payload_bid.block_hash)
             if committed_bid_hash != b"\x00" * 32:
                 parent_block_hash = committed_bid_hash

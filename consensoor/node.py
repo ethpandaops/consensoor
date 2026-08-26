@@ -159,6 +159,10 @@ class BeaconNode:
         self.config = config
         self.state: Optional[AnyBeaconState] = None
         self.head_root: Optional[bytes] = None
+        # Execution block hashes our EL has answered VALID for (own payloads
+        # via newPayloadV5, received envelopes via newPayload). Drives the
+        # Gloas fcU head choice in _gloas_el_head_hash.
+        self._el_validated_hashes: set[bytes] = set()
         self.head_slot: int = 0
 
         self.store = Store(config.data_dir)
@@ -774,6 +778,7 @@ class BeaconNode:
             self.beacon_gossip.set_status_provider(self._get_chain_status)
             self.beacon_gossip.set_block_provider(self._get_block_for_slot)
             self.beacon_gossip.set_block_by_root_provider(self._get_block_by_root)
+            self.beacon_gossip.set_fork_digest_resolver(self._publish_fork_digest)
 
             await self.beacon_gossip.start()
             await self.beacon_gossip.activate_subscriptions()
@@ -1044,6 +1049,30 @@ class BeaconNode:
                 return selected_epoch, selected_max_blobs
 
         return net_config.electra_fork_epoch, net_config.max_blobs_per_block_electra
+
+    def _fork_digest_for_epoch(self, epoch: int) -> Optional[bytes]:
+        """BPO-aware fork digest for ``epoch`` (cached)."""
+        if not self.state:
+            return None
+        cache = self.__dict__.setdefault("_fork_digest_cache", {})
+        if epoch in cache:
+            return cache[epoch]
+        from .spec.network_config import get_config as get_network_config
+        from .p2p.encoding import compute_fork_digest
+        net_config = get_network_config()
+        digest = compute_fork_digest(
+            net_config.get_fork_version(epoch),
+            bytes(self.state.genesis_validators_root),
+            blob_params=self._get_blob_params_for_epoch(net_config, epoch),
+        )
+        cache[epoch] = digest
+        return digest
+
+    def _publish_fork_digest(self) -> Optional[bytes]:
+        """Digest to publish gossip on right now: the wall-clock epoch's."""
+        if not self._genesis_time:
+            return None
+        return self._fork_digest_for_epoch(self.current_epoch)
 
     async def _update_fork_digest_for_epoch(self, epoch: int) -> None:
         """Update the fork_digest for publishing when crossing fork boundaries.
@@ -1368,8 +1397,9 @@ class BeaconNode:
             self.sync_committee_pool.prune(slot)
             # Update fork_digest for publishing if we've crossed a fork boundary
             await self._update_fork_digest_for_epoch(epoch)
-            # Recompute sync committee duties at epoch boundary
-            await self._compute_sync_committee_duties()
+            # Recompute sync committee duties at epoch boundary (for the
+            # wall-clock epoch — see the period-boundary note in the method)
+            await self._compute_sync_committee_duties(epoch)
 
         # Compute attester duties for current epoch if not cached
         await self._ensure_attester_duties(epoch)
@@ -1470,6 +1500,17 @@ class BeaconNode:
             network_config = get_config()
             next_slot = slot + 1
             timestamp = self._genesis_time + next_slot * (network_config.slot_duration_ms // 1000)
+            if next_slot <= int(self.state.slot) or timestamp < int(time.time()):
+                # A late prep (e.g. queued behind a slow block import): the
+                # slot we'd build for has already started, and the EL rejects
+                # attributes with a past timestamp (-38003). Just push the
+                # forkchoice head instead.
+                logger.debug(
+                    f"Skipping stale payload prep for slot {next_slot} "
+                    f"(state_slot={self.state.slot}, now>={timestamp})"
+                )
+                await self._update_forkchoice()
+                return
             logger.info(
                 f"Forkchoice prep for slot {next_slot}: head_hash={head_block_hash.hex()[:16]}, "
                 f"finalized_epoch={finalized_epoch}, timestamp={timestamp}, state_slot={self.state.slot}"
@@ -1728,10 +1769,18 @@ class BeaconNode:
             return False
         return hasattr(self.state, "builders")
 
-    async def _compute_sync_committee_duties(self) -> None:
-        """Compute which of our validators are in the current sync committee.
+    async def _compute_sync_committee_duties(self, target_epoch: int | None = None) -> None:
+        """Compute which of our validators are in the sync committee that
+        serves ``target_epoch`` (default: the wall-clock epoch).
 
-        Called at epoch boundaries to refresh sync committee membership.
+        Called at epoch boundaries to refresh sync committee membership. At a
+        sync-committee period boundary our state usually still sits in the
+        previous epoch, so ``state.current_sync_committee`` is the OLD
+        committee — using it made us publish sync messages from stale
+        members for the whole first epoch of every period (peers REJECT
+        those: "InvalidSubnetId … expected: []"). When the target period is
+        one ahead of the state's, the right committee is
+        ``state.next_sync_committee``.
         """
         if not self.state or not self.validator_client:
             return
@@ -1739,10 +1788,32 @@ class BeaconNode:
         if not hasattr(self.state, "current_sync_committee"):
             return
 
+        from .spec.constants import EPOCHS_PER_SYNC_COMMITTEE_PERIOD
+
+        if target_epoch is None:
+            target_epoch = (
+                self.current_epoch if self._genesis_time
+                else int(self.state.slot) // SLOTS_PER_EPOCH()
+            )
+        period_len = EPOCHS_PER_SYNC_COMMITTEE_PERIOD()
+        state_period = (int(self.state.slot) // SLOTS_PER_EPOCH()) // period_len
+        target_period = target_epoch // period_len
+        if target_period == state_period + 1 and hasattr(self.state, "next_sync_committee"):
+            committee = self.state.next_sync_committee
+        elif target_period > state_period + 1:
+            logger.warning(
+                f"Sync committee for epoch {target_epoch} (period {target_period}) not derivable "
+                f"from state at period {state_period}; keeping previous duties"
+            )
+            return
+        else:
+            committee = self.state.current_sync_committee
+
         self._sync_committee_duties.clear()
         self._sync_committee_index_to_positions.clear()
+        self._sync_duties_period = target_period
 
-        committee_pubkeys = list(self.state.current_sync_committee.pubkeys)
+        committee_pubkeys = list(committee.pubkeys)
 
         # Build the full pubkey -> validator_index map once so subnet ingest
         # can resolve foreign messages without scanning validator state every
@@ -1787,8 +1858,15 @@ class BeaconNode:
         if not hasattr(self.state, "current_sync_committee"):
             return
 
-        if not self._sync_committee_duties:
-            await self._compute_sync_committee_duties()
+        from .spec.constants import EPOCHS_PER_SYNC_COMMITTEE_PERIOD
+        slot_period = (slot // SLOTS_PER_EPOCH()) // EPOCHS_PER_SYNC_COMMITTEE_PERIOD()
+        if (
+            not self._sync_committee_duties
+            or getattr(self, "_sync_duties_period", None) != slot_period
+        ):
+            await self._compute_sync_committee_duties(slot // SLOTS_PER_EPOCH())
+        if getattr(self, "_sync_duties_period", None) != slot_period:
+            return
 
         if not self._sync_committee_duties:
             return
@@ -2475,6 +2553,15 @@ class BeaconNode:
                 slot, proposer_key, execution_payload_dict,
                 blobs_bundle=payload_response.blobs_bundle,
                 execution_requests=el_execution_requests,
+                # The bid must commit to the execution parent the EL actually
+                # built this payload on (fcU head at prep time — see
+                # _gloas_el_head_hash); take it from the payload itself so a
+                # late-arriving envelope can't make bid and payload disagree.
+                execution_head_hash=(
+                    bytes.fromhex(execution_payload_dict["parentHash"][2:])
+                    if hasattr(self.state, "latest_execution_payload_bid")
+                    and execution_payload_dict.get("parentHash") else None
+                ),
             )
             if signed_block is None:
                 logger.error("Failed to build block")
@@ -2551,6 +2638,12 @@ class BeaconNode:
                         logger.info("EL is syncing, block may be valid later")
                     else:
                         return
+                else:
+                    own_hash = execution_payload_dict.get("blockHash") or execution_payload_dict.get("block_hash")
+                    if isinstance(own_hash, str):
+                        own_hash = bytes.fromhex(own_hash[2:] if own_hash.startswith("0x") else own_hash)
+                    if own_hash:
+                        self._el_validated_hashes.add(bytes(own_hash))
 
             else:
                 # Non-GLOAS: execution_payload is directly in block body
@@ -4115,7 +4208,14 @@ class BeaconNode:
             return out
 
         result: list[str] = []
-        for type_byte, attr in ((0x00, "deposits"), (0x01, "withdrawals"), (0x02, "consolidations")):
+        for type_byte, attr in (
+            (0x00, "deposits"),
+            (0x01, "withdrawals"),
+            (0x02, "consolidations"),
+            # [New in Gloas:EIP8282]
+            (0x03, "builder_deposits"),
+            (0x04, "builder_exits"),
+        ):
             data = _concat(getattr(execution_requests, attr, ()) or ())
             if data:
                 result.append("0x" + bytes([type_byte]).hex() + data.hex())
@@ -4135,11 +4235,25 @@ class BeaconNode:
         """
         if hasattr(self.state, "latest_execution_payload_bid"):
             bid_hash = bytes(self.state.latest_execution_payload_bid.block_hash)
-            if bid_hash != b"\x00" * 32:
+            if bid_hash != b"\x00" * 32 and self._is_head_payload_revealed(bid_hash):
                 return bid_hash
         if hasattr(self.state, "latest_block_hash"):
+            # The head block's payload hasn't been revealed (no envelope seen
+            # / EL hasn't validated it): the execution head is the last FULL
+            # payload. Pointing fcU at an unrevealed bid hash makes the EL
+            # answer SYNCING (it never got that block), it starts a devp2p
+            # sync it can't finish, and we get no payload_id for our slots.
             return bytes(self.state.latest_block_hash)
         return bytes(self.state.latest_execution_payload_header.block_hash)
+
+    def _is_head_payload_revealed(self, bid_hash: bytes) -> bool:
+        """True if the payload committed by the head's bid is known to us —
+        our EL validated it, or we hold its envelope (gossip/req-resp/self)."""
+        if bid_hash in self._el_validated_hashes:
+            return True
+        if self.head_root and self.store.get_payload(self.head_root) is not None:
+            return True
+        return False
 
     def _withdrawals_attr_list_for_slot(self, target_slot: int) -> list:
         """Expected withdrawals for the payload of ``target_slot``, EL-JSON shaped.
@@ -4467,6 +4581,24 @@ class BeaconNode:
             f"block_hash={bytes(block.body.execution_payload.block_hash).hex()[:16] if hasattr(block.body, 'execution_payload') else 'N/A'}"
         )
 
+    def _versioned_hashes_for_envelope(self, envelope) -> list[bytes]:
+        """Versioned hashes of the blobs committed by the envelope's block bid."""
+        from hashlib import sha256
+        root = bytes(envelope.beacon_block_root)
+        commitments = None
+        block = self.store.get_block(root)
+        if block is not None:
+            try:
+                commitments = block.message.body.signed_execution_payload_bid.message.blob_kzg_commitments
+            except Exception:
+                commitments = None
+        if commitments is None and self.state is not None and root == self.head_root:
+            bid = getattr(self.state, "latest_execution_payload_bid", None)
+            commitments = getattr(bid, "blob_kzg_commitments", None)
+        if commitments is None:
+            return []
+        return [b"\x01" + sha256(bytes(c)).digest()[1:] for c in commitments]
+
     async def _validate_execution_payload(
         self, envelope: ExecutionPayloadEnvelope
     ) -> bool:
@@ -4484,7 +4616,11 @@ class BeaconNode:
             # claimed, and returned INVALID. Use the parent ref the
             # envelope carries explicitly.
             parent_beacon_root = bytes(envelope.parent_beacon_block_root)
-            execution_requests = []
+            # Blob versioned hashes come from the bid that committed to this
+            # payload (the envelope itself carries no commitments); without
+            # them the EL answers INVALID for every blob-carrying payload.
+            versioned_hashes = self._versioned_hashes_for_envelope(envelope)
+            execution_requests = self._encode_execution_requests(envelope.execution_requests)
 
             status = await self.engine.new_payload(
                 envelope.payload,
@@ -4496,6 +4632,7 @@ class BeaconNode:
 
             if status.status == PayloadStatusEnum.VALID:
                 logger.info("Execution payload validated")
+                self._el_validated_hashes.add(bytes(envelope.payload.block_hash))
                 return True
             elif status.status == PayloadStatusEnum.SYNCING:
                 logger.info(f"Payload validation deferred (EL syncing): {status.status}")
