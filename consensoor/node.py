@@ -693,7 +693,13 @@ class BeaconNode:
     # ------------------------------------------------------------------ fork choice / FCR shadow store
 
     def _fc_on_block(self, signed_block, post_state) -> None:
-        """Feed a validated block (+ its post-state) into the spec Store."""
+        """Feed a validated block (+ its post-state) into the spec Store.
+
+        Single gate for the whole feature: with ``--no-fast-confirmation``
+        the Store is never anchored, so every other hook is a no-op and
+        ``_safe_block_hash`` falls back to its default."""
+        if not self.config.fast_confirmation:
+            return
         try:
             from .spec import fork_choice as fc
             if not hasattr(post_state, "latest_execution_payload_bid"):

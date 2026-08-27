@@ -35,6 +35,10 @@ class Config:
     # Emit payload_attributes SSE events on every slot (for external builders
     # such as buildoor). Off by default.
     emit_payload_attributes: bool = False
+    # Run the Fast Confirmation Rule (spec fork choice shadow Store,
+    # `fast_confirmation` SSE event, /consensoor/v1/fast_confirmation, and
+    # FCR-derived safe_block_hash on forkchoiceUpdated). On by default.
+    fast_confirmation: bool = True
     # Proposer's preferred target gas limit, in gas (not millions). Sent as
     # targetGasLimit on Gloas PayloadAttributesV4 and as
     # ProposerPreferences.target_gas_limit. None = follow the network's

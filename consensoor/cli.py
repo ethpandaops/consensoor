@@ -205,6 +205,15 @@ def cli():
     envvar="CONSENSOOR_ENGINE_FORCE_JSON",
 )
 @click.option(
+    "--fast-confirmation/--no-fast-confirmation",
+    default=True,
+    show_default=True,
+    help="Run the Fast Confirmation Rule: maintain the spec fork-choice Store, "
+         "emit fast_confirmation SSE events, serve /consensoor/v1/fast_confirmation "
+         "and use the confirmed block for the EL safe_block_hash.",
+    envvar="CONSENSOOR_FAST_CONFIRMATION",
+)
+@click.option(
     "--emit-payload-attributes",
     is_flag=True,
     default=False,
@@ -242,6 +251,7 @@ def run(
     bootnodes: tuple[str, ...],
     supernode: bool,
     engine_force_json: bool,
+    fast_confirmation: bool,
     emit_payload_attributes: bool,
     target_gas_limit: int,
 ):
@@ -284,6 +294,7 @@ def run(
         supernode=supernode,
         engine_force_json=engine_force_json,
         emit_payload_attributes=emit_payload_attributes,
+        fast_confirmation=fast_confirmation,
         target_gas_limit=target_gas_limit_wei,
     )
 
@@ -299,6 +310,7 @@ def run(
     else:
         logger.info("  Target gas limit: network GAS_LIMIT_SCHEDULE (EIP-8261), default 60M")
     logger.info(f"  P2P: {p2p_host}:{p2p_port} (QUIC udp/{quic_port if quic_port is not None else p2p_port + 1})")
+    logger.info(f"  Fast confirmation rule: {'enabled' if fast_confirmation else 'disabled'}")
     logger.info(f"  Beacon API: port {beacon_api_port}")
     logger.info(f"  Metrics: port {metrics_port}")
     if peers:

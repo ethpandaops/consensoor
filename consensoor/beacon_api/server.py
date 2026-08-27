@@ -186,6 +186,8 @@ class BeaconAPI:
         """GET /consensoor/v1/fast_confirmation — latest FCR result."""
         node = self.node
         root = getattr(node, "confirmed_root", None)
+        if not getattr(node.config, "fast_confirmation", True):
+            return web.json_response({"code": 501, "message": "fast confirmation disabled (--no-fast-confirmation)"}, status=501)
         if root is None or node.fc_store is None or root not in node.fc_store.blocks:
             return web.json_response({"code": 503, "message": "fast confirmation not available yet"}, status=503)
         from ..spec import fast_confirmation as fcr
