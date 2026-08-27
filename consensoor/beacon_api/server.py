@@ -48,6 +48,8 @@ class BeaconAPI:
         self.app.router.add_get("/eth/v1/node/syncing", self.get_syncing)
         self.app.router.add_get("/eth/v1/node/identity", self.get_identity)
         self.app.router.add_get("/consensoor/v1/fast_confirmation", self.get_fast_confirmation)
+        self.app.router.add_get("/consensoor/v1/custody", self.get_custody)
+        self.app.router.add_post("/consensoor/v1/custody/backfill", self.post_custody_backfill)
         self.app.router.add_get("/eth/v1/node/peers", self.get_peers)
         self.app.router.add_get("/eth/v1/beacon/genesis", self.get_genesis)
         self.app.router.add_get("/eth/v1/beacon/states/{state_id}/root", self.get_state_root)
@@ -181,6 +183,49 @@ class BeaconAPI:
                 "el_offline": False,
             }
         })
+
+    async def get_custody(self, request):
+        """GET /consensoor/v1/custody — PeerDAS custody state of this node."""
+        node = self.node
+        das = getattr(node, "das", None)
+        gossip = getattr(node, "beacon_gossip", None)
+        task = getattr(node, "_custody_backfill_task", None)
+        return web.json_response({
+            "data": {
+                "custody_group_count": int(gossip.custody_group_count) if gossip else None,
+                "supernode": bool(node.config.supernode),
+                "validator_custody_requirement": (
+                    None if das is None or not node.validator_client or node.state is None
+                    else int(__import__("consensoor.das", fromlist=["x"]).get_validators_custody_requirement(
+                        node.state, node._attached_validator_indices()))
+                ),
+                "attached_validators": len(node._attached_validator_indices()),
+                "custody_columns": sorted(das.custody_columns) if das else [],
+                "custody_subnets": das.custody_subnets if das else [],
+                "earliest_available_slot": int(getattr(node, "_earliest_available_slot", 0)),
+                "backfill": None if task is None else ("running" if not task.done() else "finished"),
+            }
+        })
+
+    async def post_custody_backfill(self, request):
+        """POST /consensoor/v1/custody/backfill {"start_slot", "end_slot", "columns"?}
+        — fetch custody columns from peers for a slot range (operator tool;
+        the node does this itself when its custody widens)."""
+        node = self.node
+        das = getattr(node, "das", None)
+        if das is None:
+            return web.json_response({"code": 503, "message": "DAS not active"}, status=503)
+        try:
+            body = await request.json()
+            start_slot = int(body["start_slot"])
+            end_slot = int(body["end_slot"])
+            columns = set(int(c) for c in body.get("columns", [])) or set(das.custody_columns)
+        except Exception as e:
+            return web.json_response({"code": 400, "message": f"bad request: {e}"}, status=400)
+        if not columns or end_slot < start_slot:
+            return web.json_response({"code": 400, "message": "nothing to backfill"}, status=400)
+        node._start_custody_backfill_range(columns, start_slot, end_slot)
+        return web.json_response({"data": {"columns": sorted(columns), "start_slot": start_slot, "end_slot": end_slot}})
 
     async def get_fast_confirmation(self, request):
         """GET /consensoor/v1/fast_confirmation — latest FCR result."""

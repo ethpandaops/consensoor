@@ -163,6 +163,11 @@ class BeaconNode:
         # everything we import/receive; drives the FCR `safe_block_hash` and
         # the `fast_confirmation` event; head selection stays as-is for now).
         self.fc_store = None
+        # Status.earliest_available_slot: the slot our custody_group_count
+        # was last raised at, lowered as custody backfill progresses.
+        self._earliest_available_slot: int = 0
+        self._pending_column_requests: dict = {}
+        self._custody_backfill_task = None
         self.fcr_store = None
         self.confirmed_root: Optional[bytes] = None
         # Execution block hashes our EL has answered VALID for (own payloads
@@ -565,53 +570,225 @@ class BeaconNode:
             logger.error(f"Failed to load validator keys: {e}")
             self.validator_client = ValidatorClient([])
 
-    def _update_custody_group_count_from_state(self) -> None:
-        """Apply `get_validators_custody_requirement` from
-        `consensus-specs/specs/fulu/validator.md`.
+    # ------------------------------------------------------------ validator custody
+    # fulu/validator.md, "Validator custody": a node with validators custodies
+    # get_validators_custody_requirement(finalized_state, attached indices)
+    # groups, re-evaluated as attached effective balance changes; the
+    # advertised count only ever grows, persists across restarts, and a raise
+    # is reflected in Status.earliest_available_slot (lowered by backfill).
 
-        Sums effective_balance of attached validators, divides by
-        BALANCE_PER_ADDITIONAL_CUSTODY_GROUP, clamps to
-        [VALIDATOR_CUSTODY_REQUIREMENT, NUMBER_OF_CUSTODY_GROUPS]. Pushes the
-        result into the libp2p host so MetaData v3 advertises it on the next
-        request (seq_number is bumped).
+    def _persisted_custody_group_count(self) -> Optional[int]:
+        try:
+            raw = self.store.get_metadata("custody_group_count")
+            if raw:
+                cgc = int.from_bytes(raw, "big")
+                logger.info(f"Restored custody_group_count={cgc} from DB")
+                return cgc
+        except Exception as e:
+            logger.debug(f"custody_group_count restore failed: {e!r}")
+        return None
+
+    def _custody_source_state(self):
+        """The spec computes the requirement on the latest finalized state;
+        fall back to the head state when we don't hold the finalized one."""
+        if self.state is None:
+            return None
+        try:
+            ckpt = self.state.finalized_checkpoint
+            root = bytes(ckpt.root)
+            if int(ckpt.epoch) > 0 and root != b"\x00" * 32:
+                finalized = self.store.get_state(root)
+                if finalized is not None:
+                    return finalized
+        except Exception as e:
+            logger.debug(f"finalized state lookup for custody failed: {e!r}")
+        return self.state
+
+    def _attached_validator_indices(self) -> list[int]:
+        if not self.validator_client:
+            return []
+        return [idx for idx in self.validator_client._validator_indices.values() if idx is not None]
+
+    def _on_epoch_start_validator_custody(self, slot: int) -> None:
+        """Epoch hook: resolve indices of validators that activated since
+        the last check and re-evaluate the custody requirement."""
+        if not self.validator_client or self.state is None or self.config.supernode:
+            return
+        try:
+            vc = self.validator_client
+            if len(vc._validator_indices) < len(vc.pubkeys):
+                vc.update_validator_indices(self.state)
+            self._update_custody_group_count_from_state()
+        except Exception as e:
+            logger.warning(f"validator custody re-evaluation failed at slot {slot}: {e!r}")
+
+    def _update_custody_group_count_from_state(self) -> None:
+        """Apply `get_validators_custody_requirement` (fulu/validator.md).
+
+        On a raise: advertise the new count immediately (MetaData v3 seq
+        bump + ENR cgc), persist it, custody + subscribe the new columns,
+        set earliest_available_slot to the current slot and start
+        backfilling the new columns over the retention window.
         """
         if self.config.supernode:
             return  # supernode pinned at NUMBER_OF_CUSTODY_GROUPS in BeaconGossip
         if not self.beacon_gossip or not self.validator_client or not self.state:
             return
-        indices = [
-            idx for idx in self.validator_client._validator_indices.values()
-            if idx is not None
-        ]
+        indices = self._attached_validator_indices()
         if not indices:
             return
-        net_config = get_config()
-        total_balance = sum(
-            int(self.state.validators[i].effective_balance) for i in indices
-        )
-        per_group = net_config.balance_per_additional_custody_group
-        count = total_balance // per_group if per_group else 0
-        cgc = min(
-            max(count, net_config.validator_custody_requirement),
-            net_config.number_of_custody_groups,
-        )
+        from .das import get_validators_custody_requirement
+        state = self._custody_source_state()
+        if state is None:
+            return
+        required = get_validators_custody_requirement(state, indices)
+        current = int(self.beacon_gossip.custody_group_count)
+        if required <= current:
+            logger.debug(
+                f"Validator custody requirement {required} <= advertised custody_group_count {current}"
+            )
+            return
         logger.info(
-            f"Computed custody_group_count={cgc} "
-            f"(validators={len(indices)}, total_effective_balance={total_balance} gwei, "
-            f"per_group={per_group} gwei, "
-            f"floor=VALIDATOR_CUSTODY_REQUIREMENT={net_config.validator_custody_requirement}, "
-            f"ceil=NUMBER_OF_CUSTODY_GROUPS={net_config.number_of_custody_groups})"
+            f"Validator custody: requirement {required} > advertised {current} "
+            f"(validators={len(indices)}) -> raising custody_group_count"
         )
-        self.beacon_gossip.update_custody_group_count(cgc)
-        # Custody widened: recompute our columns and subscribe the new subnets.
-        self._refresh_custody_columns()
         das = getattr(self, "das", None)
-        if das is not None:
+        old_columns = set(das.custody_columns) if das is not None else set()
+        self.beacon_gossip.update_custody_group_count(required)
+        try:
+            self.store.save_metadata("custody_group_count", int(required).to_bytes(8, "big"))
+        except Exception as e:
+            logger.debug(f"custody_group_count persist failed: {e!r}")
+        self._refresh_custody_columns()
+        try:
+            current_slot = int((time.time() - self._genesis_time) // (get_config().slot_duration_ms / 1000.0))
+        except Exception:
+            current_slot = int(self.state.slot)
+        self._earliest_available_slot = max(0, int(current_slot))
+        self._push_status_snapshot()
+        if das is None:
+            return
+        new_columns = set(das.custody_columns) - old_columns
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self.beacon_gossip.ensure_data_column_subnets(das.custody_subnets))
+        if new_columns:
+            self._start_custody_backfill(new_columns, int(current_slot))
+
+    # ------------------------------------------------------------ custody backfill
+
+    def _das_start_slot(self) -> Optional[int]:
+        """First slot with data column sidecars (Fulu fork), or None pre-Fulu."""
+        net_config = get_config()
+        far = 2**64 - 1
+        fulu_epoch = int(getattr(net_config, "fulu_fork_epoch", far))
+        if fulu_epoch >= far:
+            return None
+        return fulu_epoch * SLOTS_PER_EPOCH()
+
+    def _start_custody_backfill(self, new_columns: set, current_slot: int) -> None:
+        """Backfill ``new_columns`` over the retention window ending now."""
+        from .spec.constants import MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS
+        das_start = self._das_start_slot()
+        if das_start is None:
+            return
+        retention_slots = MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS() * SLOTS_PER_EPOCH()
+        start_slot = max(das_start, current_slot - retention_slots, 1)
+        end_slot = current_slot - 1
+        if end_slot < start_slot:
+            return
+        self._start_custody_backfill_range(new_columns, start_slot, end_slot)
+
+    def _start_custody_backfill_range(self, new_columns: set, start_slot: int, end_slot: int) -> None:
+        from .das import CustodyBackfiller
+        if self._custody_backfill_task is not None and not self._custody_backfill_task.done():
+            self._custody_backfill_task.cancel()
+
+        def on_progress(reached_slot: int) -> None:
+            if reached_slot < self._earliest_available_slot:
+                self._earliest_available_slot = reached_slot
+                self._push_status_snapshot()
+
+        backfiller = CustodyBackfiller(
+            self.das,
+            request_by_range=self._request_columns_by_range,
+            peers=self._backfill_peers,
+            get_block=self._get_block_by_root_for_das,
+            get_block_by_slot=self.store.get_block_by_slot,
+            on_progress=on_progress,
+        )
+
+        async def run() -> None:
+            logger.info(
+                f"Custody backfill: {len(new_columns)} new columns over slots {start_slot}-{end_slot}"
+            )
             try:
-                loop = asyncio.get_running_loop()
-                loop.create_task(self.beacon_gossip.ensure_data_column_subnets(das.custody_subnets))
-            except RuntimeError:
-                pass
+                stats = await backfiller.run(new_columns, start_slot, end_slot)
+                logger.info(f"Custody backfill finished: {stats}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"Custody backfill failed: {e!r}")
+
+        self._custody_backfill_task = asyncio.get_running_loop().create_task(run())
+
+    def _get_block_by_root_for_das(self, root: bytes):
+        return self.store.get_block(root)
+
+    def _backfill_peers(self) -> list[str]:
+        """Connected peers, those advertising the widest custody (ENR cgc) first."""
+        from .p2p.enr import decode_enr
+        scored = []
+        try:
+            peers = self.beacon_gossip.connected_peers()
+        except Exception:
+            return []
+        for peer in peers:
+            cgc = 0
+            enr = peer.get("enr") or ""
+            if enr:
+                try:
+                    raw = decode_enr(enr).get(b"cgc")
+                    if raw:
+                        cgc = int.from_bytes(raw, "big")
+                except Exception:
+                    pass
+            scored.append((cgc, peer["peer_id"]))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        return [pid for _cgc, pid in scored]
+
+    async def _request_columns_by_range(self, peer: str, payload: bytes, timeout: float = 20.0):
+        """Send data_column_sidecars_by_range to ``peer`` and await its chunks."""
+        from .das import PROTO_COLUMNS_BY_RANGE
+        loop = asyncio.get_running_loop()
+        if peer in self._pending_column_requests:
+            raise RuntimeError(f"request to {peer} already in flight")
+        fut = loop.create_future()
+        self._pending_column_requests[peer] = (loop, fut)
+        try:
+            self.beacon_gossip.request_raw_rpc(peer, PROTO_COLUMNS_BY_RANGE, payload)
+            return await asyncio.wait_for(fut, timeout)
+        finally:
+            self._pending_column_requests.pop(peer, None)
+
+    def _on_columns_by_range_response(self, peer: str, chunks, error) -> None:
+        """Raw req/resp response handler (runs on the host's rpc thread)."""
+        entry = self._pending_column_requests.get(peer)
+        if entry is None:
+            return
+        loop, fut = entry
+
+        def settle() -> None:
+            if fut.done():
+                return
+            if error:
+                fut.set_exception(RuntimeError(str(error)))
+            else:
+                fut.set_result(chunks or [])
+
+        loop.call_soon_threadsafe(settle)
 
     def _target_gas_limit_for_slot(self, slot: int) -> int:
         """Proposer target gas limit advertised for ``slot``.
@@ -1027,6 +1204,7 @@ class BeaconNode:
                 blob_params=blob_params,
                 supernode=self.config.supernode,
                 all_fork_digests=all_fork_digests,
+                custody_group_count=self._persisted_custody_group_count(),
             )
 
             self.beacon_gossip.subscribe_blocks(self._on_p2p_block)
@@ -1060,6 +1238,7 @@ class BeaconNode:
             self.beacon_gossip.set_raw_rpc_provider(PROTO_ENVELOPES_BY_ROOT, self.das.serve_envelopes_by_root)
             self.beacon_gossip.set_raw_rpc_provider(PROTO_COLUMNS_BY_ROOT, self.das.serve_columns_by_root)
             self.beacon_gossip.set_raw_rpc_provider(PROTO_COLUMNS_BY_RANGE, self.das.serve_columns_by_range)
+            self.beacon_gossip.set_raw_rpc_response_handler(PROTO_COLUMNS_BY_RANGE, self._on_columns_by_range_response)
 
             await self.beacon_gossip.start()
             # Custody columns need our node id (from the ENR the host just built).
@@ -1125,7 +1304,7 @@ class BeaconNode:
             "head_root": head_root,
             "finalized_epoch": finalized_epoch,
             "finalized_root": finalized_root,
-            "earliest_available_slot": 0,
+            "earliest_available_slot": int(self._earliest_available_slot),
         }
 
     def _get_block_for_slot(self, slot: int) -> Optional[tuple[bytes, bytes]]:
@@ -1647,6 +1826,8 @@ class BeaconNode:
         epoch = slot // slots_per_epoch
         logger.info(f"Slot {slot} (epoch {epoch})")
         await self._fc_on_tick(slot)
+        if slot % slots_per_epoch == 0:
+            self._on_epoch_start_validator_custody(slot)
 
         # Sync committee message production moved to the 1/3 mark (next
         # to attestations) so we sign this slot's head, not the previous

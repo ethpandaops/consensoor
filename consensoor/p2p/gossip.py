@@ -82,6 +82,7 @@ class BeaconGossip:
         fork_digest_override: Optional[bytes] = None,
         blob_params: Optional[tuple[int, int]] = None,
         supernode: bool = False,
+        custody_group_count: Optional[int] = None,
         all_fork_digests: Optional[list[bytes]] = None,
     ):
         # Use override if provided, otherwise compute from fork_version and genesis_validators_root
@@ -122,6 +123,10 @@ class BeaconGossip:
         # bumps it via update_custody_group_count once validator effective
         # balances are known (per fulu/validator.md).
         initial_cgc = 128 if supernode else 4
+        if custody_group_count is not None:
+            # Highest count advertised before a restart (fulu/validator.md:
+            # the count never decreases and SHOULD persist across restarts).
+            initial_cgc = max(initial_cgc, int(custody_group_count))
         config = P2PConfig(
             listen_port=listen_port,
             quic_port=quic_port,
@@ -376,6 +381,10 @@ class BeaconGossip:
         topic = get_data_column_sidecar_topic(subnet_id, self.fork_digest)
         encoded = encode_message(sidecar_ssz)
         await self._host.publish(topic, encoded)
+
+    def connected_peers(self) -> list[dict]:
+        """Connected peers as beacon-API-shaped dicts (peer_id, enr, ...)."""
+        return self._host.connected_peers()
 
     def set_raw_rpc_provider(self, protocol: str, provider) -> None:
         self._host.set_raw_rpc_provider(protocol, provider)

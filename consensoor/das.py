@@ -13,16 +13,24 @@ specs/gloas/builder.md (get_data_column_sidecars).
 """
 
 
+import asyncio
 import logging
 import time
-from typing import Callable, Iterable, Optional
+from typing import Awaitable, Callable, Iterable, Optional
 
 from remerkleable.basic import uint64
 from remerkleable.complex import Container, List
 
 from .crypto import hash_tree_root
 from .spec import kzg
-from .spec.constants import NUMBER_OF_COLUMNS, DATA_COLUMN_SIDECAR_SUBNET_COUNT, SLOTS_PER_EPOCH
+from .spec.constants import (
+    NUMBER_OF_COLUMNS,
+    DATA_COLUMN_SIDECAR_SUBNET_COUNT,
+    SLOTS_PER_EPOCH,
+    NUMBER_OF_CUSTODY_GROUPS,
+    VALIDATOR_CUSTODY_REQUIREMENT,
+    BALANCE_PER_ADDITIONAL_CUSTODY_GROUP,
+)
 from .spec.types.base import Root
 from .spec.types.fulu import Cell, DataColumnsByRootIdentifier
 from .spec.types.gloas import DataColumnSidecar, SignedExecutionPayloadEnvelope
@@ -54,6 +62,17 @@ class DataColumnSidecarsByRangeRequest(Container):
 
 class ExecutionPayloadEnvelopeRoots(List[Root, MAX_REQUEST_PAYLOADS]):
     pass
+
+
+def get_validators_custody_requirement(state, validator_indices: Iterable[int]) -> int:
+    """``get_validators_custody_requirement`` from fulu/validator.md: the number
+    of custody groups a node with these validators attached must custody —
+    one per BALANCE_PER_ADDITIONAL_CUSTODY_GROUP of attached effective
+    balance, clamped to [VALIDATOR_CUSTODY_REQUIREMENT, NUMBER_OF_CUSTODY_GROUPS]."""
+    validators = state.validators
+    total_node_balance = sum(int(validators[int(i)].effective_balance) for i in validator_indices)
+    count = total_node_balance // BALANCE_PER_ADDITIONAL_CUSTODY_GROUP()
+    return min(max(count, VALIDATOR_CUSTODY_REQUIREMENT()), NUMBER_OF_CUSTODY_GROUPS())
 
 
 def compute_subnet_for_data_column_sidecar(column_index: int) -> int:
@@ -149,6 +168,38 @@ class DataColumnManager:
             return "reject", "column index out of range"
         if compute_subnet_for_data_column_sidecar(index) != int(subnet_id):
             return "reject", "wrong subnet"
+        status, reason = self._verify_sidecar(sidecar, get_block)
+        if status != "accept":
+            return status, reason
+        self._remember(root, int(sidecar.slot), index, bytes(data))
+        return "accept", ""
+
+    def ingest_sidecar(self, data: bytes, get_block) -> tuple[str, str]:
+        """Verify + store a sidecar obtained through req/resp (custody backfill,
+        by-root fetches). Same checks as gossip minus the subnet rule; a
+        column we already hold is ignored."""
+        try:
+            sidecar = DataColumnSidecar.decode_bytes(data)
+        except Exception as e:
+            return "reject", f"undecodable sidecar: {e}"
+        root = bytes(sidecar.beacon_block_root)
+        index = int(sidecar.index)
+        if index >= NUMBER_OF_COLUMNS:
+            return "reject", "column index out of range"
+        if index in self.held_columns(root):
+            return "ignore", "already held"
+        status, reason = self._verify_sidecar(sidecar, get_block)
+        if status != "accept":
+            return status, reason
+        self._remember(root, int(sidecar.slot), index, bytes(data))
+        return "accept", ""
+
+    def _verify_sidecar(self, sidecar: DataColumnSidecar, get_block) -> tuple[str, str]:
+        """Block-dependent checks of ``validate_data_column_sidecar_gossip``:
+        the sidecar must match a block we hold and its cells must verify
+        against that block's KZG commitments."""
+        root = bytes(sidecar.beacon_block_root)
+        index = int(sidecar.index)
         signed_block = get_block(root)
         if signed_block is None:
             return "ignore", "block not seen"
@@ -170,7 +221,6 @@ class DataColumnManager:
         proofs = [bytes(p) for p in sidecar.kzg_proofs]
         if not kzg.verify_cell_kzg_proof_batch(commitments, [index] * n, cells, proofs):
             return "reject", "kzg verification failed"
-        self._remember(root, int(sidecar.slot), index, bytes(data))
         return "accept", ""
 
     # ------------------------------------------------------------------ availability
@@ -264,3 +314,128 @@ class DataColumnManager:
             if chunk:
                 out.append(chunk)
         return out
+
+
+# ---------------------------------------------------------------------------
+# Custody backfill (fulu/validator.md, "Validator custody")
+# ---------------------------------------------------------------------------
+
+
+def blob_commitment_count(signed_block) -> int:
+    """Number of blob KZG commitments carried by a block (0 if none / pre-Fulu)."""
+    try:
+        body = signed_block.message.body
+        if hasattr(body, "signed_execution_payload_bid"):
+            return len(body.signed_execution_payload_bid.message.blob_kzg_commitments)
+        return len(body.blob_kzg_commitments)
+    except Exception:
+        return 0
+
+
+class CustodyBackfiller:
+    """Fetch the columns of newly custodied groups for the retention window.
+
+    When a node's custody requirement grows (more validators / balance) it
+    widens its custody set and SHOULD advertise the new count immediately;
+    it MAY backfill the new columns for blocks it already has, lowering
+    ``earliest_available_slot`` as it goes. This walks the window backwards
+    in batches, asks peers for ``data_column_sidecars_by_range`` restricted to
+    the new columns, verifies every sidecar against the block we hold and
+    stores it. Peers that don't custody a column simply don't return it,
+    so each batch is retried on the next peer until nothing is missing.
+    """
+
+    def __init__(
+        self,
+        das: DataColumnManager,
+        request_by_range: Callable[[str, bytes], "Awaitable[Optional[list[tuple[bytes, bytes]]]]"],
+        peers: Callable[[], list[str]],
+        get_block,
+        get_block_by_slot,
+        on_progress: Optional[Callable[[int], None]] = None,
+        batch_slots: int = 32,
+    ) -> None:
+        self.das = das
+        self._request = request_by_range
+        self._peers = peers
+        self._get_block = get_block
+        self._get_block_by_slot = get_block_by_slot
+        self._on_progress = on_progress
+        self.batch_slots = max(1, int(batch_slots))
+
+    def _wanted(self, start_slot: int, count: int) -> dict[bytes, int]:
+        """block_root -> slot for the blob-carrying blocks we hold in the range."""
+        wanted: dict[bytes, int] = {}
+        for slot in range(start_slot, start_slot + count):
+            signed_block = self._get_block_by_slot(slot)
+            if signed_block is None or blob_commitment_count(signed_block) == 0:
+                continue
+            wanted[hash_tree_root(signed_block.message)] = slot
+        return wanted
+
+    def _missing(self, wanted: dict[bytes, int], columns: set[int]) -> dict[bytes, set[int]]:
+        out: dict[bytes, set[int]] = {}
+        for root in wanted:
+            missing = columns - self.das.held_columns(root)
+            if missing:
+                out[root] = missing
+        return out
+
+    async def run(self, columns: Iterable[int], start_slot: int, end_slot: int) -> dict:
+        columns = {int(c) for c in columns}
+        stats = {"batches": 0, "accepted": 0, "rejected": 0, "ignored": 0, "requests": 0,
+                 "failed_requests": 0, "unserved_batches": 0, "reached_slot": end_slot + 1}
+        if not columns or end_slot < start_slot:
+            return stats
+        cursor = int(end_slot)
+        while cursor >= start_slot:
+            batch_start = max(int(start_slot), cursor - self.batch_slots + 1)
+            count = cursor - batch_start + 1
+            stats["batches"] += 1
+            wanted = self._wanted(batch_start, count)
+            missing = self._missing(wanted, columns)
+            if missing:
+                for peer in self._peers():
+                    # Ask only for what is still missing after the previous peer.
+                    request_columns = sorted(set().union(*missing.values()))
+                    payload = DataColumnSidecarsByRangeRequest(
+                        start_slot=uint64(batch_start),
+                        count=uint64(count),
+                        columns=[uint64(c) for c in request_columns],
+                    ).encode_bytes()
+                    stats["requests"] += 1
+                    try:
+                        chunks = await self._request(peer, payload)
+                    except Exception as e:
+                        stats["failed_requests"] += 1
+                        logger.debug(f"custody backfill: {peer} failed: {e!r}")
+                        continue
+                    if not chunks:
+                        continue
+                    for _context, ssz in chunks:
+                        status, reason = self.das.ingest_sidecar(ssz, self._get_block)
+                        if status == "accept":
+                            stats["accepted"] += 1
+                        elif status == "ignore":
+                            stats["ignored"] += 1
+                        else:
+                            stats["rejected"] += 1
+                            logger.debug(f"custody backfill: rejected sidecar from {peer}: {reason}")
+                    missing = self._missing(wanted, columns)
+                    if not missing:
+                        break
+                if missing:
+                    stats["unserved_batches"] += 1
+                    logger.info(
+                        f"custody backfill: slots {batch_start}-{cursor}: "
+                        f"{sum(len(m) for m in missing.values())} columns still missing after all peers"
+                    )
+            stats["reached_slot"] = batch_start
+            if self._on_progress is not None:
+                try:
+                    self._on_progress(batch_start)
+                except Exception as e:
+                    logger.debug(f"custody backfill progress callback failed: {e!r}")
+            cursor = batch_start - 1
+            await asyncio.sleep(0)
+        return stats

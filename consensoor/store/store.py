@@ -91,6 +91,12 @@ class Store:
         """Save a metadata value to database."""
         self._db.put(PREFIX_META + key.encode(), value)
 
+    def save_metadata(self, key: str, value: bytes) -> None:
+        self._save_metadata(key, value)
+
+    def get_metadata(self, key: str) -> Optional[bytes]:
+        return self._db.get(PREFIX_META + key.encode())
+
     def _detect_fork(self, obj: Any) -> str:
         """Detect the fork type of a state or block."""
         type_name = type(obj).__name__

@@ -31,6 +31,7 @@ UNKNOWN_PARAMS := $(filter-out all $(VALID_PRESETS) $(VALID_FORKS),$(TEST_PARAMS
 	fetch-comptests    \
 	help               \
 	test               \
+	test-unit          \
 	test-fork-choice   \
 	test-compliance    \
 	all                \
@@ -81,7 +82,7 @@ test: CORES := $(or $(cores),auto)
 test: PRESET := $(or $(PARAM_PRESET),$(preset),minimal)
 test: FORK := $(or $(PARAM_FORK),$(fork))
 test: MAYBE_FORK := $(if $(or $(PARAM_FORK),$(fork)),-k "$(or $(PARAM_FORK),$(fork))")
-test: fetch-tests
+test: fetch-tests test-unit
 	@if [ -n "$(UNKNOWN_PARAMS)" ]; then \
 		echo "Error: Unknown parameter(s): $(UNKNOWN_PARAMS)"; \
 		echo "Run 'make help' for usage."; \
@@ -95,6 +96,10 @@ test: fetch-tests
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/$(PRESET) \
 		-m "not fork_choice"     \
 		$(MAYBE_FORK)
+
+# Unit tests (no reference vectors needed).
+test-unit:
+	@python3 -m pytest tests/unit/ -q -p no:cacheprovider
 
 # Fork-choice + fast-confirmation reference vectors (gloas) driven through
 # consensoor's own Store (consensoor/spec/fork_choice.py + fast_confirmation.py).
