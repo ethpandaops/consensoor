@@ -19,6 +19,7 @@ dependencies = [
     "rlp>=4.0.0",
     "plyvel>=1.5.0",
     "prometheus_client>=0.20.0",
+    "ckzg>=2.1.0",
 ]
 
 [project.optional-dependencies]
@@ -40,5 +41,13 @@ build-backend = "setuptools.build_meta"
 where = ["."]
 include = ["consensoor*"]
 
+[tool.setuptools.package-data]
+consensoor = ["spec/trusted_setup_4096.json"]
+
 [tool.setuptools_scm]
 version_file = "consensoor/_version.py"
+
+[tool.pytest.ini_options]
+markers = [
+    "fork_choice: fork-choice / fast-confirmation reference vectors driven through consensoor's Store (slow; make test-fork-choice)",
+]

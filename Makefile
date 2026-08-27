@@ -31,6 +31,7 @@ UNKNOWN_PARAMS := $(filter-out all $(VALID_PRESETS) $(VALID_FORKS),$(TEST_PARAMS
 	fetch-comptests    \
 	help               \
 	test               \
+	test-fork-choice   \
 	test-compliance    \
 	all                \
 	$(VALID_PRESETS)   \
@@ -63,6 +64,7 @@ help:
 	@echo "  make test-compliance gloas       # Run gloas compliance cases"
 	@echo "  make test-compliance fulu        # Run fulu compliance cases"
 	@echo "  make fetch-comptests             # Download compliance fixtures"
+	@echo "  make test-fork-choice            # Run fork-choice + fast-confirmation vectors (slow)"
 	@echo ""
 	@echo "Other targets:"
 	@echo "  make fetch-tests     # Download reference tests"
@@ -91,7 +93,22 @@ test: fetch-tests
 		--numprocesses $(CORES)  \
 		--preset=$(PRESET)       \
 		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/$(PRESET) \
+		-m "not fork_choice"     \
 		$(MAYBE_FORK)
+
+# Fork-choice + fast-confirmation reference vectors (gloas) driven through
+# consensoor's own Store (consensoor/spec/fork_choice.py + fast_confirmation.py).
+# Slow (~40 min on 8 cores): each case replays whole epochs of attestations.
+test-fork-choice: CORES := $(or $(cores),auto)
+test-fork-choice: PRESET := $(or $(PARAM_PRESET),$(preset),minimal)
+test-fork-choice: fetch-tests
+	@python3 -m pytest           \
+		tests/spec/              \
+		--verbose                \
+		--numprocesses $(CORES)  \
+		--preset=$(PRESET)       \
+		--spec-tests-dir=$(SPEC_TESTS_DIR)/tests/$(PRESET) \
+		-m fork_choice
 
 # Compliance tests are produced by the `comptests.yml` workflow and are
 # fork-choice only. Currently runs the pyspec reference implementation; not yet

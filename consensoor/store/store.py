@@ -14,6 +14,8 @@ PREFIX_BLOCK_SLOT = b"bs:"
 PREFIX_BLOCK_PARENT = b"bp:"
 PREFIX_PAYLOAD = b"p:"
 PREFIX_BLOBS = b"bl:"
+PREFIX_COLUMN = b"dc:"        # dc:<block_root:32><index:2> -> DataColumnSidecar ssz
+PREFIX_COLUMN_SLOT = b"dcs:"  # dcs:<slot:8 BE> -> block_root (blob-carrying blocks only)
 PREFIX_META = b"m:"
 
 
@@ -32,6 +34,8 @@ class Store:
         self._block_cache: dict[bytes, object] = {}
         self._payload_cache: dict[bytes, object] = {}
         self._blob_cache: dict[bytes, list] = {}
+        # block_root -> {column_index: sidecar_ssz}
+        self._column_cache: dict[bytes, dict[int, bytes]] = {}
         self._bid_cache: dict[int, object] = {}
         self._cache_limit = 128
 
@@ -463,6 +467,50 @@ class Store:
             logger.warning(f"Failed to load blobs from LevelDB: {e}")
 
         return []
+
+    # ------------------------------------------------------------------ data columns (PeerDAS)
+
+    def save_data_column(self, block_root: bytes, slot: int, index: int, sidecar_ssz: bytes) -> None:
+        """Persist one DataColumnSidecar (SSZ) for ``block_root``."""
+        cols = self._column_cache.setdefault(block_root, {})
+        cols[int(index)] = bytes(sidecar_ssz)
+        self._trim_cache(self._column_cache, 64)
+        try:
+            self._db.put(PREFIX_COLUMN + block_root + int(index).to_bytes(2, "big"), bytes(sidecar_ssz))
+            self._db.put(PREFIX_COLUMN_SLOT + int(slot).to_bytes(8, "big"), block_root)
+        except Exception as e:
+            logger.warning(f"Failed to persist data column to LevelDB: {e}")
+
+    def get_data_columns(self, block_root: bytes) -> dict[int, bytes]:
+        """Return {column_index: sidecar_ssz} we hold for ``block_root``."""
+        cached = self._column_cache.get(block_root)
+        if cached:
+            return dict(cached)
+        out: dict[int, bytes] = {}
+        try:
+            prefix = PREFIX_COLUMN + block_root
+            it = self._db.iterator(prefix=prefix)
+            for key, value in it:
+                out[int.from_bytes(key[len(prefix):], "big")] = bytes(value)
+        except Exception as e:
+            logger.warning(f"Failed to load data columns from LevelDB: {e}")
+        if out:
+            self._column_cache[block_root] = dict(out)
+        return out
+
+    def get_column_block_roots_in_range(self, start_slot: int, count: int) -> list[tuple[int, bytes]]:
+        """[(slot, block_root)] of blob-carrying blocks in [start_slot, start_slot + count)."""
+        out: list[tuple[int, bytes]] = []
+        try:
+            it = self._db.iterator(
+                start=PREFIX_COLUMN_SLOT + int(start_slot).to_bytes(8, "big"),
+                stop=PREFIX_COLUMN_SLOT + int(start_slot + count).to_bytes(8, "big"),
+            )
+            for key, value in it:
+                out.append((int.from_bytes(key[len(PREFIX_COLUMN_SLOT):], "big"), bytes(value)))
+        except Exception as e:
+            logger.warning(f"Failed to scan data column slots: {e}")
+        return out
 
     def set_head(self, root: bytes) -> None:
         """Set the current head root."""

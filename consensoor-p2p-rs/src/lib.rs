@@ -17,6 +17,7 @@ mod discovery;
 mod gossip;
 mod network;
 mod peer_score;
+mod raw_rpc;
 mod rpc;
 
 use pyo3::prelude::*;
@@ -58,6 +59,10 @@ fn _native(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<blocks_by_root::BlocksByRootRequest>()?;
     m.add_class::<blocks_by_root::BlocksByRootResponse>()?;
     m.add_class::<blocks_by_root::BlocksByRootEvent>()?;
+    m.add_class::<raw_rpc::RawRpcRequest>()?;
+    m.add_class::<raw_rpc::RawChunk>()?;
+    m.add_class::<raw_rpc::RawRpcResponse>()?;
+    m.add_class::<raw_rpc::RawRpcEvent>()?;
     m.add_function(wrap_pyfunction!(network::generate_keypair, m)?)?;
     Ok(())
 }

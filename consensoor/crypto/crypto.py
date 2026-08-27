@@ -97,7 +97,23 @@ def sign(privkey: int, message: bytes) -> bytes:
         return _py_ecc_bls.Sign(privkey, message)
 
 
+# Global switch used by the spec-test runner for vectors generated with
+# ``bls_setting: 2`` (signatures are dummies there). Always on in production.
+_VERIFICATION_ENABLED = True
+
+
+def set_bls_verification(enabled: bool) -> None:
+    global _VERIFICATION_ENABLED
+    _VERIFICATION_ENABLED = bool(enabled)
+
+
+def bls_verification_enabled() -> bool:
+    return _VERIFICATION_ENABLED
+
+
 def verify(pubkey: bytes, message: bytes, signature: bytes) -> bool:
+    if not _VERIFICATION_ENABLED:
+        return True
     """Verify a BLS signature."""
     try:
         if _USE_BLSPY:
@@ -121,6 +137,8 @@ def aggregate_signatures(signatures: Sequence[bytes]) -> bytes:
 
 
 def verify_aggregate(pubkeys: Sequence[bytes], messages: Sequence[bytes], signature: bytes) -> bool:
+    if not _VERIFICATION_ENABLED:
+        return True
     """Verify an aggregate BLS signature."""
     try:
         if _USE_BLSPY:
@@ -134,6 +152,8 @@ def verify_aggregate(pubkeys: Sequence[bytes], messages: Sequence[bytes], signat
 
 
 def fast_aggregate_verify(pubkeys: Sequence[bytes], message: bytes, signature: bytes) -> bool:
+    if not _VERIFICATION_ENABLED:
+        return True
     """Verify an aggregate signature where all signers signed the same message.
 
     Implements eth_fast_aggregate_verify from the consensus spec.

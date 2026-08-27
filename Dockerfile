@@ -52,7 +52,7 @@ RUN pip install --no-cache-dir --no-deps /tmp/consensoor*.whl /tmp/consensoor_p2
         "plyvel>=1.5.0" \
         "prometheus_client>=0.20.0" \
         "httpx[http2]>=0.27.0" \
-        pycryptodome aiohttp click python-snappy coincurve rlp pyjwt pyyaml && \
+        pycryptodome aiohttp click python-snappy coincurve rlp pyjwt pyyaml ckzg && \
     rm /tmp/*.whl
 
 EXPOSE 9000/tcp

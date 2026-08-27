@@ -68,6 +68,14 @@ PAYLOAD_ATTESTATION_MESSAGE_TOPIC = "payload_attestation_message"  # GLOAS/ePBS 
 PROPOSER_PREFERENCES_TOPIC = "proposer_preferences"  # GLOAS/ePBS proposer fee_recipient/gas_limit prefs
 
 
+DATA_COLUMN_SIDECAR_TOPIC_PREFIX = "data_column_sidecar_"
+
+
+def get_data_column_sidecar_topic(subnet_id: int, fork_digest: bytes, encoding: str = "ssz_snappy") -> str:
+    """Format: /eth2/{fork_digest}/data_column_sidecar_{subnet_id}/{encoding} (Fulu+ PeerDAS)."""
+    return f"/eth2/{fork_digest.hex()}/{DATA_COLUMN_SIDECAR_TOPIC_PREFIX}{subnet_id}/{encoding}"
+
+
 def get_blob_sidecar_topic(subnet_id: int, fork_digest: bytes, encoding: str = "ssz_snappy") -> str:
     """Get the full topic name for a blob sidecar subnet.
 

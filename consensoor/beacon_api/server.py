@@ -47,6 +47,7 @@ class BeaconAPI:
         self.app.router.add_get("/eth/v1/node/version", self.get_version)
         self.app.router.add_get("/eth/v1/node/syncing", self.get_syncing)
         self.app.router.add_get("/eth/v1/node/identity", self.get_identity)
+        self.app.router.add_get("/consensoor/v1/fast_confirmation", self.get_fast_confirmation)
         self.app.router.add_get("/eth/v1/node/peers", self.get_peers)
         self.app.router.add_get("/eth/v1/beacon/genesis", self.get_genesis)
         self.app.router.add_get("/eth/v1/beacon/states/{state_id}/root", self.get_state_root)
@@ -178,6 +179,23 @@ class BeaconAPI:
                 "is_syncing": False,
                 "is_optimistic": False,
                 "el_offline": False,
+            }
+        })
+
+    async def get_fast_confirmation(self, request):
+        """GET /consensoor/v1/fast_confirmation — latest FCR result."""
+        node = self.node
+        root = getattr(node, "confirmed_root", None)
+        if root is None or node.fc_store is None or root not in node.fc_store.blocks:
+            return web.json_response({"code": 503, "message": "fast confirmation not available yet"}, status=503)
+        from ..spec import fast_confirmation as fcr
+        block = node.fc_store.blocks[root]
+        return web.json_response({
+            "data": {
+                "confirmed_root": "0x" + root.hex(),
+                "confirmed_slot": str(int(block.slot)),
+                "safe_execution_block_hash": "0x" + fcr.get_safe_execution_block_hash(node.fcr_store).hex(),
+                "head_root": ("0x" + node.head_root.hex()) if node.head_root else None,
             }
         })
 
@@ -1385,7 +1403,7 @@ class BeaconAPI:
 
         valid_topics = {"head", "block", "finalized_checkpoint", "chain_reorg",
                         "execution_payload_available", "execution_payload_bid",
-                        "payload_attributes", "proposer_preferences"}
+                        "payload_attributes", "proposer_preferences", "fast_confirmation"}
         requested_topics = topics & valid_topics if topics else valid_topics
 
         if not requested_topics:
@@ -1508,6 +1526,17 @@ class BeaconAPI:
                 subscriber_queue.put_nowait(event)
             except asyncio.QueueFull:
                 logger.warning("Event queue full for subscriber, dropping event")
+
+    async def emit_fast_confirmation(self, slot: int, block_root: bytes) -> None:
+        """Emit the `fast_confirmation` SSE event (beacon-APIs): emitted every
+        time the fast confirmation rule runs, with the latest confirmed block."""
+        self._cross_loop_events.put({
+            "event": "fast_confirmation",
+            "data": {
+                "slot": str(slot),
+                "block": "0x" + block_root.hex(),
+            },
+        })
 
     async def emit_execution_payload_available(self, slot: int, block_root: bytes) -> None:
         """Emit execution_payload_available SSE event (ePBS).

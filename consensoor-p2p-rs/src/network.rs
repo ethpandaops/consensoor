@@ -24,6 +24,7 @@ use tokio::runtime::Runtime;
 use crate::blocks_by_range::{
     self, BlocksByRangeBehaviour, BlocksByRangeEvent, BlocksByRangeRequest, BlocksByRangeResponse,
 };
+use crate::raw_rpc::{self, RawRpcBehaviour, RawRpcEvent, RawRpcRequest, RawRpcResponse};
 use crate::blocks_by_root::{
     self, BlocksByRootBehaviour, BlocksByRootEvent, BlocksByRootRequest, BlocksByRootResponse,
 };
@@ -70,6 +71,12 @@ struct Eth2Behaviour {
     metadata: rpc::MetadataBehaviour,
     blocks_by_range: BlocksByRangeBehaviour,
     blocks_by_root: BlocksByRootBehaviour,
+    /// Gloas ExecutionPayloadEnvelopesByRoot v1 (SSZ handled in Python).
+    envelopes_by_root: RawRpcBehaviour,
+    /// Fulu DataColumnSidecarsByRoot v1.
+    columns_by_root: RawRpcBehaviour,
+    /// Fulu DataColumnSidecarsByRange v1.
+    columns_by_range: RawRpcBehaviour,
 }
 
 #[pyclass]
@@ -308,6 +315,8 @@ enum Command {
     AnswerBlocksByRange { id: u64, response: BlocksByRangeResponse },
     RequestBlocksByRoot { peer: String, request: BlocksByRootRequest },
     AnswerBlocksByRoot { id: u64, response: BlocksByRootResponse },
+    RequestRaw { peer: String, request: RawRpcRequest },
+    AnswerRaw { id: u64, response: RawRpcResponse },
     Shutdown,
 }
 
@@ -322,6 +331,7 @@ pub struct Network {
     metadata_rx: Mutex<Receiver<MetadataEvent>>,
     by_range_rx: Mutex<Receiver<BlocksByRangeEvent>>,
     by_root_rx: Mutex<Receiver<BlocksByRootEvent>>,
+    raw_rx: Mutex<Receiver<RawRpcEvent>>,
     local_peer_id: String,
     listen_addrs: Arc<Mutex<Vec<String>>>,
     connected_peers: Arc<Mutex<HashMap<String, &'static str>>>,
@@ -442,6 +452,7 @@ impl Network {
         let (metadata_tx, metadata_rx) = bounded::<MetadataEvent>(256);
         let (by_range_tx, by_range_rx) = bounded::<BlocksByRangeEvent>(64);
         let (by_root_tx, by_root_rx) = bounded::<BlocksByRootEvent>(64);
+        let (raw_tx, raw_rx) = bounded::<RawRpcEvent>(256);
         let listen_addrs = Arc::new(Mutex::new(Vec::<String>::new()));
         let listen_addrs_clone = listen_addrs.clone();
         let connected_peers = Arc::new(Mutex::new(HashMap::<String, &'static str>::new()));
@@ -475,6 +486,7 @@ impl Network {
                 metadata_tx,
                 by_range_tx,
                 by_root_tx,
+                raw_tx,
                 listen_addrs_clone,
                 connected_peers_clone,
                 peer_enrs_clone,
@@ -504,6 +516,7 @@ impl Network {
             metadata_rx: Mutex::new(metadata_rx),
             by_range_rx: Mutex::new(by_range_rx),
             by_root_rx: Mutex::new(by_root_rx),
+            raw_rx: Mutex::new(raw_rx),
             local_peer_id: local_peer_id_str,
             listen_addrs,
             connected_peers,
@@ -817,6 +830,47 @@ impl Network {
         }
     }
 
+    /// Send a raw req/resp request on one of the generic protocols
+    /// (see `raw_rpc::PROTO_*`). The SSZ payload is built in Python.
+    pub fn request_raw_rpc(&self, peer: String, protocol: String, payload: Vec<u8>) -> PyResult<()> {
+        let request = RawRpcRequest { protocol, payload };
+        self.cmd_tx
+            .send_blocking(Command::RequestRaw { peer, request })
+            .map_err(|e| PyRuntimeError::new_err(format!("request_raw_rpc: {e}")))
+    }
+
+    pub fn answer_raw_rpc(&self, request_id: u64, response: RawRpcResponse) -> PyResult<()> {
+        self.cmd_tx
+            .send_blocking(Command::AnswerRaw {
+                id: request_id,
+                response,
+            })
+            .map_err(|e| PyRuntimeError::new_err(format!("answer_raw_rpc: {e}")))
+    }
+
+    #[pyo3(signature = (timeout_ms=None))]
+    pub fn next_raw_rpc<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_ms: Option<u64>,
+    ) -> PyResult<Option<Py<RawRpcEvent>>> {
+        let rx = self.raw_rx.lock().clone();
+        let runtime = self.runtime.clone();
+        let result = py.allow_threads(|| match timeout_ms {
+            Some(ms) => runtime.block_on(async move {
+                tokio::time::timeout(Duration::from_millis(ms), rx.recv())
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+            }),
+            None => runtime.block_on(async move { rx.recv().await.ok() }),
+        });
+        match result {
+            Some(ev) => Ok(Some(Py::new(py, ev)?)),
+            None => Ok(None),
+        }
+    }
+
     pub fn request_blocks_by_root(&self, peer: String, roots: Vec<u8>) -> PyResult<()> {
         let request = BlocksByRootRequest::new(roots)?;
         self.cmd_tx
@@ -1000,6 +1054,7 @@ async fn run_swarm(
     metadata_tx: Sender<MetadataEvent>,
     by_range_tx: Sender<BlocksByRangeEvent>,
     by_root_tx: Sender<BlocksByRootEvent>,
+    raw_tx: Sender<RawRpcEvent>,
     listen_addrs: Arc<Mutex<Vec<String>>>,
     connected_peers: Arc<Mutex<HashMap<String, &'static str>>>,
     peer_enrs: Arc<Mutex<HashMap<String, String>>>,
@@ -1111,6 +1166,9 @@ async fn run_swarm(
         metadata: rpc::new_metadata_behaviour(),
         blocks_by_range: blocks_by_range::new_blocks_by_range_behaviour(),
         blocks_by_root: blocks_by_root::new_blocks_by_root_behaviour(),
+        envelopes_by_root: raw_rpc::new_raw_rpc_behaviour(raw_rpc::PROTO_ENVELOPES_BY_ROOT),
+        columns_by_root: raw_rpc::new_raw_rpc_behaviour(raw_rpc::PROTO_COLUMNS_BY_ROOT),
+        columns_by_range: raw_rpc::new_raw_rpc_behaviour(raw_rpc::PROTO_COLUMNS_BY_RANGE),
     };
 
     // Swarm config based on lighthouse_network::service `with_executor` block
@@ -1211,6 +1269,10 @@ async fn run_swarm(
     let mut pending_by_root: HashMap<
         u64,
         request_response::ResponseChannel<BlocksByRootResponse>,
+    > = HashMap::new();
+    let mut pending_raw: HashMap<
+        u64,
+        (&'static str, request_response::ResponseChannel<RawRpcResponse>),
     > = HashMap::new();
     let mut next_response_id: u64 = 1;
 
@@ -1431,6 +1493,33 @@ async fn run_swarm(
                         &mut next_response_id,
                     ).await;
                 }
+                SwarmEvent::Behaviour(Eth2BehaviourEvent::EnvelopesByRoot(rr_event)) => {
+                    handle_raw_rpc_event(
+                        rr_event,
+                        raw_rpc::PROTO_ENVELOPES_BY_ROOT,
+                        &raw_tx,
+                        &mut pending_raw,
+                        &mut next_response_id,
+                    ).await;
+                }
+                SwarmEvent::Behaviour(Eth2BehaviourEvent::ColumnsByRoot(rr_event)) => {
+                    handle_raw_rpc_event(
+                        rr_event,
+                        raw_rpc::PROTO_COLUMNS_BY_ROOT,
+                        &raw_tx,
+                        &mut pending_raw,
+                        &mut next_response_id,
+                    ).await;
+                }
+                SwarmEvent::Behaviour(Eth2BehaviourEvent::ColumnsByRange(rr_event)) => {
+                    handle_raw_rpc_event(
+                        rr_event,
+                        raw_rpc::PROTO_COLUMNS_BY_RANGE,
+                        &raw_tx,
+                        &mut pending_raw,
+                        &mut next_response_id,
+                    ).await;
+                }
                 _ => {}
             },
             cmd = cmd_rx.recv() => match cmd {
@@ -1573,6 +1662,36 @@ async fn run_swarm(
                         }
                     } else {
                         tracing::warn!("answer_blocks_by_root: no pending request id {id}");
+                    }
+                }
+                Ok(Command::RequestRaw { peer, request }) => {
+                    match peer.parse::<libp2p::PeerId>() {
+                        Ok(peer_id) => {
+                            let b = swarm.behaviour_mut();
+                            match request.protocol.as_str() {
+                                raw_rpc::PROTO_ENVELOPES_BY_ROOT => { let _ = b.envelopes_by_root.send_request(&peer_id, request); }
+                                raw_rpc::PROTO_COLUMNS_BY_ROOT => { let _ = b.columns_by_root.send_request(&peer_id, request); }
+                                raw_rpc::PROTO_COLUMNS_BY_RANGE => { let _ = b.columns_by_range.send_request(&peer_id, request); }
+                                other => tracing::warn!("request_raw_rpc: unknown protocol {other}"),
+                            }
+                        }
+                        Err(e) => tracing::warn!("request_raw_rpc: bad peer id {peer}: {e}"),
+                    }
+                }
+                Ok(Command::AnswerRaw { id, response }) => {
+                    if let Some((protocol, channel)) = pending_raw.remove(&id) {
+                        let b = swarm.behaviour_mut();
+                        let sent = match protocol {
+                            raw_rpc::PROTO_ENVELOPES_BY_ROOT => b.envelopes_by_root.send_response(channel, response).is_ok(),
+                            raw_rpc::PROTO_COLUMNS_BY_ROOT => b.columns_by_root.send_response(channel, response).is_ok(),
+                            raw_rpc::PROTO_COLUMNS_BY_RANGE => b.columns_by_range.send_response(channel, response).is_ok(),
+                            _ => false,
+                        };
+                        if !sent {
+                            tracing::warn!("answer_raw_rpc: channel dropped for id {id}");
+                        }
+                    } else {
+                        tracing::warn!("answer_raw_rpc: no pending request id {id}");
                     }
                 }
                 Ok(Command::Shutdown) => break,
@@ -1868,5 +1987,52 @@ mod tests {
         );
         // v4-only external ip → no quic6 field
         assert!(enr.get_decodable::<u16>("quic6").is_none());
+    }
+}
+
+async fn handle_raw_rpc_event(
+    ev: request_response::Event<RawRpcRequest, RawRpcResponse>,
+    protocol: &'static str,
+    tx: &Sender<RawRpcEvent>,
+    pending: &mut HashMap<u64, (&'static str, request_response::ResponseChannel<RawRpcResponse>)>,
+    next_id: &mut u64,
+) {
+    use request_response::Event;
+    use request_response::Message;
+    let mk = |peer: String, kind: String, request, response, error| RawRpcEvent {
+        peer,
+        protocol: protocol.to_string(),
+        kind,
+        request,
+        response,
+        error,
+    };
+    match ev {
+        Event::Message { peer, message, .. } => match message {
+            Message::Request { request, channel, .. } => {
+                let id = *next_id;
+                *next_id = next_id.wrapping_add(1);
+                pending.insert(id, (protocol, channel));
+                let _ = tx
+                    .send(mk(peer.to_string(), format!("request:{id}"), Some(request), None, None))
+                    .await;
+            }
+            Message::Response { response, .. } => {
+                let _ = tx
+                    .send(mk(peer.to_string(), "response".into(), None, Some(response), None))
+                    .await;
+            }
+        },
+        Event::OutboundFailure { peer, error, .. } => {
+            let _ = tx
+                .send(mk(peer.to_string(), "failure".into(), None, None, Some(format!("{error}"))))
+                .await;
+        }
+        Event::InboundFailure { peer, error, .. } => {
+            let _ = tx
+                .send(mk(peer.to_string(), "failure".into(), None, None, Some(format!("{error}"))))
+                .await;
+        }
+        Event::ResponseSent { .. } => {}
     }
 }

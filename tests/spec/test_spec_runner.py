@@ -678,6 +678,8 @@ def discover_random_tests(spec_tests_dir: Path):
 
 CASE_FIXTURES = [
     ("ssz_case", discover_ssz_static_tests),
+    ("fork_choice_case", lambda d: discover_fork_choice_tests(d, "fork_choice")),
+    ("fast_confirmation_case", lambda d: discover_fork_choice_tests(d, "fast_confirmation")),
     ("operations_case", discover_operations_tests),
     ("epoch_case", discover_epoch_processing_tests),
     ("sanity_blocks_case", discover_sanity_blocks_tests),
@@ -1385,3 +1387,347 @@ class TestForkChoiceCompliance:
             else:
                 pytest.fail(f"{case_id} step {i}: unknown step verb in {step!r}")
 
+
+
+# ---------------------------------------------------------------------------
+# Fork choice + fast confirmation vectors driven by consensoor's own Store
+# ---------------------------------------------------------------------------
+
+def discover_fork_choice_tests(spec_tests_dir: Path, handler_group: str):
+    """Yield (case_id, case_path, fork, preset) for gloas fork_choice /
+    fast_confirmation vectors (consensoor's Store is Gloas-only)."""
+    cases = []
+    base = spec_tests_dir / "gloas" / handler_group
+    if not base.exists():
+        return cases
+    for handler_dir in sorted(base.iterdir()):
+        tests_dir = handler_dir / "pyspec_tests"
+        if not tests_dir.exists():
+            continue
+        for case_path in sorted(tests_dir.iterdir()):
+            if (case_path / "steps.yaml").exists():
+                cases.append((f"gloas/{handler_group}/{handler_dir.name}/{case_path.name}", case_path, "gloas", None))
+    return cases
+
+
+def _run_consensoor_fork_choice_case(case_id: str, case_path: Path, preset: str, with_fcr: bool):
+    import snappy
+    from consensoor.spec.constants import set_preset
+    from consensoor.spec.network_config import load_config_from_upstream, set_config
+    set_preset(preset)
+    set_config(load_config_from_upstream(preset))
+    from consensoor.spec import fork_choice as fc
+    from consensoor.spec import fast_confirmation as fcr
+    from consensoor.spec.types.gloas import (
+        BeaconState, BeaconBlock, SignedBeaconBlock, Attestation, AttesterSlashing,
+        SignedExecutionPayloadEnvelope, PayloadAttestationMessage,
+    )
+
+    def load(name, typ):
+        with open(case_path / f"{name}.ssz_snappy", "rb") as f:
+            return typ.decode_bytes(snappy.decompress(f.read()))
+
+    with open(case_path / "anchor_state.ssz_snappy", "rb") as f:
+        anchor_state = BeaconState.decode_bytes(snappy.decompress(f.read()))
+    with open(case_path / "anchor_block.ssz_snappy", "rb") as f:
+        anchor_block = BeaconBlock.decode_bytes(snappy.decompress(f.read()))
+    store = fc.get_forkchoice_store(anchor_state, anchor_block)
+    fcr_store = fcr.get_fast_confirmation_store(store) if with_fcr else None
+    steps = load_yaml(case_path / "steps.yaml")
+    assert steps, f"{case_id}: no steps"
+    meta = load_yaml(case_path / "meta.yaml") or {}
+    from consensoor.crypto import set_bls_verification
+    bls_setting = int(meta.get("bls_setting", 1))
+    set_bls_verification(bls_setting != 2)
+    try:
+        _run_steps(case_id, case_path, store, fcr_store, steps, with_fcr, load, fc, fcr,
+                   SignedBeaconBlock, Attestation, AttesterSlashing, SignedExecutionPayloadEnvelope, PayloadAttestationMessage)
+    finally:
+        set_bls_verification(True)
+
+
+def _run_steps(case_id, case_path, store, fcr_store, steps, with_fcr, load, fc, fcr,
+               SignedBeaconBlock, Attestation, AttesterSlashing, SignedExecutionPayloadEnvelope, PayloadAttestationMessage):
+
+    def expect(valid, fn, what, i):
+        try:
+            fn()
+        except (AssertionError, Exception) as e:
+            if valid:
+                raise AssertionError(f"{case_id} step {i}: {what} rejected unexpectedly: {e}") from e
+            return
+        if not valid:
+            pytest.fail(f"{case_id} step {i}: {what} accepted but expected invalid")
+
+    # Fast-confirmation vectors record attestation steps when the attestations
+    # are *created* (their own slot) and the generator applies them to the
+    # store at the start of the next slot, before on_fast_confirmation
+    # (tests/formats/fast_confirmation/README.md). Queue them until the tick.
+    queued_attestations: list = []
+
+    def flush_attestations(i):
+        while queued_attestations:
+            ref, valid, att = queued_attestations.pop(0)
+            expect(valid, lambda: fc.on_attestation(store, att, is_from_block=False), f"attestation {ref}", i)
+
+    for i, step in enumerate(steps):
+        if "tick" in step:
+            fc.on_tick(store, int(step["tick"]))
+            if with_fcr:
+                flush_attestations(i)
+        elif "block" in step:
+            signed = load(step["block"], SignedBeaconBlock)
+            def do_block():
+                fc.on_block(store, signed)
+                for att in signed.message.body.attestations:
+                    try:
+                        fc.on_attestation(store, att, is_from_block=True)
+                    except AssertionError:
+                        pass
+                for sl in signed.message.body.attester_slashings:
+                    try:
+                        fc.on_attester_slashing(store, sl)
+                    except AssertionError:
+                        pass
+            expect(step.get("valid", True), do_block, "block", i)
+        elif "attestation" in step:
+            att = load(step["attestation"], Attestation)
+            if with_fcr:
+                queued_attestations.append((step["attestation"], step.get("valid", True), att))
+            else:
+                expect(step.get("valid", True), lambda: fc.on_attestation(store, att, is_from_block=False), "attestation", i)
+        elif "attester_slashing" in step:
+            sl = load(step["attester_slashing"], AttesterSlashing)
+            expect(step.get("valid", True), lambda: fc.on_attester_slashing(store, sl), "attester_slashing", i)
+        elif "payload_attestation" in step or "payload_attestation_message" in step:
+            ref = step.get("payload_attestation_message", step.get("payload_attestation"))
+            pa = load(ref, PayloadAttestationMessage)
+            expect(step.get("valid", True), lambda: fc.on_payload_attestation_message(store, pa, is_from_block=False), "payload_attestation", i)
+        elif "execution_payload" in step:
+            env = load(step["execution_payload"], SignedExecutionPayloadEnvelope)
+            expect(step.get("valid", True), lambda: fc.on_execution_payload_envelope(store, env), "execution_payload", i)
+        elif "checks" in step:
+            checks = step["checks"]
+            is_fcr_check = "confirmed_root" in checks
+            if is_fcr_check and fcr_store is not None:
+                fcr.on_fast_confirmation(fcr_store)
+            head = fc.get_head(store)
+            if "time" in checks:
+                assert store.time == int(checks["time"]), f"{case_id} step {i}: time {store.time} != {checks['time']}"
+            if "head" in checks:
+                exp_root = bytes.fromhex(checks["head"]["root"][2:])
+                assert head.root == exp_root, f"{case_id} step {i}: head {head.root.hex()} != {exp_root.hex()}"
+                assert int(store.blocks[head.root].slot) == int(checks["head"]["slot"]), f"{case_id} step {i}: head slot"
+                if "payload_status" in checks["head"]:
+                    assert head.payload_status == int(checks["head"]["payload_status"]), \
+                        f"{case_id} step {i}: head payload_status {head.payload_status} != {checks['head']['payload_status']}"
+            for key, attr in (("justified_checkpoint", "justified_checkpoint"), ("finalized_checkpoint", "finalized_checkpoint")):
+                if key in checks:
+                    c = getattr(store, attr); exp = checks[key]
+                    assert c.epoch == int(exp["epoch"]) and c.root == bytes.fromhex(exp["root"][2:]), \
+                        f"{case_id} step {i}: {key} ({c.epoch},{c.root.hex()}) != ({exp['epoch']},{exp['root']})"
+            if "proposer_boost_root" in checks:
+                assert store.proposer_boost_root == bytes.fromhex(checks["proposer_boost_root"][2:]), \
+                    f"{case_id} step {i}: proposer_boost_root {store.proposer_boost_root.hex()}"
+            if "get_proposer_head" in checks:
+                exp = bytes.fromhex(checks["get_proposer_head"][2:])
+                got = fc.get_proposer_head(store, head, fc.get_current_slot(store)).root
+                assert got == exp, f"{case_id} step {i}: get_proposer_head {got.hex()} != {exp.hex()}"
+            if "should_override_forkchoice_update" in checks:
+                pass  # not implemented in consensoor (builder override is n/a for self-build)
+            if "viable_for_head_roots_and_weights" in checks:
+                # Mirror pyspec's get_viable_for_head_checks: the leaves of the
+                # filtered (root, payload_status) node tree with their weights.
+                filtered = fc.get_filtered_block_tree(store)
+                pending = [fc.ForkChoiceNode(root=store.justified_checkpoint.root, payload_status=fc.PAYLOAD_STATUS_PENDING)]
+                leaves = []
+                while pending:
+                    node = pending.pop()
+                    children = fc.get_node_children(store, filtered, node)
+                    if not children:
+                        leaves.append(node)
+                    else:
+                        pending.extend(children)
+                got = {(n.root, n.payload_status): fc.get_weight(store, n) for n in leaves}
+                exp = {(bytes.fromhex(e["root"][2:]), int(e.get("payload_status", fc.PAYLOAD_STATUS_PENDING))): int(e["weight"])
+                       for e in checks["viable_for_head_roots_and_weights"]}
+                assert got == exp, f"{case_id} step {i}: viable leaves {[(r.hex()[:8], ps, w) for (r, ps), w in got.items()]} != {[(r.hex()[:8], ps, w) for (r, ps), w in exp.items()]}"
+            if is_fcr_check and fcr_store is not None:
+                for key in ("previous_epoch_observed_justified_checkpoint", "current_epoch_observed_justified_checkpoint",
+                            "previous_epoch_greatest_unrealized_checkpoint"):
+                    c = getattr(fcr_store, key); exp = checks[key]
+                    assert c.epoch == int(exp["epoch"]) and c.root == bytes.fromhex(exp["root"][2:]), \
+                        f"{case_id} step {i}: {key} ({c.epoch},{c.root.hex()[:12]}) != ({exp['epoch']},{exp['root'][:14]})"
+                for key in ("previous_slot_head", "current_slot_head", "confirmed_root"):
+                    exp = bytes.fromhex(checks[key][2:]); got = getattr(fcr_store, key)
+                    assert got == exp, f"{case_id} step {i}: {key} {got.hex()[:12]} != {exp.hex()[:12]}"
+                if "safe_execution_block_hash" in checks:
+                    exp = bytes.fromhex(checks["safe_execution_block_hash"][2:])
+                    got = fcr.get_safe_execution_block_hash(fcr_store)
+                    assert got == exp, f"{case_id} step {i}: safe_execution_block_hash {got.hex()[:12]} != {exp.hex()[:12]}"
+        else:
+            pytest.fail(f"{case_id} step {i}: unknown step {step!r}")
+
+
+@pytest.mark.fork_choice
+class TestForkChoiceConsensoor:
+    """Gloas fork_choice vectors against consensoor.spec.fork_choice."""
+
+    def test_fork_choice(self, fork_choice_case, preset):
+        case_id, case_path, fork, _ = fork_choice_case
+        _run_consensoor_fork_choice_case(case_id, case_path, preset, with_fcr=False)
+
+
+@pytest.mark.fork_choice
+class TestFastConfirmationConsensoor:
+    """Gloas fast_confirmation vectors against consensoor.spec.fast_confirmation."""
+
+    def test_fast_confirmation(self, fast_confirmation_case, preset):
+        case_id, case_path, fork, _ = fast_confirmation_case
+        _run_consensoor_fork_choice_case(case_id, case_path, preset, with_fcr=True)
+
+
+# ---------------------------------------------------------------------------
+# Mid-chain anchor replay (node scenario, not a spec vector)
+#
+# A running node anchors its Store on the first block it fully imports —
+# typically the first block of an epoch — not on genesis. The dependent root
+# of that epoch and the PTC votes for the anchor slot then reference state
+# *below* the anchor, which the spec functions never see in the reference
+# vectors. Replay the tail of a fast_confirmation vector from such an anchor
+# and require that get_head / on_fast_confirmation keep working and agree with
+# the genesis-anchored reference store.
+# ---------------------------------------------------------------------------
+
+def _select_mid_chain_anchor_cases(spec_tests_dir: Path, limit: int = 3):
+    """The FCR vectors with the most block steps (longest linear chains)."""
+    from consensoor.spec.constants import SLOTS_PER_EPOCH
+    scored = []
+    for case_id, case_path, _fork, _p in discover_fork_choice_tests(spec_tests_dir, "fast_confirmation"):
+        steps = load_yaml(case_path / "steps.yaml") or []
+        n_blocks = sum(1 for s in steps if "block" in s)
+        if n_blocks >= 3 * SLOTS_PER_EPOCH():
+            scored.append((n_blocks, case_id, case_path))
+    scored.sort(reverse=True)
+    return [(cid, path) for _n, cid, path in scored[:limit]]
+
+
+def _replay_from_mid_chain_anchor(case_id: str, case_path: Path, preset: str):
+    from consensoor.spec.constants import set_preset
+    from consensoor.spec.network_config import load_config_from_upstream, set_config
+    set_preset(preset)
+    set_config(load_config_from_upstream(preset))
+    from consensoor.crypto import hash_tree_root, set_bls_verification
+    from consensoor.spec import fork_choice as fc
+    from consensoor.spec import fast_confirmation as fcr
+    from consensoor.spec.types.gloas import (
+        BeaconState, BeaconBlock, SignedBeaconBlock, Attestation, AttesterSlashing,
+        SignedExecutionPayloadEnvelope, PayloadAttestationMessage,
+    )
+
+    def load(name, typ):
+        with open(case_path / f"{name}.ssz_snappy", "rb") as f:
+            return typ.decode_bytes(snappy.decompress(f.read()))
+
+    anchor_state = load("anchor_state", BeaconState)
+    anchor_block = load("anchor_block", BeaconBlock)
+    steps = load_yaml(case_path / "steps.yaml")
+    meta = load_yaml(case_path / "meta.yaml") or {}
+    set_bls_verification(int(meta.get("bls_setting", 1)) != 2)
+    try:
+        # Pass 1: reference store from genesis (also yields every post-state).
+        ref = fc.get_forkchoice_store(anchor_state, anchor_block)
+        ref_fcr = fcr.get_fast_confirmation_store(ref)
+        _run_steps(case_id, case_path, ref, ref_fcr, steps, True, load, fc, fcr,
+                   SignedBeaconBlock, Attestation, AttesterSlashing, SignedExecutionPayloadEnvelope,
+                   PayloadAttestationMessage)
+
+        # Anchor: the first epoch-start block that still leaves >= 1 epoch to replay.
+        from consensoor.spec.constants import SLOTS_PER_EPOCH
+        spe = SLOTS_PER_EPOCH()
+        max_slot = max(int(b.slot) for b in ref.blocks.values())
+        candidates = sorted(
+            (int(b.slot), root) for root, b in ref.blocks.items()
+            if int(b.slot) >= spe and int(b.slot) % spe == 0 and int(b.slot) + spe <= max_slot
+        )
+        if not candidates:
+            pytest.skip(f"{case_id}: no epoch-start block with an epoch of chain after it")
+        anchor_slot, anchor_root = candidates[0]
+
+        # Pass 2: replay the same steps into a store anchored at that block.
+        store = fcr_store = None
+        queued = []
+        ticks_after_anchor = 0
+        for i, step in enumerate(steps):
+            if "tick" in step:
+                if store is None:
+                    continue
+                fc.on_tick(store, int(step["tick"]))
+                for att in queued:
+                    try:
+                        fc.on_attestation(store, att, is_from_block=False)
+                    except AssertionError:
+                        pass  # pre-anchor target / future slot — same as the node drops them
+                queued = []
+                # This is exactly what the node does on every slot tick.
+                fcr.on_fast_confirmation(fcr_store)
+                head = fc.get_head(store)
+                assert head.root in store.blocks, f"{case_id} step {i}: head not in store"
+                ticks_after_anchor += 1
+            elif "block" in step:
+                signed = load(step["block"], SignedBeaconBlock)
+                root = hash_tree_root(signed.message)
+                post_state = ref.block_states.get(root)
+                if post_state is None:
+                    continue  # invalid block in the vector
+                if store is None:
+                    if root != anchor_root:
+                        continue
+                    store = fc.get_forkchoice_store(post_state, signed.message)
+                    store.time = ref.time
+                    fcr_store = fcr.get_fast_confirmation_store(store)
+                    continue
+                assert fc.on_block_with_state(store, signed, post_state), f"{case_id} step {i}: parent unknown"
+                for att in signed.message.body.attestations:
+                    try:
+                        fc.on_attestation(store, att, is_from_block=True)
+                    except AssertionError:
+                        pass
+            elif "attestation" in step:
+                if store is not None and step.get("valid", True):
+                    queued.append(load(step["attestation"], Attestation))
+            elif "payload_attestation" in step or "payload_attestation_message" in step:
+                if store is not None and step.get("valid", True):
+                    pa = load(step.get("payload_attestation_message", step.get("payload_attestation")),
+                              PayloadAttestationMessage)
+                    try:
+                        fc.on_payload_attestation_message(store, pa, is_from_block=False)
+                    except AssertionError:
+                        pass
+            elif "execution_payload" in step:
+                if store is not None and step.get("valid", True):
+                    fc.on_execution_payload_envelope_trusted(store, load(step["execution_payload"], SignedExecutionPayloadEnvelope))
+
+        assert store is not None and ticks_after_anchor > 0, f"{case_id}: anchor block never replayed"
+        ref_head, head = fc.get_head(ref), fc.get_head(store)
+        assert (head.root, head.payload_status) == (ref_head.root, ref_head.payload_status), (
+            f"{case_id}: anchored@{anchor_slot} head {head} != reference head {ref_head}"
+        )
+        confirmed_slot = int(store.blocks[fcr_store.confirmed_root].slot)
+        assert confirmed_slot >= anchor_slot, f"{case_id}: confirmed root left the anchored store"
+        if int(ref.blocks[ref_fcr.confirmed_root].slot) >= anchor_slot:
+            assert fcr_store.confirmed_root == ref_fcr.confirmed_root, f"{case_id}: confirmed root differs from reference"
+    finally:
+        set_bls_verification(True)
+
+
+@pytest.mark.fork_choice
+class TestMidChainAnchorReplay:
+    """Store anchored on an epoch-start block mid-chain (how the node anchors)."""
+
+    def test_replay_from_mid_chain_anchor(self, spec_tests_dir, preset):
+        cases = _select_mid_chain_anchor_cases(spec_tests_dir)
+        if not cases:
+            pytest.skip("no gloas fast_confirmation vectors with >= 3 epochs of blocks")
+        for case_id, case_path in cases:
+            _replay_from_mid_chain_anchor(case_id, case_path, preset)

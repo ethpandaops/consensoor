@@ -14,6 +14,7 @@ from .encoding import (
     get_topic_name,
     get_blob_sidecar_topic,
     get_sync_committee_subnet_topic,
+    get_data_column_sidecar_topic,
     encode_message,
     decode_message,
     compute_fork_digest,
@@ -111,6 +112,10 @@ class BeaconGossip:
             self._all_fork_digests.append(self.fork_digest)
 
         self._handlers: dict[str, MessageHandler] = {}
+        self._data_column_handler = None
+        self._data_column_subnets: list[int] = []
+        # Digests (Fulu+) on which to subscribe DAS subnets; set by the node.
+        self._das_fork_digests: list[bytes] = []
 
         # Supernodes pin to NUMBER_OF_CUSTODY_GROUPS up-front. Validator
         # nodes start at the conservative CUSTODY_REQUIREMENT (4) — node.py
@@ -194,6 +199,12 @@ class BeaconGossip:
         topic = get_topic_name(PROPOSER_PREFERENCES_TOPIC, self.fork_digest)
         await self._host.publish(topic, message_ssz)
 
+    def subscribe_data_column_sidecars(self, handler: Callable, subnet_ids: list[int]) -> None:
+        """Subscribe to ``data_column_sidecar_{subnet}`` for the given subnets
+        (Fulu+ PeerDAS). Handler receives (decoded_ssz, from_peer, subnet_id)."""
+        self._data_column_handler = handler
+        self._data_column_subnets = list(subnet_ids)
+
     def subscribe_blob_sidecars(self, handler: MessageHandler) -> None:
         """Subscribe to blob sidecar messages on all subnets."""
         self._blob_sidecar_handler = handler
@@ -235,6 +246,21 @@ class BeaconGossip:
                     await self._host.subscribe(topic, wrapped_handler)
             subscribed_topics.append(f"sync_committee ({SYNC_COMMITTEE_SUBNET_COUNT} subnets)")
 
+        # Data column sidecar subnets (PeerDAS). Only for the digests of forks
+        # that actually have them (Fulu+): the subnet count is large, so we
+        # don't multiply it by every historical digest.
+        if getattr(self, "_data_column_handler", None) is not None:
+            digests = self._das_fork_digests or self._all_fork_digests
+            n = 0
+            for fork_digest in digests:
+                for subnet_id in self._data_column_subnets:
+                    wrapped_handler = self._wrap_subnet_handler(self._data_column_handler, subnet_id)
+                    topic = get_data_column_sidecar_topic(subnet_id, fork_digest)
+                    await self._host.subscribe(topic, wrapped_handler)
+                    n += 1
+            subscribed_topics.append(
+                f"data_column_sidecar ({len(self._data_column_subnets)} subnets x {len(digests)} digests)"
+            )
         fork_count = len(self._all_fork_digests)
         logger.info(f"Subscribed to gossip topics: {subscribed_topics} ({fork_count} fork digests)")
 
@@ -326,6 +352,39 @@ class BeaconGossip:
         topic = get_sync_committee_subnet_topic(subnet_id, self.fork_digest)
         encoded = encode_message(message_ssz)
         await self._host.publish(topic, encoded)
+
+    async def ensure_data_column_subnets(self, subnet_ids) -> None:
+        """Subscribe to any data_column_sidecar subnets we don't have yet
+        (custody widens when the validator balance is known after start)."""
+        if getattr(self, "_data_column_handler", None) is None:
+            return
+        digests = self._das_fork_digests or self._all_fork_digests
+        added = 0
+        for subnet_id in subnet_ids:
+            if subnet_id in self._data_column_subnets:
+                continue
+            self._data_column_subnets.append(subnet_id)
+            wrapped_handler = self._wrap_subnet_handler(self._data_column_handler, subnet_id)
+            for fork_digest in digests:
+                await self._host.subscribe(get_data_column_sidecar_topic(subnet_id, fork_digest), wrapped_handler)
+                added += 1
+        if added:
+            logger.info(f"Subscribed to {added} additional data_column_sidecar topics ({len(self._data_column_subnets)} subnets)")
+
+    async def publish_data_column_sidecar(self, subnet_id: int, sidecar_ssz: bytes) -> None:
+        """Publish a DataColumnSidecar on its subnet (PeerDAS)."""
+        topic = get_data_column_sidecar_topic(subnet_id, self.fork_digest)
+        encoded = encode_message(sidecar_ssz)
+        await self._host.publish(topic, encoded)
+
+    def set_raw_rpc_provider(self, protocol: str, provider) -> None:
+        self._host.set_raw_rpc_provider(protocol, provider)
+
+    def set_raw_rpc_response_handler(self, protocol: str, handler) -> None:
+        self._host.set_raw_rpc_response_handler(protocol, handler)
+
+    def request_raw_rpc(self, peer: str, protocol: str, payload: bytes) -> None:
+        self._host.request_raw_rpc(peer, protocol, payload)
 
     async def publish_execution_payload(self, payload_ssz: bytes) -> None:
         """Publish a signed execution payload envelope (GLOAS/ePBS)."""

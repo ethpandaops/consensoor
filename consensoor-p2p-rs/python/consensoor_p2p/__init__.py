@@ -20,6 +20,10 @@ from ._native import (
     BlocksByRootRequest,
     BlocksByRootResponse,
     BlocksByRootEvent,
+    RawRpcRequest,
+    RawChunk,
+    RawRpcResponse,
+    RawRpcEvent,
 )
 
 __all__ = [
@@ -42,4 +46,8 @@ __all__ = [
     "BlocksByRootRequest",
     "BlocksByRootResponse",
     "BlocksByRootEvent",
+    "RawRpcRequest",
+    "RawChunk",
+    "RawRpcResponse",
+    "RawRpcEvent",
 ]

@@ -135,6 +135,11 @@ class P2PHost:
             Callable[[bytes], Optional[tuple[bytes, bytes]]]
         ] = None
         self._status_provider: Optional[Callable[[], dict]] = None
+        # protocol id -> fn(request_payload_bytes) -> list[(context4, ssz_bytes)]
+        self._raw_rpc_providers: dict[str, Callable[[bytes], list[tuple[bytes, bytes]]]] = {}
+        self._raw_rpc_thread: Optional[threading.Thread] = None
+        # protocol id -> fn(peer, RawRpcResponse|None, error) for outbound replies
+        self._raw_rpc_response_handlers: dict[str, Callable] = {}
 
         self._peer_id: Optional[str] = None
         self._listen_addrs: list[str] = []
@@ -161,6 +166,27 @@ class P2PHost:
 
     def set_status_provider(self, provider: Callable[[], dict]) -> None:
         self._status_provider = provider
+
+    def set_raw_rpc_provider(
+        self, protocol: str, provider: Callable[[bytes], list[tuple[bytes, bytes]]]
+    ) -> None:
+        """Serve inbound requests on a generic req/resp protocol
+        (execution_payload_envelopes_by_root, data_column_sidecars_by_root/range).
+
+        ``provider`` gets the raw SSZ request payload and returns the response
+        chunks as ``[(context_bytes4, ssz_bytes), ...]``.
+        """
+        self._raw_rpc_providers[protocol] = provider
+
+    def set_raw_rpc_response_handler(self, protocol: str, handler: Callable) -> None:
+        """Handler for responses to our own requests on ``protocol``:
+        ``handler(peer, chunks: list[(context, ssz)] | None, error: str | None)``."""
+        self._raw_rpc_response_handlers[protocol] = handler
+
+    def request_raw_rpc(self, peer: str, protocol: str, payload: bytes) -> None:
+        if self._network is None:
+            return
+        self._network.request_raw_rpc(peer, protocol, list(payload))
 
     def push_status_snapshot(self, status: dict) -> None:
         """Install a StatusMessage snapshot in the Rust binding so inbound
@@ -284,6 +310,10 @@ class P2PHost:
             target=self._by_root_loop, name="p2p-by-root-dispatch", daemon=True
         )
         self._by_root_thread.start()
+        self._raw_rpc_thread = threading.Thread(
+            target=self._raw_rpc_loop, name="p2p-raw-rpc-dispatch", daemon=True
+        )
+        self._raw_rpc_thread.start()
 
         self._status_sender_thread = threading.Thread(
             target=self._status_sender_loop, name="p2p-status-send", daemon=True
@@ -548,6 +578,47 @@ class P2PHost:
                 )
             except Exception as e:
                 logger.warning(f"answer_blocks_by_root failed: {e}")
+
+    def _raw_rpc_loop(self) -> None:
+        """Serve inbound requests on the generic req/resp protocols and route
+        responses to our own requests."""
+        import consensoor_p2p as cp
+        while not self._stop.is_set():
+            try:
+                ev = self._network.next_raw_rpc(1000)
+            except Exception as e:
+                logger.warning(f"next_raw_rpc error: {e}")
+                continue
+            if ev is None:
+                continue
+            proto = ev.protocol
+            if ev.kind.startswith("request:"):
+                req_id = int(ev.kind.split(":")[1])
+                provider = self._raw_rpc_providers.get(proto)
+                chunks: list = []
+                try:
+                    if provider is not None and ev.request is not None:
+                        for context, ssz in provider(bytes(ev.request.payload)):
+                            chunks.append(cp.RawChunk(list(context), list(ssz)))
+                except Exception as e:
+                    logger.warning(f"raw rpc provider for {proto} failed: {e}")
+                    chunks = []
+                try:
+                    self._network.answer_raw_rpc(req_id, cp.RawRpcResponse(chunks, None))
+                except Exception as e:
+                    logger.warning(f"answer_raw_rpc failed: {e}")
+                continue
+            handler = self._raw_rpc_response_handlers.get(proto)
+            if handler is None:
+                continue
+            try:
+                if ev.kind == "response" and ev.response is not None:
+                    chunks = [(bytes(c.context), bytes(c.ssz)) for c in ev.response.chunks]
+                    handler(ev.peer, chunks, ev.response.error)
+                else:
+                    handler(ev.peer, None, ev.error)
+            except Exception as e:
+                logger.warning(f"raw rpc response handler for {proto} failed: {e}")
 
     def _meta_loop(self) -> None:
         import consensoor_p2p as cp

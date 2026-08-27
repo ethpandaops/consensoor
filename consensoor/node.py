@@ -51,7 +51,7 @@ from .spec.network_config import (
     load_config_from_upstream,
     get_config,
 )
-from .spec.constants import SLOTS_PER_EPOCH, MIN_SEED_LOOKAHEAD
+from .spec.constants import SLOTS_PER_EPOCH, MIN_SEED_LOOKAHEAD, NUMBER_OF_COLUMNS
 from .spec.state_transition import process_slots
 from .engine import EngineAPIClient, ForkchoiceState, PayloadStatusEnum
 from .store import Store
@@ -159,6 +159,12 @@ class BeaconNode:
         self.config = config
         self.state: Optional[AnyBeaconState] = None
         self.head_root: Optional[bytes] = None
+        # Spec fork-choice Store + fast-confirmation store (shadow: fed with
+        # everything we import/receive; drives the FCR `safe_block_hash` and
+        # the `fast_confirmation` event; head selection stays as-is for now).
+        self.fc_store = None
+        self.fcr_store = None
+        self.confirmed_root: Optional[bytes] = None
         # Execution block hashes our EL has answered VALID for (own payloads
         # via newPayloadV5, received envelopes via newPayload). Drives the
         # Gloas fcU head choice in _gloas_el_head_hash.
@@ -597,6 +603,15 @@ class BeaconNode:
             f"ceil=NUMBER_OF_CUSTODY_GROUPS={net_config.number_of_custody_groups})"
         )
         self.beacon_gossip.update_custody_group_count(cgc)
+        # Custody widened: recompute our columns and subscribe the new subnets.
+        self._refresh_custody_columns()
+        das = getattr(self, "das", None)
+        if das is not None:
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.beacon_gossip.ensure_data_column_subnets(das.custody_subnets))
+            except RuntimeError:
+                pass
 
     def _target_gas_limit_for_slot(self, slot: int) -> int:
         """Proposer target gas limit advertised for ``slot``.
@@ -610,6 +625,247 @@ class BeaconNode:
             return int(self.config.target_gas_limit)
         scheduled = get_config().get_scheduled_gas_limit(int(slot) // SLOTS_PER_EPOCH())
         return int(scheduled) if scheduled is not None else DEFAULT_TARGET_GAS_LIMIT
+
+    def _refresh_custody_columns(self) -> None:
+        """Derive the columns we custody (get_custody_column_bits) and hand
+        them to the DAS manager + gossip subnet subscription list."""
+        das = getattr(self, "das", None)
+        if das is None or self.beacon_gossip is None:
+            return
+        bits = self._custody_column_bits()
+        if bits is None:
+            # No ENR yet: a supernode custodies everything; otherwise start
+            # from the minimum and let the next refresh widen it.
+            cols = list(range(NUMBER_OF_COLUMNS)) if self.config.supernode else []
+        else:
+            cols = [i for i in range(NUMBER_OF_COLUMNS) if bits[i // 8] >> (i % 8) & 1]
+        das.set_custody_columns(cols)
+        if not self.beacon_gossip._data_column_subnets:
+            # First time (before activate_subscriptions): seed the subnet list.
+            self.beacon_gossip._data_column_subnets = das.custody_subnets
+        self._custody_column_bits_cache = None  # cgc may have changed
+        logger.info(f"DAS custody: {len(cols)} columns, {len(das.custody_subnets)} subnets")
+
+    def _digest_for_slot(self, slot: int) -> Optional[bytes]:
+        return self._fork_digest_for_epoch(int(slot) // SLOTS_PER_EPOCH())
+
+    def _max_blobs_for_epoch(self, epoch: int) -> int:
+        params = self._get_blob_params_for_epoch(get_config(), int(epoch))
+        return int(params[1]) if params else 6
+
+    def _das_fork_digests(self) -> list[bytes]:
+        """Digests of the forks that carry data column sidecars (Fulu+)."""
+        net_config = get_config()
+        far = 2**64 - 1
+        epochs = set()
+        for e in (getattr(net_config, "fulu_fork_epoch", far), getattr(net_config, "gloas_fork_epoch", far)):
+            if e < far:
+                epochs.add(int(e))
+        for entry in getattr(net_config, "blob_schedule", None) or []:
+            e = entry.get("epoch", entry.get("EPOCH"))
+            if e is not None and int(e) >= int(getattr(net_config, "fulu_fork_epoch", far)):
+                epochs.add(int(e))
+        digests: list[bytes] = []
+        for e in sorted(epochs):
+            d = self._fork_digest_for_epoch(e)
+            if d and d not in digests:
+                digests.append(d)
+        return digests
+
+    async def _on_p2p_data_column_sidecar(self, data: bytes, from_peer: str, subnet_id: int) -> None:
+        """Handle a DataColumnSidecar from a data_column_sidecar_{subnet} topic."""
+        das = getattr(self, "das", None)
+        if das is None:
+            return
+        try:
+            verdict, reason = await asyncio.get_running_loop().run_in_executor(
+                None, das.on_gossip_sidecar, data, subnet_id, self.store.get_block
+            )
+        except Exception as e:
+            logger.error(f"data column sidecar handling failed: {e}")
+            return
+        if verdict == "reject":
+            logger.debug(f"P2P: rejected data column sidecar from {from_peer[:16]}: {reason}")
+            self._record_peer_event(from_peer, "gossip_invalid_data_column")
+        elif verdict == "ignore":
+            logger.debug(f"P2P: ignored data column sidecar (subnet {subnet_id}): {reason}")
+
+    # ------------------------------------------------------------------ fork choice / FCR shadow store
+
+    def _fc_on_block(self, signed_block, post_state) -> None:
+        """Feed a validated block (+ its post-state) into the spec Store."""
+        try:
+            from .spec import fork_choice as fc
+            if not hasattr(post_state, "latest_execution_payload_bid"):
+                return  # Store is Gloas-only
+            if self.fc_store is None:
+                from .spec import fast_confirmation as fcr
+                das = getattr(self, "das", None)
+                self.fc_store = fc.get_forkchoice_store(
+                    post_state, signed_block.message,
+                    is_data_available=(das.is_available if das is not None else None),
+                )
+                self.fc_store.time = int(time.time())
+                self.fcr_store = fcr.get_fast_confirmation_store(self.fc_store)
+                logger.info(
+                    f"Fork-choice store anchored at slot {signed_block.message.slot} "
+                    f"root={hash_tree_root(signed_block.message).hex()[:16]}"
+                )
+                self._fc_mark_applied_payload(hash_tree_root(signed_block.message))
+                return
+            if not fc.on_block_with_state(self.fc_store, signed_block, post_state):
+                return
+            # The envelope usually arrives (and is applied) before the block
+            # is adopted as head, i.e. before this hook runs, so the
+            # envelope hook found the block unknown. Catch up here.
+            self._fc_mark_applied_payload(hash_tree_root(signed_block.message))
+            for att in signed_block.message.body.attestations:
+                try:
+                    fc.on_attestation(self.fc_store, att, is_from_block=True)
+                except AssertionError:
+                    pass
+                except Exception as e:
+                    logger.debug(f"fork-choice store block attestation failed: {e!r}")
+            for sl in signed_block.message.body.attester_slashings:
+                try:
+                    fc.on_attester_slashing(self.fc_store, sl)
+                except AssertionError:
+                    pass
+                except Exception as e:
+                    logger.debug(f"fork-choice store block slashing failed: {e!r}")
+        except Exception as e:
+            logger.warning(f"fork-choice store on_block failed: {e!r}")
+
+    def _fc_mark_applied_payload(self, block_root: bytes) -> None:
+        """If the node already applied ``block_root``'s payload envelope,
+        record it in the Store (payload FULL branch becomes viable)."""
+        try:
+            env = self.store.get_payload(block_root)
+            if env is None or not hasattr(env, "message"):
+                return
+            if bytes(env.message.beacon_block_root) != block_root:
+                return
+            from .spec import fork_choice as fc
+            fc.on_execution_payload_envelope_trusted(self.fc_store, env)
+        except Exception as e:
+            logger.debug(f"fork-choice store payload catch-up failed: {e!r}")
+
+    def _fc_on_envelope(self, signed_envelope) -> None:
+        if self.fc_store is None:
+            return
+        try:
+            from .spec import fork_choice as fc
+            fc.on_execution_payload_envelope_trusted(self.fc_store, signed_envelope)
+        except Exception as e:
+            logger.debug(f"fork-choice store envelope failed: {e}")
+
+    def _fc_on_attestation(self, attestation) -> None:
+        if self.fc_store is None:
+            return
+        try:
+            from .spec import fork_choice as fc
+            fc.on_attestation(self.fc_store, attestation, is_from_block=False)
+        except AssertionError:
+            pass  # not yet applicable (future slot / unknown block) — normal
+        except Exception as e:
+            logger.debug(f"fork-choice store on_attestation failed: {e}")
+
+    def _fc_on_payload_attestation(self, msg) -> None:
+        if self.fc_store is None:
+            return
+        try:
+            from .spec import fork_choice as fc
+            fc.on_payload_attestation_message(self.fc_store, msg, is_from_block=False)
+        except AssertionError:
+            pass
+        except Exception as e:
+            logger.debug(f"fork-choice store on_payload_attestation_message failed: {e}")
+
+    async def _fc_on_tick(self, slot: int) -> None:
+        """Advance the Store clock and kick off the fast confirmation rule
+        for this slot (spec: at the start of each slot, after the previous
+        slot's attestations were applied). The rule itself runs as a
+        background task so a slow run can never stall the slot loop; a run
+        still in flight when the next slot ticks is left alone and that
+        slot is skipped."""
+        if self.fc_store is None or self.fcr_store is None:
+            return
+        try:
+            from .spec import fork_choice as fc
+            fc.on_tick(self.fc_store, int(time.time()))
+        except Exception as e:
+            logger.warning(f"fork-choice store on_tick failed for slot {slot}: {e!r}")
+            return
+        task = getattr(self, "_fcr_task", None)
+        if task is not None and not task.done():
+            logger.warning(f"FCR: run for slot {slot} skipped, previous run still in progress")
+            return
+        self._fcr_task = asyncio.get_running_loop().create_task(self._run_fast_confirmation(slot))
+
+    async def _run_fast_confirmation(self, slot: int) -> None:
+        try:
+            from .spec import fork_choice as fc
+            from .spec import fast_confirmation as fcr
+            t0 = time.monotonic()
+            await asyncio.get_running_loop().run_in_executor(None, fcr.on_fast_confirmation, self.fcr_store)
+            self.confirmed_root = self.fcr_store.confirmed_root
+            confirmed_block = self.fc_store.blocks.get(self.confirmed_root)
+            confirmed_slot = int(confirmed_block.slot) if confirmed_block is not None else None
+            fc_head = fc.get_head(self.fc_store)
+            logger.info(
+                f"FCR: confirmed slot={confirmed_slot} root={self.confirmed_root.hex()[:16]} "
+                f"fc_head=slot {int(self.fc_store.blocks[fc_head.root].slot)}/{fc_head.root.hex()[:12]}/"
+                f"status {fc_head.payload_status} "
+                f"(node head {self.head_root.hex()[:12] if self.head_root else None}) "
+                f"took {(time.monotonic() - t0) * 1000:.0f}ms"
+            )
+            if self.beacon_api and confirmed_slot is not None:
+                try:
+                    await self.beacon_api.emit_fast_confirmation(confirmed_slot, self.confirmed_root)
+                except Exception as e:
+                    logger.debug(f"emit_fast_confirmation failed: {e}")
+            if slot % SLOTS_PER_EPOCH() == 0:
+                removed = fc.prune_store(self.fc_store)
+                if removed:
+                    logger.debug(f"fork-choice store pruned {removed} blocks")
+        except RuntimeError as e:
+            # The Store is updated on the event loop while the rule runs in
+            # a worker thread; a block/attestation landing mid-run can trip
+            # "dictionary changed size during iteration". Next slot retries.
+            logger.info(f"fast confirmation for slot {slot} aborted by a concurrent store update: {e}")
+        except Exception as e:
+            logger.warning(f"fast confirmation failed for slot {slot}: {e!r}")
+
+    def _safe_block_hash(self, default: bytes) -> bytes:
+        """``safe_block_hash`` for fcU: the FCR-confirmed block's execution
+        parent (get_safe_execution_block_hash) when available, else ``default``."""
+        try:
+            store = self.fc_store
+            if self.fcr_store is not None and store is not None and self.confirmed_root in store.blocks:
+                from .spec import fork_choice as fc
+                from .spec import fast_confirmation as fcr
+                from .spec.state_transition.helpers.misc import compute_start_slot_at_epoch
+                confirmed_slot = int(store.blocks[self.confirmed_root].slot)
+                # The Engine API requires finalized <= safe <= head on one
+                # chain (ethrex: "Safe, finalized and head blocks are not in
+                # the correct order" -> INVALID, no payload_id). The FCR safe
+                # hash is the confirmed block's execution *parent*, so the
+                # confirmed block must sit strictly after the finalized one,
+                # and under our current head.
+                if self.state is not None and confirmed_slot <= compute_start_slot_at_epoch(
+                    int(self.state.finalized_checkpoint.epoch)
+                ):
+                    return default
+                if self.head_root and self.head_root in store.blocks:
+                    head_node = fc.ForkChoiceNode(root=self.head_root, payload_status=fc.PAYLOAD_STATUS_PENDING)
+                    if fc.get_ancestor(store, head_node, confirmed_slot).root != self.confirmed_root:
+                        return default
+                h = fcr.get_safe_execution_block_hash(self.fcr_store)
+                if h and h != b"\x00" * 32:
+                    return h
+        except Exception as e:
+            logger.debug(f"safe block hash fallback: {e!r}")
+        return default
 
     def _custody_column_bits(self) -> Optional[bytes]:
         """SSZ ``Bitvector[NUMBER_OF_COLUMNS]`` of the columns we custody.
@@ -780,7 +1036,28 @@ class BeaconNode:
             self.beacon_gossip.set_block_by_root_provider(self._get_block_by_root)
             self.beacon_gossip.set_fork_digest_resolver(self._publish_fork_digest)
 
+            # PeerDAS: verify/store/serve data column sidecars and publish our own.
+            from .das import (
+                DataColumnManager,
+                PROTO_ENVELOPES_BY_ROOT,
+                PROTO_COLUMNS_BY_ROOT,
+                PROTO_COLUMNS_BY_RANGE,
+            )
+            self.das = DataColumnManager(
+                self.store,
+                digest_for_slot=self._digest_for_slot,
+                custody_columns=[],
+                max_blobs_for_epoch=self._max_blobs_for_epoch,
+            )
+            self.beacon_gossip.subscribe_data_column_sidecars(self._on_p2p_data_column_sidecar, [])
+            self.beacon_gossip._das_fork_digests = self._das_fork_digests()
+            self.beacon_gossip.set_raw_rpc_provider(PROTO_ENVELOPES_BY_ROOT, self.das.serve_envelopes_by_root)
+            self.beacon_gossip.set_raw_rpc_provider(PROTO_COLUMNS_BY_ROOT, self.das.serve_columns_by_root)
+            self.beacon_gossip.set_raw_rpc_provider(PROTO_COLUMNS_BY_RANGE, self.das.serve_columns_by_range)
+
             await self.beacon_gossip.start()
+            # Custody columns need our node id (from the ENR the host just built).
+            self._refresh_custody_columns()
             await self.beacon_gossip.activate_subscriptions()
 
             self._push_status_snapshot()
@@ -1161,7 +1438,7 @@ class BeaconNode:
 
             forkchoice_state = ForkchoiceState(
                 head_block_hash=head_block_hash,
-                safe_block_hash=head_block_hash,
+                safe_block_hash=self._safe_block_hash(head_block_hash),
                 finalized_block_hash=b"\x00" * 32,
             )
 
@@ -1363,6 +1640,7 @@ class BeaconNode:
         slots_per_epoch = SLOTS_PER_EPOCH()
         epoch = slot // slots_per_epoch
         logger.info(f"Slot {slot} (epoch {epoch})")
+        await self._fc_on_tick(slot)
 
         # Sync committee message production moved to the 1/3 mark (next
         # to attestations) so we sign this slot's head, not the previous
@@ -1492,7 +1770,7 @@ class BeaconNode:
 
             forkchoice_state = ForkchoiceState(
                 head_block_hash=head_block_hash,
-                safe_block_hash=head_block_hash,
+                safe_block_hash=self._safe_block_hash(head_block_hash),
                 finalized_block_hash=finalized_hash,
             )
 
@@ -1737,6 +2015,7 @@ class BeaconNode:
                 )
                 if attestation:
                     self.attestation_pool.add(attestation)
+                    self._fc_on_attestation(attestation)
                     produced_count += 1
 
                     # Broadcast via P2P as aggregate, but only if this
@@ -1984,10 +2263,18 @@ class BeaconNode:
 
         beacon_block_root = self.head_root
         payload_present = self.store.get_payload(beacon_block_root) is not None
-        # Conservative: only assert blob_data_available when we also have
-        # the envelope. A finer check would compare blob count to
-        # bid.blob_kzg_commitments — left for a follow-up.
+        # blob_data_available: the payload is present AND every column we
+        # custody for it has been received/verified (PeerDAS). Blob-less
+        # payloads are trivially available.
         blob_data_available = payload_present
+        das = getattr(self, "das", None)
+        if payload_present and das is not None:
+            try:
+                n_commitments = len(self.state.latest_execution_payload_bid.blob_kzg_commitments)
+            except Exception:
+                n_commitments = 0
+            if n_commitments > 0:
+                blob_data_available = das.is_available(beacon_block_root)
 
         produced: list[int] = []
         for validator_index in our_in_ptc:
@@ -2013,6 +2300,7 @@ class BeaconNode:
             # without round-tripping our vote through gossip.
             try:
                 self.payload_attestation_pool.add_message(msg, ptc)
+                self._fc_on_payload_attestation(msg)
             except Exception as e:
                 logger.warning(f"PTC self-feed failed for vi={validator_index}: {e}")
 
@@ -2469,6 +2757,7 @@ class BeaconNode:
         payload_root = hash_tree_root(envelope)
         self.store.save_payload(payload_root, signed_envelope)
         self.store.save_payload(beacon_block_root, signed_envelope)
+        self._fc_on_envelope(signed_envelope)
 
         # Broadcast
         ssz_bytes = signed_envelope.encode_bytes()
@@ -2479,6 +2768,24 @@ class BeaconNode:
             f"latest_block_hash={bytes(self.state.latest_block_hash).hex()[:16]}, "
             f"commitments={len(kzg_commitments)}"
         )
+
+        # PeerDAS: the builder (us, self-build) publishes the data column
+        # sidecars of its payload right after the envelope.
+        das = getattr(self, "das", None)
+        if das is not None and blobs_bundle and blobs_bundle.get("blobs"):
+            try:
+                sidecars = await asyncio.get_running_loop().run_in_executor(
+                    None, das.build_sidecars, bytes(beacon_block_root), int(slot), blobs_bundle
+                )
+                das.store_sidecars(sidecars)
+                from .das import compute_subnet_for_data_column_sidecar
+                for sc in sidecars:
+                    await self.beacon_gossip.publish_data_column_sidecar(
+                        compute_subnet_for_data_column_sidecar(int(sc.index)), sc.encode_bytes()
+                    )
+                logger.info(f"Published {len(sidecars)} data column sidecars for slot {slot}")
+            except Exception as e:
+                logger.error(f"Failed to build/publish data column sidecars for slot {slot}: {e}")
 
     async def _produce_and_broadcast_block(self, slot: int, proposer_key) -> None:
         """Produce and broadcast a block for the given slot."""
@@ -2493,6 +2800,15 @@ class BeaconNode:
         try:
             network_config = get_config()
             timestamp = self._genesis_time + slot * (network_config.slot_duration_ms // 1000)
+
+            # Don't propose from a stale state (e.g. while catching up after a
+            # late start): the lookahead we read our duty from is then wrong
+            # and the block fails process_block_header ("proposer mismatch").
+            if self.state is not None and int(self.state.slot) + 2 * SLOTS_PER_EPOCH() < slot:
+                logger.warning(
+                    f"Skipping proposal for slot {slot}: state at slot {self.state.slot} is not synced"
+                )
+                return
 
             # Prefer the already-prepared payload from the prep-fcU at the
             # previous slot's end — geth has been filling it with txs for
@@ -2800,7 +3116,7 @@ class BeaconNode:
             # Now update forkchoice with the new block
             forkchoice_state = ForkchoiceState(
                 head_block_hash=new_block_hash,
-                safe_block_hash=new_block_hash,
+                safe_block_hash=self._safe_block_hash(new_block_hash),
                 finalized_block_hash=self._resolve_finalized_block_hash() or b"\x00" * 32,
             )
 
@@ -2818,6 +3134,7 @@ class BeaconNode:
                 f"Block produced and applied: slot={slot}, "
                 f"root={block_root.hex()[:16]}, block_hash={new_block_hash.hex()[:16]}"
             )
+            self._fc_on_block(signed_block, self.state)
 
             # (Block was already published EARLY immediately after build_block.)
 
@@ -3258,6 +3575,7 @@ class BeaconNode:
                         f"P2P: Adopted block as new head: slot={block.slot}, "
                         f"root={block_root.hex()[:16]}"
                     )
+                    self._fc_on_block(signed_block, self.state)
 
                     self.attestation_pool.remove_included(list(block.body.attestations))
 
@@ -3331,6 +3649,7 @@ class BeaconNode:
 
             # Add to attestation pool
             self.attestation_pool.add(attestation)
+            self._fc_on_attestation(attestation)
 
             logger.info(
                 f"P2P: Received aggregate slot={slot}, "
@@ -3449,7 +3768,11 @@ class BeaconNode:
             self.store.save_payload(payload_root, signed_envelope)
             self.store.save_payload(beacon_block_root, signed_envelope)
 
-            if self.engine:
+            # Only hand the payload to the EL once we know its block: the
+            # blob versioned hashes come from the block's bid, and without
+            # them the EL answers INVALID for blob-carrying payloads. If the
+            # block isn't here yet the pending-envelope path validates later.
+            if self.engine and self.store.get_block(beacon_block_root) is not None:
                 await self._validate_execution_payload(envelope)
 
             # Apply phase 2 (envelope processing) to state if the block has been processed
@@ -3478,6 +3801,7 @@ class BeaconNode:
             slot = int(msg.data.slot)
             ptc = list(get_ptc(self.state, slot))
             self.payload_attestation_pool.add_message(msg, ptc)
+            self._fc_on_payload_attestation(msg)
             # Drop messages older than current_epoch's start.
             current_slot = int(self.state.slot)
             from .spec.constants import SLOTS_PER_EPOCH
@@ -4000,6 +4324,7 @@ class BeaconNode:
             f"Reorg: head moved from {old_head} → "
             f"{target_root.hex()[:16]} at slot {target_slot}"
         )
+        self._fc_on_block(target_signed_block, self.state)
 
         # Forkchoice update with EL so it tracks the new head.
         try:
@@ -4497,6 +4822,14 @@ class BeaconNode:
             f"latest_block_hash={bytes(self.state.latest_block_hash).hex()[:16]}, "
             f"state_root={state_root.hex()[:16]}"
         )
+        self._fc_on_envelope(signed_envelope)
+        # Envelopes that arrived before their block were not sent to the EL yet.
+        env_hash = bytes(signed_envelope.message.payload.block_hash)
+        if self.engine and env_hash not in self._el_validated_hashes:
+            try:
+                await self._validate_execution_payload(signed_envelope.message)
+            except Exception as e:
+                logger.debug(f"deferred payload validation failed: {e}")
 
     async def _apply_minimal_block_update(self, block) -> None:
         """Apply minimal block updates when full state transition fails.
@@ -4670,7 +5003,7 @@ class BeaconNode:
             # Use zeros for finalized hash (finalized_checkpoint.root is beacon root, not execution hash)
             forkchoice_state = ForkchoiceState(
                 head_block_hash=head_block_hash,
-                safe_block_hash=head_block_hash,
+                safe_block_hash=self._safe_block_hash(head_block_hash),
                 finalized_block_hash=b"\x00" * 32,
             )
 
