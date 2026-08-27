@@ -64,7 +64,7 @@ help:
 	@echo "  make test-compliance gloas       # Run gloas compliance cases"
 	@echo "  make test-compliance fulu        # Run fulu compliance cases"
 	@echo "  make fetch-comptests             # Download compliance fixtures"
-	@echo "  make test-fork-choice            # Run fork-choice + fast-confirmation vectors (slow)"
+	@echo "  make test-fork-choice            # Run fork-choice + fast-confirmation vectors"
 	@echo ""
 	@echo "Other targets:"
 	@echo "  make fetch-tests     # Download reference tests"
@@ -98,7 +98,7 @@ test: fetch-tests
 
 # Fork-choice + fast-confirmation reference vectors (gloas) driven through
 # consensoor's own Store (consensoor/spec/fork_choice.py + fast_confirmation.py).
-# Slow (~40 min on 8 cores): each case replays whole epochs of attestations.
+# ~1 min on 6 cores (each case replays whole epochs of attestations).
 test-fork-choice: CORES := $(or $(cores),auto)
 test-fork-choice: PRESET := $(or $(PARAM_PRESET),$(preset),minimal)
 test-fork-choice: fetch-tests

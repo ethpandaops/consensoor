@@ -49,5 +49,5 @@ version_file = "consensoor/_version.py"
 
 [tool.pytest.ini_options]
 markers = [
-    "fork_choice: fork-choice / fast-confirmation reference vectors driven through consensoor's Store (slow; make test-fork-choice)",
+    "fork_choice: fork-choice / fast-confirmation reference vectors driven through consensoor's Store (make test-fork-choice)",
 ]
