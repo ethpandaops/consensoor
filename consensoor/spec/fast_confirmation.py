@@ -27,6 +27,7 @@ from .fork_choice import (
     get_current_store_epoch,
     get_head,
     get_latest_message_epoch,
+    get_supported_node,
     get_voting_source,
     is_ancestor,
 )
@@ -144,7 +145,9 @@ def get_current_balance_source(fcr_store: FastConfirmationStore):
 # ---------------------------------------------------------------- LMD-GHOST helpers
 
 
-def get_block_support_between_slots(store: Store, balance_source, block_root: bytes, start_slot: int, end_slot: int) -> int:
+def get_node_support_between_slots(store: Store, balance_source, node: ForkChoiceNode, start_slot: int, end_slot: int) -> int:
+    """Support for ``node`` (root + payload status) by validators assigned to
+    slots [start_slot, end_slot] (specs #5672: node, not block root)."""
     participants: Set[int] = set()
     for slot in range(start_slot, end_slot + 1):
         participants.update(get_slot_committee(store, slot))
@@ -155,7 +158,11 @@ def get_block_support_between_slots(store: Store, balance_source, block_root: by
         if v.slashed or not is_active_validator(v, epoch):
             continue
         msg = store.latest_messages.get(i)
-        if msg is not None and msg.root == block_root and i not in store.equivocating_indices:
+        if (
+            msg is not None
+            and i not in store.equivocating_indices
+            and get_supported_node(store, msg) == node
+        ):
             total += int(v.effective_balance)
     return total
 
@@ -227,8 +234,11 @@ def compute_empty_slot_support_discount(store: Store, balance_source, block_root
     parent_block = store.blocks[bytes(block.parent_root)]
     if int(parent_block.slot) + 1 == int(block.slot):
         return 0
-    parent_support_in_empty_slots = get_block_support_between_slots(
-        store, balance_source, bytes(block.parent_root), int(parent_block.slot) + 1, int(block.slot) - 1
+    # Discount votes for the parent *node* (with the payload status this
+    # block builds on) from the committees of the empty slots (specs #5672)
+    parent_node = get_ancestor(store, get_node_for_root(block_root), int(parent_block.slot))
+    parent_support_in_empty_slots = get_node_support_between_slots(
+        store, balance_source, parent_node, int(parent_block.slot) + 1, int(block.slot) - 1
     )
     adversarial_weight = compute_adversarial_weight(
         store, balance_source, int(parent_block.slot) + 1, int(block.slot) - 1

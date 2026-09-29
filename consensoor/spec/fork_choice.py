@@ -480,61 +480,69 @@ def _children_index(store: Store) -> Dict[bytes, List[bytes]]:
     return index
 
 
-def filter_block_tree(store: Store, block_root: bytes, blocks: Dict[bytes, object], children_index=None) -> bool:
-    if children_index is None:
-        children_index = _children_index(store)
-    block = store.blocks[block_root]
-    children = children_index.get(block_root, [])
-    if any(children):
-        results = [filter_block_tree(store, child, blocks, children_index) for child in children]
-        if any(results):
-            blocks[block_root] = block
-            return True
-        return False
-
+def _is_leaf_viable(store: Store, root: bytes) -> bool:
     current_epoch = get_current_store_epoch(store)
-    voting_source = get_voting_source(store, block_root)
+    voting_source = get_voting_source(store, root)
     correct_justified = (
         store.justified_checkpoint.epoch == GENESIS_EPOCH
         or voting_source.epoch == store.justified_checkpoint.epoch
         or voting_source.epoch + 2 >= current_epoch
     )
-    finalized_checkpoint_block = get_checkpoint_block(store, block_root, store.finalized_checkpoint.epoch)
+    finalized_checkpoint_block = get_checkpoint_block(store, root, store.finalized_checkpoint.epoch)
     correct_finalized = (
         store.finalized_checkpoint.epoch == GENESIS_EPOCH
         or store.finalized_checkpoint.root == finalized_checkpoint_block
     )
-    if correct_justified and correct_finalized:
-        blocks[block_root] = block
-        return True
-    return False
+    return correct_justified and correct_finalized
 
 
-def get_filtered_block_tree(store: Store) -> Dict[bytes, object]:
-    blocks: Dict[bytes, object] = {}
-    filter_block_tree(store, store.justified_checkpoint.root, blocks)
-    return blocks
-
-
-def get_node_children(store: Store, blocks: Dict[bytes, object], node: ForkChoiceNode) -> Sequence[ForkChoiceNode]:
+def get_node_children(store: Store, node: ForkChoiceNode, children_index=None) -> Sequence[ForkChoiceNode]:
     if node.payload_status == PAYLOAD_STATUS_PENDING:
         children = [ForkChoiceNode(root=node.root, payload_status=PAYLOAD_STATUS_EMPTY)]
         if is_payload_verified(store, node.root):
             children.append(ForkChoiceNode(root=node.root, payload_status=PAYLOAD_STATUS_FULL))
         return children
+    if children_index is None:
+        children_index = _children_index(store)
     children = []
-    for root in blocks:
-        meta = _meta(store, root)
-        if meta[1] == node.root and node.payload_status == meta[3]:
+    for root in children_index.get(node.root, []):
+        if node.payload_status == _meta(store, root)[3]:
             children.append(ForkChoiceNode(root=root, payload_status=PAYLOAD_STATUS_PENDING))
     return children
 
 
+def filter_node_tree(store: Store, node: ForkChoiceNode, children_index=None) -> List[ForkChoiceNode]:
+    """[Modified in Gloas] filter over (root, payload_status) nodes so a
+    childless unviable EMPTY/FULL variant is pruned on its own (specs #5509)."""
+    if children_index is None:
+        children_index = _children_index(store)
+    children = get_node_children(store, node, children_index)
+    if any(children):
+        viable_nodes: List[ForkChoiceNode] = []
+        for child in children:
+            viable_nodes.extend(filter_node_tree(store, child, children_index))
+        if any(viable_nodes):
+            return viable_nodes + [node]
+        return []
+    if _is_leaf_viable(store, node.root):
+        return [node]
+    return []
+
+
+def get_filtered_node_tree(store: Store) -> Set[ForkChoiceNode]:
+    base = ForkChoiceNode(root=store.justified_checkpoint.root, payload_status=PAYLOAD_STATUS_PENDING)
+    return set(filter_node_tree(store, base))
+
+
 def get_head(store: Store) -> ForkChoiceNode:
-    blocks = get_filtered_block_tree(store)
+    children_index = _children_index(store)
+    nodes = get_filtered_node_tree(store)
+    # [New in Gloas:EIP7732] no viable nodes -> empty variant of the justified root
+    if not nodes:
+        return ForkChoiceNode(root=store.justified_checkpoint.root, payload_status=PAYLOAD_STATUS_EMPTY)
     head = ForkChoiceNode(root=store.justified_checkpoint.root, payload_status=PAYLOAD_STATUS_PENDING)
     while True:
-        children = get_node_children(store, blocks, head)
+        children = [c for c in get_node_children(store, head, children_index) if c in nodes]
         if len(children) == 0:
             return head
         head = max(

@@ -242,6 +242,7 @@ def get_ssz_type_by_name(fork: str, type_name: str) -> Optional[Type]:
             "ExecutionRequests",
             "BuilderDepositRequest",
             "BuilderExitRequest",
+            "NewPayloadRequest",
         }
         if type_name in gloas_only_types:
             from consensoor.spec.types import gloas as gloas_mod
@@ -1459,22 +1460,12 @@ def _run_steps(case_id, case_path, store, fcr_store, steps, with_fcr, load, fc, 
         if not valid:
             pytest.fail(f"{case_id} step {i}: {what} accepted but expected invalid")
 
-    # Fast-confirmation vectors record attestation steps when the attestations
-    # are *created* (their own slot) and the generator applies them to the
-    # store at the start of the next slot, before on_fast_confirmation
-    # (tests/formats/fast_confirmation/README.md). Queue them until the tick.
-    queued_attestations: list = []
-
-    def flush_attestations(i):
-        while queued_attestations:
-            ref, valid, att = queued_attestations.pop(0)
-            expect(valid, lambda: fc.on_attestation(store, att, is_from_block=False), f"attestation {ref}", i)
-
+    # Fast-confirmation vectors list attestation steps in apply order, after
+    # the tick that makes them past-slot (consensus-specs #5627), so every
+    # step is replayed exactly as written.
     for i, step in enumerate(steps):
         if "tick" in step:
             fc.on_tick(store, int(step["tick"]))
-            if with_fcr:
-                flush_attestations(i)
         elif "block" in step:
             signed = load(step["block"], SignedBeaconBlock)
             def do_block():
@@ -1492,10 +1483,7 @@ def _run_steps(case_id, case_path, store, fcr_store, steps, with_fcr, load, fc, 
             expect(step.get("valid", True), do_block, "block", i)
         elif "attestation" in step:
             att = load(step["attestation"], Attestation)
-            if with_fcr:
-                queued_attestations.append((step["attestation"], step.get("valid", True), att))
-            else:
-                expect(step.get("valid", True), lambda: fc.on_attestation(store, att, is_from_block=False), "attestation", i)
+            expect(step.get("valid", True), lambda: fc.on_attestation(store, att, is_from_block=False), "attestation", i)
         elif "attester_slashing" in step:
             sl = load(step["attester_slashing"], AttesterSlashing)
             expect(step.get("valid", True), lambda: fc.on_attester_slashing(store, sl), "attester_slashing", i)
@@ -1538,12 +1526,12 @@ def _run_steps(case_id, case_path, store, fcr_store, steps, with_fcr, load, fc, 
             if "viable_for_head_roots_and_weights" in checks:
                 # Mirror pyspec's get_viable_for_head_checks: the leaves of the
                 # filtered (root, payload_status) node tree with their weights.
-                filtered = fc.get_filtered_block_tree(store)
+                filtered = fc.get_filtered_node_tree(store)
                 pending = [fc.ForkChoiceNode(root=store.justified_checkpoint.root, payload_status=fc.PAYLOAD_STATUS_PENDING)]
                 leaves = []
                 while pending:
                     node = pending.pop()
-                    children = fc.get_node_children(store, filtered, node)
+                    children = [c for c in fc.get_node_children(store, node) if c in filtered]
                     if not children:
                         leaves.append(node)
                     else:

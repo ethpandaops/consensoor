@@ -232,6 +232,15 @@ class ExecutionPayload(ProgressiveContainer(active_fields=[1] * 19)):
     slot_number: uint64
 
 
+# [Modified in Gloas:EIP7688] SSZ container since specs #5619 (ssz_static only;
+# consensoor builds engine requests directly)
+class NewPayloadRequest(ProgressiveContainer(active_fields=[1] * 4)):
+    execution_payload: ExecutionPayload
+    versioned_hashes: List[Bytes32, MAX_BLOB_COMMITMENTS_PER_BLOCK]
+    parent_beacon_block_root: Root
+    execution_requests: ExecutionRequests
+
+
 class ExecutionPayloadBid(ProgressiveContainer(active_fields=[1] * 12)):
     parent_block_hash: Hash32
     parent_block_root: Root
@@ -444,6 +453,7 @@ __all__ = [
     "BuilderExitRequests",
     "ExecutionRequests",
     "ExecutionPayload",
+    "NewPayloadRequest",
     "ExecutionPayloadBid",
     "SignedExecutionPayloadBid",
     "ExecutionPayloadEnvelope",
