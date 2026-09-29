@@ -206,7 +206,7 @@ def cli():
 )
 @click.option(
     "--fast-confirmation/--no-fast-confirmation",
-    default=True,
+    default=False,
     show_default=True,
     help="Run the Fast Confirmation Rule: maintain the spec fork-choice Store, "
          "emit fast_confirmation SSE events, serve /consensoor/v1/fast_confirmation "
