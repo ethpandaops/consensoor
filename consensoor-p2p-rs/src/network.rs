@@ -77,6 +77,8 @@ struct Eth2Behaviour {
     columns_by_root: RawRpcBehaviour,
     /// Fulu DataColumnSidecarsByRange v1.
     columns_by_range: RawRpcBehaviour,
+    /// Heze InclusionListsByIndices v1.
+    inclusion_lists_by_indices: RawRpcBehaviour,
 }
 
 #[pyclass]
@@ -1169,6 +1171,9 @@ async fn run_swarm(
         envelopes_by_root: raw_rpc::new_raw_rpc_behaviour(raw_rpc::PROTO_ENVELOPES_BY_ROOT),
         columns_by_root: raw_rpc::new_raw_rpc_behaviour(raw_rpc::PROTO_COLUMNS_BY_ROOT),
         columns_by_range: raw_rpc::new_raw_rpc_behaviour(raw_rpc::PROTO_COLUMNS_BY_RANGE),
+        inclusion_lists_by_indices: raw_rpc::new_raw_rpc_behaviour(
+            raw_rpc::PROTO_INCLUSION_LISTS_BY_INDICES,
+        ),
     };
 
     // Swarm config based on lighthouse_network::service `with_executor` block
@@ -1520,6 +1525,15 @@ async fn run_swarm(
                         &mut next_response_id,
                     ).await;
                 }
+                SwarmEvent::Behaviour(Eth2BehaviourEvent::InclusionListsByIndices(rr_event)) => {
+                    handle_raw_rpc_event(
+                        rr_event,
+                        raw_rpc::PROTO_INCLUSION_LISTS_BY_INDICES,
+                        &raw_tx,
+                        &mut pending_raw,
+                        &mut next_response_id,
+                    ).await;
+                }
                 _ => {}
             },
             cmd = cmd_rx.recv() => match cmd {
@@ -1672,6 +1686,7 @@ async fn run_swarm(
                                 raw_rpc::PROTO_ENVELOPES_BY_ROOT => { let _ = b.envelopes_by_root.send_request(&peer_id, request); }
                                 raw_rpc::PROTO_COLUMNS_BY_ROOT => { let _ = b.columns_by_root.send_request(&peer_id, request); }
                                 raw_rpc::PROTO_COLUMNS_BY_RANGE => { let _ = b.columns_by_range.send_request(&peer_id, request); }
+                                raw_rpc::PROTO_INCLUSION_LISTS_BY_INDICES => { let _ = b.inclusion_lists_by_indices.send_request(&peer_id, request); }
                                 other => tracing::warn!("request_raw_rpc: unknown protocol {other}"),
                             }
                         }
@@ -1685,6 +1700,7 @@ async fn run_swarm(
                             raw_rpc::PROTO_ENVELOPES_BY_ROOT => b.envelopes_by_root.send_response(channel, response).is_ok(),
                             raw_rpc::PROTO_COLUMNS_BY_ROOT => b.columns_by_root.send_response(channel, response).is_ok(),
                             raw_rpc::PROTO_COLUMNS_BY_RANGE => b.columns_by_range.send_response(channel, response).is_ok(),
+                            raw_rpc::PROTO_INCLUSION_LISTS_BY_INDICES => b.inclusion_lists_by_indices.send_response(channel, response).is_ok(),
                             _ => false,
                         };
                         if !sent {

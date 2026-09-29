@@ -20,10 +20,13 @@ class PayloadStatus:
     status: PayloadStatusEnum
     latest_valid_hash: Optional[bytes] = None
     validation_error: Optional[str] = None
+    # [New in Bogota] PayloadStatusV2.inclusionListSatisfied: set iff VALID
+    inclusion_list_satisfied: Optional[bool] = None
 
     @classmethod
     def from_dict(cls, data: dict) -> "PayloadStatus":
         return cls(
+            inclusion_list_satisfied=data.get("inclusionListSatisfied"),
             status=PayloadStatusEnum(data["status"]),
             latest_valid_hash=(
                 bytes.fromhex(data["latestValidHash"][2:])

@@ -816,6 +816,12 @@ class BeaconAPI:
             return "electra"
 
         if hasattr(body, "signed_execution_payload_header") or hasattr(body, "signed_execution_payload_bid"):
+            if hasattr(body, "signed_execution_payload_bid") and hasattr(
+                body.signed_execution_payload_bid.message, "inclusion_list_bits"
+            ):
+                from ..spec.network_config import get_config
+                from ..spec.constants import SLOTS_PER_EPOCH
+                return get_config().fork_name_at_epoch(int(block.slot) // SLOTS_PER_EPOCH())
             return "gloas"
         if hasattr(body, "blob_kzg_commitments"):
             return "deneb"
@@ -1261,61 +1267,14 @@ class BeaconAPI:
         config = get_config()
 
         forks = []
-
-        if hasattr(config, 'genesis_fork_version'):
+        prev = config.genesis_fork_version
+        for epoch, version, _name in config.get_fork_schedule():
             forks.append({
-                "previous_version": "0x" + config.genesis_fork_version.hex(),
-                "current_version": "0x" + config.genesis_fork_version.hex(),
-                "epoch": "0",
+                "previous_version": "0x" + bytes(prev).hex(),
+                "current_version": "0x" + bytes(version).hex(),
+                "epoch": str(epoch),
             })
-
-        if hasattr(config, 'altair_fork_epoch') and hasattr(config, 'altair_fork_version'):
-            forks.append({
-                "previous_version": "0x" + config.genesis_fork_version.hex(),
-                "current_version": "0x" + config.altair_fork_version.hex(),
-                "epoch": str(config.altair_fork_epoch),
-            })
-
-        if hasattr(config, 'bellatrix_fork_epoch') and hasattr(config, 'bellatrix_fork_version'):
-            prev = config.altair_fork_version if hasattr(config, 'altair_fork_version') else config.genesis_fork_version
-            forks.append({
-                "previous_version": "0x" + prev.hex(),
-                "current_version": "0x" + config.bellatrix_fork_version.hex(),
-                "epoch": str(config.bellatrix_fork_epoch),
-            })
-
-        if hasattr(config, 'capella_fork_epoch') and hasattr(config, 'capella_fork_version'):
-            prev = config.bellatrix_fork_version if hasattr(config, 'bellatrix_fork_version') else config.genesis_fork_version
-            forks.append({
-                "previous_version": "0x" + prev.hex(),
-                "current_version": "0x" + config.capella_fork_version.hex(),
-                "epoch": str(config.capella_fork_epoch),
-            })
-
-        if hasattr(config, 'deneb_fork_epoch') and hasattr(config, 'deneb_fork_version'):
-            prev = config.capella_fork_version if hasattr(config, 'capella_fork_version') else config.genesis_fork_version
-            forks.append({
-                "previous_version": "0x" + prev.hex(),
-                "current_version": "0x" + config.deneb_fork_version.hex(),
-                "epoch": str(config.deneb_fork_epoch),
-            })
-
-        if hasattr(config, 'electra_fork_epoch') and hasattr(config, 'electra_fork_version'):
-            prev = config.deneb_fork_version if hasattr(config, 'deneb_fork_version') else config.genesis_fork_version
-            forks.append({
-                "previous_version": "0x" + prev.hex(),
-                "current_version": "0x" + config.electra_fork_version.hex(),
-                "epoch": str(config.electra_fork_epoch),
-            })
-
-        if hasattr(config, 'fulu_fork_epoch') and hasattr(config, 'fulu_fork_version'):
-            prev = config.electra_fork_version if hasattr(config, 'electra_fork_version') else config.genesis_fork_version
-            forks.append({
-                "previous_version": "0x" + prev.hex(),
-                "current_version": "0x" + config.fulu_fork_version.hex(),
-                "epoch": str(config.fulu_fork_epoch),
-            })
-
+            prev = version
         return web.json_response({"data": forks})
 
     async def get_deposit_contract(self, request: web.Request) -> web.Response:
@@ -1337,6 +1296,10 @@ class BeaconAPI:
         """Determine the fork version string for a state."""
         # Check GLOAS before fulu since GLOAS extends fulu
         if hasattr(state, "builders"):
+            if hasattr(state.latest_execution_payload_bid, "inclusion_list_bits"):
+                from ..spec.network_config import get_config
+                from ..spec.constants import SLOTS_PER_EPOCH
+                return get_config().fork_name_at_epoch(int(state.slot) // SLOTS_PER_EPOCH())
             return "gloas"
         if hasattr(state, "proposer_lookahead"):
             return "fulu"
@@ -1450,7 +1413,8 @@ class BeaconAPI:
 
         valid_topics = {"head", "block", "finalized_checkpoint", "chain_reorg",
                         "execution_payload_available", "execution_payload_bid",
-                        "payload_attributes", "proposer_preferences", "fast_confirmation"}
+                        "payload_attributes", "proposer_preferences", "fast_confirmation",
+                        "inclusion_list"}
         requested_topics = topics & valid_topics if topics else valid_topics
 
         if not requested_topics:
@@ -1644,23 +1608,31 @@ class BeaconAPI:
 
     async def emit_execution_payload_bid(self, signed_bid) -> None:
         """Emit execution_payload_bid SSE event (ePBS)."""
-        bid = signed_bid.message
+        from .gloas import signed_bid_to_json
+
         self._cross_loop_events.put({
             "event": "execution_payload_bid",
+            "data": signed_bid_to_json(signed_bid),
+        })
+
+    def emit_inclusion_list(self, signed_inclusion_list) -> None:
+        """Emit an inclusion_list SSE event (Heze, EIP-7805). Thread-safe."""
+        from ..spec.network_config import get_config
+        from ..spec.constants import SLOTS_PER_EPOCH
+
+        il = signed_inclusion_list.message
+        self._cross_loop_events.put({
+            "event": "inclusion_list",
             "data": {
-                "message": {
-                    "parent_block_hash": "0x" + bytes(bid.parent_block_hash).hex(),
-                    "parent_block_root": "0x" + bytes(bid.parent_block_root).hex(),
-                    "block_hash": "0x" + bytes(bid.block_hash).hex(),
-                    "prev_randao": "0x" + bytes(bid.prev_randao).hex(),
-                    "fee_recipient": "0x" + bytes(bid.fee_recipient).hex(),
-                    "gas_limit": str(int(bid.gas_limit)),
-                    "builder_index": str(int(bid.builder_index)),
-                    "slot": str(int(bid.slot)),
-                    "value": str(int(bid.value)),
-                    "execution_payment": str(int(bid.execution_payment)),
-                    "blob_kzg_commitments": ["0x" + bytes(c).hex() for c in bid.blob_kzg_commitments],
+                "version": get_config().fork_name_at_epoch(int(il.slot) // SLOTS_PER_EPOCH()),
+                "data": {
+                    "message": {
+                        "slot": str(int(il.slot)),
+                        "validator_index": str(int(il.validator_index)),
+                        "dependent_root": "0x" + bytes(il.dependent_root).hex(),
+                        "transactions": ["0x" + bytes(tx).hex() for tx in il.transactions],
+                    },
+                    "signature": "0x" + bytes(signed_inclusion_list.signature).hex(),
                 },
-                "signature": "0x" + bytes(signed_bid.signature).hex(),
             },
         })

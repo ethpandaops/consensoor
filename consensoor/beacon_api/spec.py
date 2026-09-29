@@ -35,6 +35,10 @@ def build_spec_response() -> dict:
         "FULU_FORK_EPOCH": str(net_config.fulu_fork_epoch),
         "GLOAS_FORK_VERSION": to_hex(net_config.gloas_fork_version, 4),
         "GLOAS_FORK_EPOCH": str(net_config.gloas_fork_epoch),
+        "HEZE_FORK_VERSION": to_hex(net_config.heze_fork_version, 4),
+        "HEZE_FORK_EPOCH": str(net_config.heze_fork_epoch),
+        "EIP8198_FORK_VERSION": to_hex(net_config.eip8198_fork_version, 4),
+        "EIP8198_FORK_EPOCH": str(net_config.eip8198_fork_epoch),
         "SLOT_DURATION_MS": str(net_config.slot_duration_ms),
         "SECONDS_PER_SLOT": str(net_config.slot_duration_ms // 1000),
         # Intra-slot timing (basis points of the slot)
@@ -48,7 +52,7 @@ def build_spec_response() -> dict:
         "CONTRIBUTION_DUE_BPS_GLOAS": str(net_config.contribution_due_bps_gloas),
         "PAYLOAD_DUE_BPS": str(net_config.payload_due_bps),
         "PAYLOAD_ATTESTATION_DUE_BPS": str(net_config.payload_attestation_due_bps),
-        "INCLUSION_LIST_SUBMISSION_DUE_BPS": str(net_config.inclusion_list_submission_due_bps),
+        "INCLUSION_LIST_DUE_BPS": str(net_config.inclusion_list_due_bps),
         "PROPOSER_REORG_CUTOFF_BPS": str(net_config.proposer_reorg_cutoff_bps),
         "SECONDS_PER_ETH1_BLOCK": str(net_config.seconds_per_eth1_block),
         "MIN_VALIDATOR_WITHDRAWABILITY_DELAY": str(net_config.min_validator_withdrawability_delay),
@@ -175,6 +179,14 @@ def build_spec_response() -> dict:
         "DOMAIN_PTC_ATTESTER": "0x" + constants.DOMAIN_PTC_ATTESTER.hex(),
         "DOMAIN_PROPOSER_PREFERENCES": "0x" + constants.DOMAIN_PROPOSER_PREFERENCES.hex(),
         "DOMAIN_BUILDER_DEPOSIT": "0x" + constants.DOMAIN_BUILDER_DEPOSIT.hex(),
+        # Heze (EIP-7805)
+        "INCLUSION_LIST_COMMITTEE_SIZE": str(constants.INCLUSION_LIST_COMMITTEE_SIZE),
+        "DOMAIN_INCLUSION_LIST_COMMITTEE": "0x" + constants.DOMAIN_INCLUSION_LIST_COMMITTEE.hex(),
+        "MAX_REQUEST_INCLUSION_LIST": str(net_config.max_request_inclusion_list),
+        "MIN_SLOTS_FOR_INCLUSION_LISTS_REQUESTS": str(net_config.min_slots_for_inclusion_lists_requests),
+        "MAX_TRANSACTIONS_BYTES_PER_INCLUSION_LIST": str(net_config.max_transactions_bytes_per_inclusion_list),
+        # EIP-8198
+        "MIN_BLOB_DATA_RETENTION_MS": str(net_config.min_blob_data_retention_ms),
         # Networking constants
         "MAX_PAYLOAD_SIZE": str(net_config.max_payload_size),
         "MAX_REQUEST_BLOCKS": str(net_config.max_request_blocks),
@@ -225,5 +237,11 @@ def build_spec_response() -> dict:
             {k.upper(): str(v) for k, v in entry.items()}
             for entry in net_config.gas_limit_schedule
         ]
+
+    # [New in EIP8198] slot duration schedule
+    spec["SLOT_DURATION_SCHEDULE"] = [
+        {"EPOCH": str(e["epoch"]), "SLOT_DURATION_MS": str(e["slot_duration_ms"])}
+        for e in net_config.slot_duration_schedule
+    ] or [{"EPOCH": "0", "SLOT_DURATION_MS": str(net_config.slot_duration_ms)}]
 
     return spec

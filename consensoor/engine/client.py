@@ -41,7 +41,14 @@ CL_TO_EL_FORK = {
     "electra": "prague",
     "fulu": "osaka",
     "gloas": "amsterdam",
+    # EIP-8198 has no EL fork of its own: it rides Bogota's engine methods.
+    "heze": "bogota",
+    "eip8198": "bogota",
 }
+
+# Engine API forks at or after Bogota (FOCIL: newPayloadV6 / fcuV5 carry
+# inclusion list transactions).
+_BOGOTA_CL_FORKS = ("heze", "eip8198")
 
 
 def get_fork_for_timestamp(timestamp: int) -> str:
@@ -49,6 +56,10 @@ def get_fork_for_timestamp(timestamp: int) -> str:
     from ..spec.network_config import get_config
     config = get_config()
 
+    if timestamp >= _epoch_to_timestamp(getattr(config, 'eip8198_fork_epoch', 2**64 - 1), config):
+        return "eip8198"
+    if timestamp >= _epoch_to_timestamp(getattr(config, 'heze_fork_epoch', 2**64 - 1), config):
+        return "heze"
     if hasattr(config, 'gloas_fork_epoch') and timestamp >= _epoch_to_timestamp(config.gloas_fork_epoch, config):
         return "gloas"
     if hasattr(config, 'fulu_fork_epoch') and timestamp >= _epoch_to_timestamp(config.fulu_fork_epoch, config):
@@ -68,7 +79,7 @@ def _epoch_to_timestamp(epoch: int, config) -> int:
     if epoch == 2**64 - 1:
         return 2**63
     genesis_time = getattr(config, 'min_genesis_time', 0)
-    return genesis_time + epoch * SLOTS_PER_EPOCH() * (config.slot_duration_ms // 1000)
+    return config.compute_time_at_slot(genesis_time, epoch * SLOTS_PER_EPOCH())
 
 
 class EngineAPIClient:
@@ -255,7 +266,7 @@ class EngineAPIClient:
         def epoch_start_time(epoch: int) -> int:
             if epoch >= FAR_FUTURE_EPOCH:
                 return 2**63
-            return genesis_time + epoch * SLOTS_PER_EPOCH() * (config.slot_duration_ms // 1000)
+            return config.compute_time_at_slot(genesis_time, epoch * SLOTS_PER_EPOCH())
 
         def is_fork_active(attr_name: str) -> bool:
             if not hasattr(config, attr_name):
@@ -265,6 +276,10 @@ class EngineAPIClient:
                 return False
             return timestamp >= epoch_start_time(epoch)
 
+        if is_fork_active('eip8198_fork_epoch'):
+            return "eip8198"
+        if is_fork_active('heze_fork_epoch'):
+            return "heze"
         if is_fork_active('gloas_fork_epoch'):
             return "gloas"
         if is_fork_active('fulu_fork_epoch'):
@@ -283,9 +298,11 @@ class EngineAPIClient:
 
     def _use_v2(self, el_fork: str) -> bool:
         """Whether the v2 REST transport should be used for the given fork."""
+        # The SSZ v2 transport has no Bogota (FOCIL) schemas yet.
         return (
             self._v2_enabled
             and not self._force_json
+            and el_fork != "bogota"
             and el_fork in self._v2_supported_forks
         )
 
@@ -338,11 +355,13 @@ class EngineAPIClient:
     async def _legacy_exchange_capabilities(self) -> list[str]:
         """Legacy JSON-RPC engine_exchangeCapabilities handshake."""
         capabilities = [
+            "engine_newPayloadV6",
             "engine_newPayloadV5",
             "engine_newPayloadV4",
             "engine_newPayloadV3",
             "engine_newPayloadV2",
             "engine_newPayloadV1",
+            "engine_forkchoiceUpdatedV5",
             "engine_forkchoiceUpdatedV4",
             "engine_forkchoiceUpdatedV3",
             "engine_forkchoiceUpdatedV2",
@@ -353,6 +372,7 @@ class EngineAPIClient:
             "engine_getPayloadV3",
             "engine_getPayloadV2",
             "engine_getPayloadV1",
+            "engine_getInclusionListV1",
         ]
         try:
             return await self._call("engine_exchangeCapabilities", [capabilities])
@@ -426,11 +446,48 @@ class EngineAPIClient:
             payload_dict, versioned_hashes, parent_beacon_block_root, execution_requests
         )
 
-    async def new_payload_v5_raw(
-        self, payload_dict: dict, versioned_hashes, parent_beacon_block_root, execution_requests
+    async def new_payload_v6(
+        self,
+        payload_dict: dict,
+        versioned_hashes,
+        parent_beacon_block_root: bytes,
+        execution_requests,
+        inclusion_list_transactions,
     ) -> PayloadStatus:
-        """Send a new payload from a raw dict (GLOAS self-build pass-through)."""
+        """JSON-RPC engine_newPayloadV6 (Bogota / Heze, EIP-7805)."""
+        params = [
+            payload_dict,
+            ["0x" + h.hex() for h in versioned_hashes],
+            "0x" + parent_beacon_block_root.hex(),
+            execution_requests,
+            ["0x" + bytes(tx).hex() for tx in (inclusion_list_transactions or [])],
+        ]
+        result = await self._call("engine_newPayloadV6", params)
+        return PayloadStatus.from_dict(result)
+
+    async def get_inclusion_list_v1(self) -> list[bytes]:
+        """JSON-RPC engine_getInclusionListV1: IL transactions from the EL mempool."""
+        result = await self._call("engine_getInclusionListV1", [])
+        return [self._hex_bytes(tx) for tx in (result or [])]
+
+    async def new_payload_v5_raw(
+        self,
+        payload_dict: dict,
+        versioned_hashes,
+        parent_beacon_block_root,
+        execution_requests,
+        inclusion_list_transactions=None,
+    ) -> PayloadStatus:
+        """Send a new payload from a raw dict (GLOAS self-build pass-through).
+
+        From Bogota on this is engine_newPayloadV6 with the IL transactions.
+        """
         timestamp = self._hex_int(payload_dict.get("timestamp", "0x0"))
+        if timestamp and self._get_fork_for_timestamp(timestamp) in _BOGOTA_CL_FORKS:
+            return await self.new_payload_v6(
+                payload_dict, versioned_hashes, parent_beacon_block_root,
+                execution_requests, inclusion_list_transactions,
+            )
         el_fork = self._el_fork_for_timestamp(timestamp) if timestamp else "amsterdam"
         logger.info(
             f"newPayloadV5_raw: blockHash={payload_dict.get('blockHash')}, "
@@ -505,10 +562,20 @@ class EngineAPIClient:
         parent_beacon_block_root: bytes = None,
         execution_requests: list = None,
         timestamp: int = None,
+        inclusion_list_transactions: list = None,
     ) -> PayloadStatus:
         """Send a new payload using v2 REST when available, else JSON-RPC."""
         if timestamp is None:
             timestamp = int(time.time())
+
+        if self._get_fork_for_timestamp(timestamp) in _BOGOTA_CL_FORKS:
+            return await self.new_payload_v6(
+                self._payload_to_dict(execution_payload),
+                versioned_hashes or [],
+                parent_beacon_block_root or b"\x00" * 32,
+                execution_requests or [],
+                inclusion_list_transactions or [],
+            )
 
         el_fork = self._el_fork_for_timestamp(timestamp)
         if self._use_v2(el_fork):
@@ -589,6 +656,32 @@ class EngineAPIClient:
         result = await self._call("engine_forkchoiceUpdatedV4", params)
         return ForkchoiceUpdateResponse.from_dict(result)
 
+    async def forkchoice_updated_v5(
+        self,
+        forkchoice_state: ForkchoiceState,
+        payload_attributes: Optional[dict] = None,
+        custody_columns: Optional[bytes] = None,
+    ) -> ForkchoiceUpdateResponse:
+        """JSON-RPC engine_forkchoiceUpdatedV5 (Bogota / Heze, EIP-7805).
+
+        PayloadAttributesV5 = V4 + ``inclusionListTransactions`` (always
+        present, possibly empty).
+        """
+        attrs = None
+        if payload_attributes:
+            attrs = dict(payload_attributes)
+            attrs["inclusionListTransactions"] = [
+                tx if isinstance(tx, str) else "0x" + bytes(tx).hex()
+                for tx in attrs.get("inclusionListTransactions") or []
+            ]
+        params = [
+            forkchoice_state.to_dict(),
+            attrs,
+            "0x" + custody_columns.hex() if custody_columns is not None else None,
+        ]
+        result = await self._call("engine_forkchoiceUpdatedV5", params)
+        return ForkchoiceUpdateResponse.from_dict(result)
+
     async def forkchoice_updated_v3(
         self, forkchoice_state: ForkchoiceState, payload_attributes: Optional[dict] = None
     ) -> ForkchoiceUpdateResponse:
@@ -636,6 +729,15 @@ class EngineAPIClient:
         """
         if timestamp is None:
             timestamp = int(time.time())
+
+        if self._get_fork_for_timestamp(timestamp) in _BOGOTA_CL_FORKS:
+            return await self.forkchoice_updated_v5(
+                forkchoice_state, payload_attributes, custody_columns=custody_columns
+            )
+        if payload_attributes:
+            payload_attributes = {
+                k: v for k, v in payload_attributes.items() if k != "inclusionListTransactions"
+            }
 
         el_fork = self._el_fork_for_timestamp(timestamp)
         if self._use_v2(el_fork):
@@ -711,7 +813,7 @@ class EngineAPIClient:
 
         fork = self._get_fork_for_timestamp(timestamp)
         logger.info(f"get_payload (JSON-RPC): fork={fork}, payload_id={payload_id.hex()}")
-        if fork == "gloas":
+        if fork in ("gloas",) + _BOGOTA_CL_FORKS:
             return await self.get_payload_v6(payload_id)
         elif fork == "fulu":
             return await self.get_payload_v5(payload_id)

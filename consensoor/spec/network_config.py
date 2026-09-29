@@ -28,6 +28,10 @@ class NetworkConfig:
     # [New in Gloas:EIP8261] (consensus-specs #5533) list of {epoch, gas_limit}
     # entries; optional and introduces no validity rules.
     gas_limit_schedule: list = field(default_factory=list)
+    # [New in EIP8198] list of {epoch, slot_duration_ms} entries, strictly
+    # increasing epochs, first entry at GENESIS_EPOCH. Empty means "derive
+    # from slot_duration_ms" (pre-EIP8198 configs).
+    slot_duration_schedule: list = field(default_factory=list)
 
     slot_duration_ms: int = 12000
     seconds_per_eth1_block: int = 14
@@ -45,13 +49,11 @@ class NetworkConfig:
     aggregate_due_bps_gloas: int = 5000  # 50% of slot
     sync_message_due_bps_gloas: int = 2500
     contribution_due_bps_gloas: int = 5000
-    payload_due_bps: int = 7500  # 75% of slot (Gloas alpha 8)
+    payload_due_bps: int = 5000  # 50% of slot
     payload_attestation_due_bps: int = 7500  # 75% of slot
 
-    # EIP-7805 timing
-    view_freeze_cutoff_bps: int = 7500
-    inclusion_list_submission_due_bps: int = 6667
-    proposer_inclusion_list_cutoff_bps: int = 9167
+    # Heze (EIP-7805) timing
+    inclusion_list_due_bps: int = 6667  # ~67% of slot
     min_validator_withdrawability_delay: int = 256
     shard_committee_period: int = 256
     eth1_follow_distance: int = 2048
@@ -77,6 +79,10 @@ class NetworkConfig:
     fulu_fork_epoch: int = 2**64 - 1
     gloas_fork_version: bytes = field(default_factory=lambda: bytes.fromhex("07000000"))
     gloas_fork_epoch: int = 2**64 - 1
+    heze_fork_version: bytes = field(default_factory=lambda: bytes.fromhex("08000000"))
+    heze_fork_epoch: int = 2**64 - 1
+    eip8198_fork_version: bytes = field(default_factory=lambda: bytes.fromhex("e8198000"))
+    eip8198_fork_epoch: int = 2**64 - 1
 
     terminal_total_difficulty: int = 2**256 - 1
     terminal_block_hash: bytes = field(default_factory=lambda: b"\x00" * 32)
@@ -145,6 +151,15 @@ class NetworkConfig:
     # Gloas networking
     max_request_payloads: int = 128
 
+    # Heze (EIP-7805) networking
+    max_request_inclusion_list: int = 16
+    min_slots_for_inclusion_lists_requests: int = 1
+    max_transactions_bytes_per_inclusion_list: int = 8192
+
+    # EIP-8198 networking: data column retention in wall-clock ms
+    # (2**12 epochs * 32 slots * 12s on mainnet)
+    min_blob_data_retention_ms: int = 1572864000
+
     @classmethod
     def from_yaml(cls, path: str | Path) -> "NetworkConfig":
         """Load network config from yaml file."""
@@ -191,12 +206,15 @@ class NetworkConfig:
         config.electra_fork_version = bytes.fromhex("05000001")
         config.fulu_fork_version = bytes.fromhex("06000001")
         config.gloas_fork_version = bytes.fromhex("07000001")
+        config.heze_fork_version = bytes.fromhex("08000001")
+        config.eip8198_fork_version = bytes.fromhex("e8198001")
+        config.min_blob_data_retention_ms = 196608000
         # Timing values (same as mainnet by default, loaded from config)
         config.attestation_due_bps = 3333
         config.aggregate_due_bps = 6667
         config.attestation_due_bps_gloas = 2500
         config.aggregate_due_bps_gloas = 5000
-        config.payload_due_bps = 7500
+        config.payload_due_bps = 5000
         config.payload_attestation_due_bps = 7500
         # Validator cycle (per minimal.yaml)
         config.min_per_epoch_churn_limit = 2
@@ -228,6 +246,8 @@ class NetworkConfig:
             "electra_fork_version",
             "fulu_fork_version",
             "gloas_fork_version",
+            "heze_fork_version",
+            "eip8198_fork_version",
         }
         for key, value in data.items():
             attr_name = key.lower()
@@ -236,19 +256,138 @@ class NetworkConfig:
                     value = bytes.fromhex(value[2:])
                 elif attr_name in fork_version_fields and isinstance(value, int):
                     value = value.to_bytes(4, "big")
-                elif attr_name in ("blob_schedule", "gas_limit_schedule") and isinstance(value, list):
+                elif attr_name in (
+                    "blob_schedule", "gas_limit_schedule", "slot_duration_schedule"
+                ) and isinstance(value, list):
                     value = [
                         {k.lower(): v for k, v in entry.items()} for entry in value
                     ]
                 setattr(config, attr_name, value)
 
+        config._normalize_slot_duration_schedule()
         # Log fork epochs for debugging
         logger.info(
             f"Config loaded: fulu_fork_epoch={config.fulu_fork_epoch}, "
             f"gloas_fork_epoch={config.gloas_fork_epoch}, "
-            f"electra_fork_epoch={config.electra_fork_epoch}"
+            f"heze_fork_epoch={config.heze_fork_epoch}, "
+            f"eip8198_fork_epoch={config.eip8198_fork_epoch}, "
+            f"slot_duration_schedule={config.slot_duration_schedule}"
         )
         return config
+
+    # ------------------------------------------------------------------
+    # EIP-8198: slot duration schedule
+    # ------------------------------------------------------------------
+
+    def _normalize_slot_duration_schedule(self) -> None:
+        """Sort the schedule and make sure it starts at GENESIS_EPOCH.
+
+        Pre-EIP8198 configs have no schedule; the single genesis entry is
+        derived from SLOT_DURATION_MS. When a schedule is given, its genesis
+        entry is authoritative and SLOT_DURATION_MS is kept in sync with it
+        so legacy call sites that still read ``slot_duration_ms`` see the
+        genesis duration.
+        """
+        entries = sorted(
+            (
+                {"epoch": int(e["epoch"]), "slot_duration_ms": int(e["slot_duration_ms"])}
+                for e in (self.slot_duration_schedule or [])
+            ),
+            key=lambda e: e["epoch"],
+        )
+        if not entries or entries[0]["epoch"] != 0:
+            entries.insert(0, {"epoch": 0, "slot_duration_ms": int(self.slot_duration_ms)})
+        for e in entries:
+            if e["slot_duration_ms"] <= 0 or e["slot_duration_ms"] % 1000 != 0:
+                raise ValueError(
+                    f"SLOT_DURATION_SCHEDULE entry {e} must be a positive multiple of 1000 ms"
+                )
+        for a, b in zip(entries, entries[1:]):
+            if b["epoch"] <= a["epoch"]:
+                raise ValueError("SLOT_DURATION_SCHEDULE epochs must be strictly increasing")
+        self.slot_duration_schedule = entries
+        self.slot_duration_ms = entries[0]["slot_duration_ms"]
+
+    def _schedule(self) -> list:
+        if not self.slot_duration_schedule or self.slot_duration_schedule[0].get("epoch") != 0:
+            self._normalize_slot_duration_schedule()
+        return self.slot_duration_schedule
+
+    def get_slot_duration_ms(self, epoch: int) -> int:
+        """Slot duration in effect at ``epoch`` (spec ``get_slot_duration_ms``)."""
+        for entry in reversed(self._schedule()):
+            if epoch >= entry["epoch"]:
+                return entry["slot_duration_ms"]
+        return self._schedule()[0]["slot_duration_ms"]
+
+    def get_slot_duration_ms_at_slot(self, slot: int) -> int:
+        from .constants import SLOTS_PER_EPOCH
+        return self.get_slot_duration_ms(slot // SLOTS_PER_EPOCH())
+
+    @property
+    def genesis_slot_duration_ms(self) -> int:
+        return self._schedule()[0]["slot_duration_ms"]
+
+    def compute_time_at_slot_ms(self, genesis_time_ms: int, slot: int) -> int:
+        """Unix ms at the start of ``slot`` (piecewise over the schedule)."""
+        from .constants import SLOTS_PER_EPOCH
+        spe = SLOTS_PER_EPOCH()
+        end_slot = slot
+        time_ms = genesis_time_ms
+        for entry in reversed(self._schedule()):
+            entry_slot = entry["epoch"] * spe
+            if entry_slot < end_slot:
+                time_ms += (end_slot - entry_slot) * entry["slot_duration_ms"]
+                end_slot = entry_slot
+        return time_ms
+
+    def compute_slot_at_time_ms(self, genesis_time_ms: int, time_ms: int) -> int:
+        """Slot at Unix ms ``time_ms`` (piecewise over the schedule)."""
+        from .constants import SLOTS_PER_EPOCH
+        spe = SLOTS_PER_EPOCH()
+        if time_ms < genesis_time_ms:
+            return 0
+        entry_slot = 0
+        entry_time_ms = genesis_time_ms
+        entry = self._schedule()[0]
+        for entry in reversed(self._schedule()):
+            entry_slot = entry["epoch"] * spe
+            entry_time_ms = self.compute_time_at_slot_ms(genesis_time_ms, entry_slot)
+            if time_ms >= entry_time_ms:
+                break
+        return entry_slot + (time_ms - entry_time_ms) // entry["slot_duration_ms"]
+
+    def compute_time_at_slot(self, genesis_time: int, slot: int) -> int:
+        """Unix seconds at the start of ``slot`` (durations are whole seconds)."""
+        return self.compute_time_at_slot_ms(genesis_time * 1000, slot) // 1000
+
+    def compute_time_at_slot_f(self, genesis_time: float, slot: int) -> float:
+        """Float-seconds variant for wall-clock scheduling."""
+        return genesis_time + (self.compute_time_at_slot_ms(0, slot) / 1000.0)
+
+    def compute_slot_at_time(self, genesis_time: float, now: float) -> int:
+        """Current slot at Unix seconds ``now`` (float allowed)."""
+        return self.compute_slot_at_time_ms(int(genesis_time * 1000), int(now * 1000))
+
+    def get_slot_component_duration_ms(self, basis_points: int, slot: int) -> int:
+        """Intra-slot deadline offset for ``slot``.
+
+        EIP-8198 prices deadlines at the slot duration of EIP8198_FORK_EPOCH;
+        since schedule entries may only coincide with forks at or after it,
+        that equals the duration in effect at ``slot`` for every schedule the
+        spec allows.
+        """
+        return basis_points * self.get_slot_duration_ms_at_slot(slot) // 10000
+
+    def compute_blob_data_retention_start_epoch(self, epoch: int) -> int:
+        """EIP-8198 ``compute_blob_data_retention_start_epoch``."""
+        from .constants import SLOTS_PER_EPOCH
+        spe = SLOTS_PER_EPOCH()
+        window_ms = int(self.min_blob_data_retention_ms)
+        current_start_ms = self.compute_time_at_slot_ms(0, epoch * spe)
+        if current_start_ms < window_ms:
+            return 0
+        return self.compute_slot_at_time_ms(0, current_start_ms - window_ms) // spe
 
     def get_scheduled_gas_limit(self, epoch: int) -> int | None:
         """Return the scheduled gas limit at ``epoch``, if any.
@@ -265,6 +404,10 @@ class NetworkConfig:
 
     def get_fork_version(self, epoch: int) -> bytes:
         """Get the fork version active at the given epoch."""
+        if epoch >= self.eip8198_fork_epoch:
+            return self.eip8198_fork_version
+        if epoch >= self.heze_fork_epoch:
+            return self.heze_fork_version
         if epoch >= self.gloas_fork_epoch:
             return self.gloas_fork_version
         if epoch >= self.fulu_fork_epoch:
@@ -297,6 +440,8 @@ class NetworkConfig:
             (self.electra_fork_epoch, self.electra_fork_version, "electra"),
             (self.fulu_fork_epoch, self.fulu_fork_version, "fulu"),
             (self.gloas_fork_epoch, self.gloas_fork_version, "gloas"),
+            (self.heze_fork_epoch, self.heze_fork_version, "heze"),
+            (self.eip8198_fork_epoch, self.eip8198_fork_version, "eip8198"),
         ]
         scheduled = [(e, v, n) for e, v, n in forks if e < FAR_FUTURE_EPOCH]
         return sorted(scheduled, key=lambda x: x[0])
@@ -317,6 +462,13 @@ class NetworkConfig:
         """Check if Gloas (ePBS) fork is active at the given epoch."""
         return epoch >= self.gloas_fork_epoch
 
+    def is_heze_active(self, epoch: int) -> bool:
+        """Check if Heze (FOCIL) is active at the given epoch (EIP-8198 builds on it)."""
+        return epoch >= self.heze_fork_epoch or epoch >= self.eip8198_fork_epoch
+
+    def is_eip8198_active(self, epoch: int) -> bool:
+        return epoch >= self.eip8198_fork_epoch
+
     def fork_name_at_epoch(self, epoch: int) -> str:
         """Return the spec fork name active at the given epoch.
 
@@ -327,6 +479,10 @@ class NetworkConfig:
         check only tells us how SSZ was decoded, not what the spec
         thinks the active fork is.
         """
+        if epoch >= self.eip8198_fork_epoch:
+            return "eip8198"
+        if epoch >= self.heze_fork_epoch:
+            return "heze"
         if epoch >= self.gloas_fork_epoch:
             return "gloas"
         if epoch >= self.fulu_fork_epoch:
@@ -348,13 +504,16 @@ class NetworkConfig:
         from .constants import SLOTS_PER_EPOCH
         return self.fork_name_at_epoch(slot // SLOTS_PER_EPOCH())
 
+    def _slot_duration_s(self, epoch: int) -> float:
+        return self.get_slot_duration_ms(epoch) / 1000.0
+
     def get_attestation_due_offset(self, epoch: int) -> float:
         """Get attestation due time offset in seconds for the given epoch.
 
         Returns the time offset from slot start when attestations should be produced.
         Uses Gloas timing if ePBS is active.
         """
-        slot_duration = self.slot_duration_ms / 1000.0
+        slot_duration = self._slot_duration_s(epoch)
         if self.is_gloas_active(epoch):
             bps = self.attestation_due_bps_gloas
         else:
@@ -367,25 +526,27 @@ class NetworkConfig:
         Returns the time offset from slot start when aggregates should be published.
         Uses Gloas timing if ePBS is active.
         """
-        slot_duration = self.slot_duration_ms / 1000.0
+        slot_duration = self._slot_duration_s(epoch)
         if self.is_gloas_active(epoch):
             bps = self.aggregate_due_bps_gloas
         else:
             bps = self.aggregate_due_bps
         return slot_duration * (bps / 10000.0)
 
-    def get_payload_attestation_due_offset(self) -> float:
+    def get_payload_attestation_due_offset(self, epoch: int = 0) -> float:
         """Get payload attestation (PTC) due time offset in seconds.
 
         Only applicable in Gloas (ePBS) for Payload Timeliness Committee attestations.
         """
-        slot_duration = self.slot_duration_ms / 1000.0
-        return slot_duration * (self.payload_attestation_due_bps / 10000.0)
+        return self._slot_duration_s(epoch) * (self.payload_attestation_due_bps / 10000.0)
 
-    def get_payload_due_offset(self) -> float:
+    def get_payload_due_offset(self, epoch: int = 0) -> float:
         """Payload due offset in seconds (PTC validators consider payloads seen after this stale)."""
-        slot_duration = self.slot_duration_ms / 1000.0
-        return slot_duration * (self.payload_due_bps / 10000.0)
+        return self._slot_duration_s(epoch) * (self.payload_due_bps / 10000.0)
+
+    def get_inclusion_list_due_offset(self, epoch: int) -> float:
+        """Heze: inclusion list due offset in seconds into the slot."""
+        return self._slot_duration_s(epoch) * (self.inclusion_list_due_bps / 10000.0)
 
 
 _config: NetworkConfig | None = None

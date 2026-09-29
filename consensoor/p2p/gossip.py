@@ -28,6 +28,7 @@ from .encoding import (
     EXECUTION_PAYLOAD_BID_TOPIC,
     PAYLOAD_ATTESTATION_MESSAGE_TOPIC,
     PROPOSER_PREFERENCES_TOPIC,
+    INCLUSION_LIST_TOPIC,
 )
 from ..spec.constants import SYNC_COMMITTEE_SUBNET_COUNT
 
@@ -202,6 +203,15 @@ class BeaconGossip:
     async def publish_proposer_preferences(self, message_ssz: bytes) -> None:
         """Publish a SignedProposerPreferences for one of our proposers."""
         topic = get_topic_name(PROPOSER_PREFERENCES_TOPIC, self.fork_digest)
+        await self._host.publish(topic, message_ssz)
+
+    def subscribe_inclusion_lists(self, handler: MessageHandler) -> None:
+        """Subscribe to SignedInclusionList gossip (Heze/FOCIL, EIP-7805)."""
+        self._handlers[INCLUSION_LIST_TOPIC] = handler
+
+    async def publish_inclusion_list(self, message_ssz: bytes) -> None:
+        """Publish a SignedInclusionList from one of our IL committee members."""
+        topic = get_topic_name(INCLUSION_LIST_TOPIC, self.fork_digest)
         await self._host.publish(topic, message_ssz)
 
     def subscribe_data_column_sidecars(self, handler: Callable, subnet_ids: list[int]) -> None:

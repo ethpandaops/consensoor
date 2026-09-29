@@ -43,6 +43,11 @@ def get_spec_tests_dir(config) -> Path:
     return Path(spec_dir)
 
 
+def _heze():
+    from consensoor.spec.types import heze
+    return heze
+
+
 def get_state_type_for_fork(fork: str) -> Type:
     """Get the BeaconState type for a given fork."""
     from consensoor.spec import types
@@ -56,6 +61,7 @@ def get_state_type_for_fork(fork: str) -> Type:
         "electra": types.ElectraBeaconState,
         "fulu": types.FuluBeaconState,
         "gloas": types.BeaconState,
+        "heze": _heze().BeaconState,
     }
     return state_types.get(fork)
 
@@ -73,6 +79,7 @@ def get_block_type_for_fork(fork: str) -> Type:
         "electra": types.SignedElectraBeaconBlock,
         "fulu": types.SignedElectraBeaconBlock,
         "gloas": types.SignedBeaconBlock,
+        "heze": _heze().SignedBeaconBlock,
     }
     return block_types.get(fork)
 
@@ -91,6 +98,7 @@ def get_execution_payload_type_for_fork(fork: str) -> Type:
         "electra": ExecutionPayload,
         "fulu": ExecutionPayload,
         "gloas": GloasExecutionPayload,
+        "heze": GloasExecutionPayload,
     }
     return payload_types.get(fork)
 
@@ -108,6 +116,7 @@ def get_unsigned_block_type_for_fork(fork: str) -> Type:
         "electra": types.ElectraBeaconBlock,
         "fulu": types.ElectraBeaconBlock,
         "gloas": types.BeaconBlock,
+        "heze": _heze().BeaconBlock,
     }
     return block_types.get(fork)
 
@@ -125,6 +134,7 @@ def get_block_body_type_for_fork(fork: str) -> Type:
         "electra": types.ElectraBeaconBlockBody,
         "fulu": types.ElectraBeaconBlockBody,
         "gloas": types.BeaconBlockBody,
+        "heze": _heze().BeaconBlockBody,
     }
     return body_types.get(fork)
 
@@ -132,6 +142,13 @@ def get_block_body_type_for_fork(fork: str) -> Type:
 def get_ssz_type_by_name(fork: str, type_name: str) -> Optional[Type]:
     """Get SSZ type class by name for a given fork."""
     from consensoor.spec import types
+
+    # Heze only redefines the bid and the containers embedding it; everything
+    # else resolves exactly like Gloas.
+    if fork == "heze":
+        if hasattr(_heze(), type_name):
+            return getattr(_heze(), type_name)
+        fork = "gloas"
 
     fork_prefix_map = {
         "phase0": "Phase0",
@@ -266,7 +283,7 @@ def get_operation_type_for_test(fork: str, op_name: str) -> Optional[Type]:
 
     pre_electra_forks = {"phase0", "altair", "bellatrix", "capella", "deneb"}
 
-    if fork == "gloas":
+    if fork in ("gloas", "heze"):
         # [Modified in Gloas:EIP7688] progressive attestation types
         from consensoor.spec.types import gloas as gloas_mod
         attestation_type = gloas_mod.Attestation
@@ -299,6 +316,8 @@ def get_operation_type_for_test(fork: str, op_name: str) -> Optional[Type]:
         "builder_deposit_request": types.BuilderDepositRequest if hasattr(types, "BuilderDepositRequest") else None,
         "builder_exit_request": types.BuilderExitRequest if hasattr(types, "BuilderExitRequest") else None,
     }
+    if fork == "heze":
+        op_type_map["execution_payload_bid"] = _heze().SignedExecutionPayloadBid
     return op_type_map.get(op_name)
 
 
@@ -404,7 +423,7 @@ def get_epoch_processor(function_name: str) -> Optional[Callable]:
 
 def discover_ssz_static_tests(spec_tests_dir: Path):
     """Discover all ssz_static test cases."""
-    supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas"}
+    supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas", "heze"}
     test_cases = []
     for fork_dir in sorted(spec_tests_dir.iterdir()):
         if not fork_dir.is_dir():
@@ -428,7 +447,7 @@ def discover_ssz_static_tests(spec_tests_dir: Path):
 
 def discover_operations_tests(spec_tests_dir: Path):
     """Discover all operations test cases."""
-    supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas"}
+    supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas", "heze"}
     test_cases = []
     for fork_dir in sorted(spec_tests_dir.iterdir()):
         if not fork_dir.is_dir():
@@ -459,7 +478,7 @@ def discover_operations_tests(spec_tests_dir: Path):
 
 def discover_epoch_processing_tests(spec_tests_dir: Path):
     """Discover all epoch_processing test cases."""
-    supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas"}
+    supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas", "heze"}
     test_cases = []
     for fork_dir in sorted(spec_tests_dir.iterdir()):
         if not fork_dir.is_dir():
@@ -490,7 +509,7 @@ def discover_epoch_processing_tests(spec_tests_dir: Path):
 
 def discover_sanity_blocks_tests(spec_tests_dir: Path):
     """Discover all sanity/blocks test cases."""
-    supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas"}
+    supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas", "heze"}
     test_cases = []
     for fork_dir in sorted(spec_tests_dir.iterdir()):
         if not fork_dir.is_dir():
@@ -514,7 +533,7 @@ def discover_sanity_blocks_tests(spec_tests_dir: Path):
 
 def discover_sanity_slots_tests(spec_tests_dir: Path):
     """Discover all sanity/slots test cases."""
-    supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas"}
+    supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas", "heze"}
     test_cases = []
     for fork_dir in sorted(spec_tests_dir.iterdir()):
         if not fork_dir.is_dir():
@@ -538,7 +557,7 @@ def discover_sanity_slots_tests(spec_tests_dir: Path):
 
 def discover_finality_tests(spec_tests_dir: Path):
     """Discover all finality test cases."""
-    supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas"}
+    supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas", "heze"}
     test_cases = []
     for fork_dir in sorted(spec_tests_dir.iterdir()):
         if not fork_dir.is_dir():
@@ -562,7 +581,7 @@ def discover_finality_tests(spec_tests_dir: Path):
 
 def discover_rewards_tests(spec_tests_dir: Path):
     """Discover all rewards test cases."""
-    supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas"}
+    supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas", "heze"}
     test_cases = []
     for fork_dir in sorted(spec_tests_dir.iterdir()):
         if not fork_dir.is_dir():
@@ -593,7 +612,7 @@ def discover_rewards_tests(spec_tests_dir: Path):
 
 def discover_shuffling_tests(spec_tests_dir: Path):
     """Discover all shuffling test cases."""
-    supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas"}
+    supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas", "heze"}
     test_cases = []
     for fork_dir in sorted(spec_tests_dir.iterdir()):
         if not fork_dir.is_dir():
@@ -655,7 +674,7 @@ def discover_fork_choice_compliance_tests(spec_tests_dir: Path):
 
 def discover_random_tests(spec_tests_dir: Path):
     """Discover all random test cases."""
-    supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas"}
+    supported_forks = {"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas", "heze"}
     test_cases = []
     for fork_dir in sorted(spec_tests_dir.iterdir()):
         if not fork_dir.is_dir():
@@ -677,7 +696,48 @@ def discover_random_tests(spec_tests_dir: Path):
     return test_cases
 
 
+def _schedule_forks_through(fork: str) -> None:
+    """pyspec vectors run with every fork up to ``fork`` active at genesis."""
+    from consensoor.spec.network_config import get_config
+    order = ["altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas", "heze"]
+    config = get_config()
+    for i, name in enumerate(order):
+        setattr(config, f"{name}_fork_epoch", 0 if i <= order.index(fork) else 2**64 - 1)
+    config.eip8198_fork_epoch = 2**64 - 1
+
+
+PREVIOUS_FORK = {"heze": "gloas", "gloas": "fulu", "eip8198": "heze"}
+
+
+def discover_fork_tests(spec_tests_dir: Path):
+    """Discover <fork>/fork/fork/pyspec_tests cases (upgrade_to_<fork>)."""
+    test_cases = []
+    for fork in ("heze",):
+        base = spec_tests_dir / fork / "fork" / "fork" / "pyspec_tests"
+        if not base.exists():
+            continue
+        for case_dir in sorted(base.iterdir()):
+            if (case_dir / "pre.ssz_snappy").exists():
+                test_cases.append((f"{fork}/fork/{case_dir.name}", fork, case_dir))
+    return test_cases
+
+
+def discover_transition_tests(spec_tests_dir: Path):
+    """Discover <fork>/transition/core/pyspec_tests cases."""
+    test_cases = []
+    for fork in ("heze",):
+        base = spec_tests_dir / fork / "transition" / "core" / "pyspec_tests"
+        if not base.exists():
+            continue
+        for case_dir in sorted(base.iterdir()):
+            if (case_dir / "pre.ssz_snappy").exists():
+                test_cases.append((f"{fork}/transition/{case_dir.name}", fork, case_dir))
+    return test_cases
+
+
 CASE_FIXTURES = [
+    ("fork_case", discover_fork_tests),
+    ("transition_case", discover_transition_tests),
     ("ssz_case", discover_ssz_static_tests),
     ("fork_choice_case", lambda d: discover_fork_choice_tests(d, "fork_choice")),
     ("fast_confirmation_case", lambda d: discover_fork_choice_tests(d, "fast_confirmation")),
@@ -706,6 +766,67 @@ def pytest_generate_tests(metafunc):
             test_cases = discover(spec_tests_dir) if spec_tests_dir.exists() else []
             ids = [tc[0] for tc in test_cases]
             metafunc.parametrize(fixture_name, test_cases, ids=ids)
+
+
+def _fork_version_attr(fork: str) -> str:
+    return f"{fork}_fork_version"
+
+
+class TestFork:
+    """Fork tests - upgrade_to_<fork> from the previous fork's state."""
+
+    def test_fork(self, fork_case, preset):
+        case_id, fork, case_path = fork_case
+        from consensoor.spec.network_config import get_config
+        from consensoor.spec.state_transition.fork_upgrade import upgrade_to_heze
+
+        pre_type = get_state_type_for_fork(PREVIOUS_FORK[fork])
+        post_type = get_state_type_for_fork(fork)
+        pre = load_ssz_snappy(case_path / "pre.ssz_snappy", pre_type)
+        epoch = int(pre.slot) // _slots_per_epoch()
+        version = getattr(get_config(), _fork_version_attr(fork))
+        upgrade = {"heze": upgrade_to_heze}[fork]
+        post = upgrade(pre, version, epoch)
+        expected = load_ssz_snappy(case_path / "post.ssz_snappy", post_type)
+        assert post.hash_tree_root() == expected.hash_tree_root(), f"post-state mismatch for {case_id}"
+
+
+def _slots_per_epoch() -> int:
+    from consensoor.spec.constants import SLOTS_PER_EPOCH
+    return SLOTS_PER_EPOCH()
+
+
+class TestTransition:
+    """Transition tests - blocks across a fork boundary."""
+
+    def test_transition(self, transition_case, preset):
+        case_id, fork, case_path = transition_case
+        from consensoor.spec.network_config import get_config
+        from consensoor.spec.state_transition import state_transition
+
+        meta = load_yaml(case_path / "meta.yaml") or {}
+        fork_epoch = int(meta["fork_epoch"])
+        blocks_count = int(meta["blocks_count"])
+        fork_block = meta.get("fork_block")
+        bls_setting = meta.get("bls_setting", 1)
+
+        prev = PREVIOUS_FORK[fork]
+        config = get_config()
+        attr = f"{fork}_fork_epoch"
+        saved = getattr(config, attr)
+        setattr(config, attr, fork_epoch)
+        try:
+            state = load_ssz_snappy(case_path / "pre.ssz_snappy", get_state_type_for_fork(prev))
+            for i in range(blocks_count):
+                is_pre = fork_block is not None and i <= int(fork_block)
+                block_type = get_block_type_for_fork(prev if is_pre else fork)
+                block = load_ssz_snappy(case_path / f"blocks_{i}.ssz_snappy", block_type)
+                state = state_transition(state, block, validate_result=(bls_setting != 2))
+            expected = load_ssz_snappy(case_path / "post.ssz_snappy", get_state_type_for_fork(fork))
+            assert state.hash_tree_root() == expected.hash_tree_root(), \
+                f"post-state mismatch for {case_id}"
+        finally:
+            setattr(config, attr, saved)
 
 
 class TestSSZStatic:
@@ -803,7 +924,7 @@ class TestOperations:
                     execution_meta = load_yaml(execution_file)
                     if execution_meta:
                         execution_valid = execution_meta.get("execution_valid", True)
-                if fork == "gloas":
+                if fork in ("gloas", "heze"):
                     from consensoor.spec import types
                     signed_envelope_file = case_path / "signed_envelope.ssz_snappy"
                     signed_envelope = load_ssz_snappy(
@@ -826,7 +947,7 @@ class TestOperations:
                     body = load_ssz_snappy(body_file, body_type)
                     processor(state_copy, body, execution_valid=execution_valid)
             elif op_name == "withdrawals":
-                if fork == "gloas":
+                if fork in ("gloas", "heze"):
                     processor(state_copy)
                 else:
                     payload_type = get_execution_payload_type_for_fork(fork)
@@ -1395,19 +1516,20 @@ class TestForkChoiceCompliance:
 # ---------------------------------------------------------------------------
 
 def discover_fork_choice_tests(spec_tests_dir: Path, handler_group: str):
-    """Yield (case_id, case_path, fork, preset) for gloas fork_choice /
-    fast_confirmation vectors (consensoor's Store is Gloas-only)."""
+    """Yield (case_id, case_path, fork, preset) for gloas/heze fork_choice /
+    fast_confirmation vectors (consensoor's Store is Gloas-shaped)."""
     cases = []
-    base = spec_tests_dir / "gloas" / handler_group
-    if not base.exists():
-        return cases
-    for handler_dir in sorted(base.iterdir()):
-        tests_dir = handler_dir / "pyspec_tests"
-        if not tests_dir.exists():
+    for fork in ("gloas", "heze"):
+        base = spec_tests_dir / fork / handler_group
+        if not base.exists():
             continue
-        for case_path in sorted(tests_dir.iterdir()):
-            if (case_path / "steps.yaml").exists():
-                cases.append((f"gloas/{handler_group}/{handler_dir.name}/{case_path.name}", case_path, "gloas", None))
+        for handler_dir in sorted(base.iterdir()):
+            tests_dir = handler_dir / "pyspec_tests"
+            if not tests_dir.exists():
+                continue
+            for case_path in sorted(tests_dir.iterdir()):
+                if (case_path / "steps.yaml").exists():
+                    cases.append((f"{fork}/{handler_group}/{handler_dir.name}/{case_path.name}", case_path, fork, None))
     return cases
 
 
@@ -1417,12 +1539,16 @@ def _run_consensoor_fork_choice_case(case_id: str, case_path: Path, preset: str,
     from consensoor.spec.network_config import load_config_from_upstream, set_config
     set_preset(preset)
     set_config(load_config_from_upstream(preset))
+    fork = case_id.split("/", 1)[0]
+    _schedule_forks_through(fork)
     from consensoor.spec import fork_choice as fc
     from consensoor.spec import fast_confirmation as fcr
     from consensoor.spec.types.gloas import (
         BeaconState, BeaconBlock, SignedBeaconBlock, Attestation, AttesterSlashing,
         SignedExecutionPayloadEnvelope, PayloadAttestationMessage,
     )
+    if fork == "heze":
+        from consensoor.spec.types.heze import BeaconState, BeaconBlock, SignedBeaconBlock
 
     def load(name, typ):
         with open(case_path / f"{name}.ssz_snappy", "rb") as f:
@@ -1592,6 +1718,8 @@ def _select_mid_chain_anchor_cases(spec_tests_dir: Path, limit: int = 3):
     from consensoor.spec.constants import SLOTS_PER_EPOCH
     scored = []
     for case_id, case_path, _fork, _p in discover_fork_choice_tests(spec_tests_dir, "fast_confirmation"):
+        if _fork != "gloas":
+            continue
         steps = load_yaml(case_path / "steps.yaml") or []
         n_blocks = sum(1 for s in steps if "block" in s)
         if n_blocks >= 3 * SLOTS_PER_EPOCH():
@@ -1605,6 +1733,7 @@ def _replay_from_mid_chain_anchor(case_id: str, case_path: Path, preset: str):
     from consensoor.spec.network_config import load_config_from_upstream, set_config
     set_preset(preset)
     set_config(load_config_from_upstream(preset))
+    _schedule_forks_through("gloas")
     from consensoor.crypto import hash_tree_root, set_bls_verification
     from consensoor.spec import fork_choice as fc
     from consensoor.spec import fast_confirmation as fcr
@@ -1644,24 +1773,20 @@ def _replay_from_mid_chain_anchor(case_id: str, case_path: Path, preset: str):
 
         # Pass 2: replay the same steps into a store anchored at that block.
         store = fcr_store = None
-        queued = []
         ticks_after_anchor = 0
         for i, step in enumerate(steps):
             if "tick" in step:
                 if store is None:
                     continue
                 fc.on_tick(store, int(step["tick"]))
-                for att in queued:
-                    try:
-                        fc.on_attestation(store, att, is_from_block=False)
-                    except AssertionError:
-                        pass  # pre-anchor target / future slot — same as the node drops them
-                queued = []
-                # This is exactly what the node does on every slot tick.
-                fcr.on_fast_confirmation(fcr_store)
                 head = fc.get_head(store)
                 assert head.root in store.blocks, f"{case_id} step {i}: head not in store"
                 ticks_after_anchor += 1
+            elif "checks" in step:
+                # Run the rule where the reference run does (consensus-specs
+                # #5627: attestation steps follow the tick they belong to).
+                if store is not None and "confirmed_root" in step["checks"]:
+                    fcr.on_fast_confirmation(fcr_store)
             elif "block" in step:
                 signed = load(step["block"], SignedBeaconBlock)
                 root = hash_tree_root(signed.message)
@@ -1683,7 +1808,10 @@ def _replay_from_mid_chain_anchor(case_id: str, case_path: Path, preset: str):
                         pass
             elif "attestation" in step:
                 if store is not None and step.get("valid", True):
-                    queued.append(load(step["attestation"], Attestation))
+                    try:
+                        fc.on_attestation(store, load(step["attestation"], Attestation), is_from_block=False)
+                    except AssertionError:
+                        pass  # pre-anchor target — the node drops these too
             elif "payload_attestation" in step or "payload_attestation_message" in step:
                 if store is not None and step.get("valid", True):
                     pa = load(step.get("payload_attestation_message", step.get("payload_attestation")),
@@ -1719,3 +1847,108 @@ class TestMidChainAnchorReplay:
             pytest.skip("no gloas fast_confirmation vectors with >= 3 epochs of blocks")
         for case_id, case_path in cases:
             _replay_from_mid_chain_anchor(case_id, case_path, preset)
+
+
+# ---------------------------------------------------------------------------
+# Heze gossip_inclusion_list vectors, driven through the node's FOCIL
+# validation (consensoor/focil.py) over a spec fork-choice Store.
+# ---------------------------------------------------------------------------
+
+
+def discover_gossip_inclusion_list_tests(spec_tests_dir: Path):
+    base = spec_tests_dir / "heze" / "networking" / "gossip_inclusion_list" / "pyspec_tests"
+    if not base.exists():
+        return []
+    return [
+        (f"heze/networking/gossip_inclusion_list/{d.name}", d)
+        for d in sorted(base.iterdir())
+        if (d / "meta.yaml").exists()
+    ]
+
+
+CASE_FIXTURES.append(("gossip_il_case", discover_gossip_inclusion_list_tests))
+
+
+class _StoreBackedNode:
+    """Just enough of BeaconNode for FocilService.validate_and_process."""
+
+    def __init__(self, fc_store, state):
+        from consensoor.spec.network_config import get_config
+        self.fc_store = fc_store
+        self.state = state
+        # Head = the spec store's head, so the committee fast path is exercised.
+        from consensoor.spec import fork_choice as fc
+        try:
+            self.head_root = fc.get_head(fc_store).root
+        except Exception:
+            self.head_root = None  # store holds a seen-but-unimported block
+        self._genesis_time = int(state.genesis_time)
+        self._config = get_config()
+        node = self
+
+        class _Store:
+            def get_block(self, root):
+                return node.fc_store.blocks.get(bytes(root))
+
+            def get_state(self, root):
+                return node.fc_store.block_states.get(bytes(root))
+
+        self.store = _Store()
+
+    def _wall_slot(self, now=None):
+        return self._config.compute_slot_at_time(self._genesis_time, now)
+
+    def _slot_start_time(self, slot):
+        return self._config.compute_time_at_slot_f(self._genesis_time, slot)
+
+
+class TestGossipInclusionList:
+    def test_gossip_inclusion_list(self, gossip_il_case, preset):
+        case_id, case_path = gossip_il_case
+        import snappy
+        from consensoor.spec import fork_choice as fc
+        from consensoor.spec.types.heze import (
+            BeaconState, BeaconBlock, SignedBeaconBlock, SignedInclusionList,
+        )
+        from consensoor.spec.inclusion_list import reset_inclusion_list_store
+        from consensoor.focil import FocilService, GossipIgnore, GossipReject
+        from consensoor.spec.network_config import get_config
+
+        def load(name, typ):
+            with open(case_path / f"{name}.ssz_snappy", "rb") as f:
+                return typ.decode_bytes(snappy.decompress(f.read()))
+
+        meta = load_yaml(case_path / "meta.yaml")
+        state = load("state", BeaconState)
+        anchor = BeaconBlock(state_root=state.hash_tree_root())
+        anchor.body.signed_execution_payload_bid.message = state.latest_execution_payload_bid
+        store = fc.get_forkchoice_store(state, anchor)
+        start_ms = int(meta.get("current_time_ms", 0))
+        fc.on_tick(store, start_ms // 1000)
+        for entry in meta.get("blocks") or []:
+            signed = load(entry["block"], SignedBeaconBlock)
+            if entry.get("pending") or entry.get("failed"):
+                store.blocks[signed.message.hash_tree_root()] = signed.message
+                continue
+            block_time = get_config().compute_time_at_slot(int(state.genesis_time), int(signed.message.slot))
+            if store.time < block_time:
+                fc.on_tick(store, block_time)
+            fc.on_block(store, signed)
+
+        reset_inclusion_list_store()
+        node = _StoreBackedNode(store, state)
+        service = FocilService(node)
+        for msg in meta["messages"]:
+            signed = load(msg["message"], SignedInclusionList)
+            now_ms = int(msg["current_time_ms"])
+            fc.on_tick(store, now_ms // 1000)
+            try:
+                service.validate_and_process(signed, now_ms / 1000.0)
+                got, reason = "valid", None
+            except GossipIgnore as e:
+                got, reason = "ignore", str(e)
+            except GossipReject as e:
+                got, reason = "reject", str(e)
+            assert got == msg["expected"], (
+                f"{case_id}: got {got} ({reason}), expected {msg['expected']} ({msg.get('reason')})"
+            )

@@ -110,6 +110,9 @@ def decode_signed_beacon_block(ssz_bytes: bytes) -> AnySignedBeaconBlock:
 
         # Order newest-active-fork first; only the schemas the slot can
         # actually belong to are tried, and the first hit wins.
+        if fork_active("heze_fork_epoch") or fork_active("eip8198_fork_epoch"):
+            from .spec.types.heze import SignedBeaconBlock as SignedHezeBeaconBlock
+            candidates.append(("Heze", SignedHezeBeaconBlock))
         if fork_active("gloas_fork_epoch"):
             candidates.append(("Gloas", SignedBeaconBlock))
         if fork_active("electra_fork_epoch"):
@@ -121,7 +124,9 @@ def decode_signed_beacon_block(ssz_bytes: bytes) -> AnySignedBeaconBlock:
         candidates.append(("Bellatrix", SignedBellatrixBeaconBlock))
     else:
         logger.debug("Slot peek failed, brute-forcing decode")
+        from .spec.types.heze import SignedBeaconBlock as SignedHezeBeaconBlock
         candidates = [
+            ("Heze", SignedHezeBeaconBlock),
             ("Gloas", SignedBeaconBlock),
             ("Electra/Fulu", SignedElectraBeaconBlock),
             ("Deneb", SignedDenebBeaconBlock),
@@ -193,6 +198,9 @@ class BeaconNode:
         self.sync_committee_pool = SyncCommitteePool()
         from .payload_attestation_pool import PayloadAttestationPool
         self.payload_attestation_pool = PayloadAttestationPool()
+        # Heze (EIP-7805, FOCIL) inclusion list runtime
+        from .focil import FocilService
+        self.focil = FocilService(self)
         # Gloas proposer preferences seen via gossip (or self-published),
         # keyed (dependent_root, proposal_slot, validator_index) per the
         # first-valid-message dedup rule in gloas/p2p-interface.md. Builders
@@ -227,6 +235,11 @@ class BeaconNode:
         self._slot_ticker_task: Optional[asyncio.Task] = None
         self._block_sync_task: Optional[asyncio.Task] = None
         self._current_payload_id: Optional[bytes] = None
+        # slot -> (payload_id, parent beacon root) of every payload build we
+        # started. Proposals must fetch the build for *their* slot: the
+        # single _current_payload_* slot is overwritten by the next-slot prep
+        # that runs concurrently at slot start.
+        self._prepared_payloads: dict[int, tuple[bytes, bytes]] = {}
         self._current_payload_beacon_root: Optional[bytes] = None  # Store head_root used in forkchoiceUpdated
         self._current_payload_slot: Optional[int] = None  # The slot the current payload_id is being built for
         # If _sync_missing_blocks asked peers for slots in (head_slot, current_slot)
@@ -353,7 +366,9 @@ class BeaconNode:
         with open(path, "rb") as f:
             ssz_bytes = f.read()
 
+        from .spec.types.heze import BeaconState as HezeBeaconState
         state_types = [
+            ("Heze", HezeBeaconState),
             ("Gloas", BeaconState),
             ("Fulu", FuluBeaconState),
             ("Electra", ElectraBeaconState),
@@ -365,10 +380,16 @@ class BeaconNode:
         ]
 
         detected_fork = None
+        _cfg = get_config()
+        _heze_versions = {bytes(_cfg.heze_fork_version), bytes(_cfg.eip8198_fork_version)}
         for fork_name, state_type in state_types:
             try:
                 self.state = state_type.decode_bytes(ssz_bytes)
                 fork_version = bytes(self.state.fork.current_version)
+                # Heze and Gloas states differ only in the bid's trailing
+                # bitvector; trust the fork version to disambiguate.
+                if fork_name == "Heze" and fork_version not in _heze_versions:
+                    raise ValueError(f"fork version {fork_version.hex()} is not Heze")
                 logger.info(f"Genesis state parsed as {fork_name} format (fork_version={fork_version.hex()})")
                 detected_fork = fork_name.lower()
                 break
@@ -390,6 +411,14 @@ class BeaconNode:
             config.capella_fork_epoch = 0
             config.bellatrix_fork_epoch = 0
             config.altair_fork_epoch = 0
+        elif detected_fork == "heze":
+            if config.heze_fork_epoch == FAR_FUTURE_EPOCH and bytes(
+                self.state.fork.current_version
+            ) == bytes(config.heze_fork_version):
+                config.heze_fork_epoch = 0
+            for attr in ("gloas", "fulu", "electra", "deneb", "capella", "bellatrix", "altair"):
+                if getattr(config, f"{attr}_fork_epoch") == FAR_FUTURE_EPOCH:
+                    setattr(config, f"{attr}_fork_epoch", 0)
         elif detected_fork == "gloas" and config.gloas_fork_epoch == FAR_FUTURE_EPOCH:
             logger.info("Genesis state is GLOAS - setting gloas_fork_epoch=0 in config")
             config.gloas_fork_epoch = 0
@@ -412,14 +441,23 @@ class BeaconNode:
         # the genesis block's body_root and as a patch for
         # state.latest_block_header.body_root — see body_root reconciliation
         # below.
-        if detected_fork == "gloas":
-            from .spec.types.gloas import (
-                BeaconBlockBody as GloasBeaconBlockBody,
-                BeaconBlock as GloasBeaconBlock,
-                SignedBeaconBlock as SignedGloasBeaconBlock,
-                ExecutionPayloadBid as GloasExecutionPayloadBid,
-                SignedExecutionPayloadBid as GloasSignedExecutionPayloadBid,
-            )
+        if detected_fork in ("gloas", "heze"):
+            if detected_fork == "heze":
+                from .spec.types.heze import (
+                    BeaconBlockBody as GloasBeaconBlockBody,
+                    BeaconBlock as GloasBeaconBlock,
+                    SignedBeaconBlock as SignedGloasBeaconBlock,
+                    ExecutionPayloadBid as GloasExecutionPayloadBid,
+                    SignedExecutionPayloadBid as GloasSignedExecutionPayloadBid,
+                )
+            else:
+                from .spec.types.gloas import (
+                    BeaconBlockBody as GloasBeaconBlockBody,
+                    BeaconBlock as GloasBeaconBlock,
+                    SignedBeaconBlock as SignedGloasBeaconBlock,
+                    ExecutionPayloadBid as GloasExecutionPayloadBid,
+                    SignedExecutionPayloadBid as GloasSignedExecutionPayloadBid,
+                )
             # Mirror state.latest_execution_payload_bid into the genesis
             # body's signed_execution_payload_bid.message — lighthouse does
             # this so its genesis body_root != prysm's. Prysm uses empty
@@ -440,6 +478,10 @@ class BeaconNode:
                 execution_payment=state_bid.execution_payment,
                 blob_kzg_commitments=list(state_bid.blob_kzg_commitments),
                 execution_requests_root=state_bid.execution_requests_root,
+                **(
+                    {"inclusion_list_bits": state_bid.inclusion_list_bits}
+                    if detected_fork == "heze" else {}
+                ),
             )
             genesis_signed_bid = GloasSignedExecutionPayloadBid(
                 message=genesis_bid_msg,
@@ -498,7 +540,7 @@ class BeaconNode:
         genesis_state_root = hash_tree_root(self.state)
         logger.info(f"Computed genesis state root: {genesis_state_root.hex()}")
 
-        if detected_fork == "gloas":
+        if detected_fork in ("gloas", "heze"):
             genesis_block = GloasBeaconBlock(
                 slot=int(header.slot),
                 proposer_index=int(header.proposer_index),
@@ -663,7 +705,7 @@ class BeaconNode:
             logger.debug(f"custody_group_count persist failed: {e!r}")
         self._refresh_custody_columns()
         try:
-            current_slot = int((time.time() - self._genesis_time) // (get_config().slot_duration_ms / 1000.0))
+            current_slot = self._wall_slot()
         except Exception:
             current_slot = int(self.state.slot)
         self._earliest_available_slot = max(0, int(current_slot))
@@ -902,6 +944,17 @@ class BeaconNode:
                 self._fc_mark_applied_payload(hash_tree_root(signed_block.message))
                 return
             if not fc.on_block_with_state(self.fc_store, signed_block, post_state):
+                # Parent unknown: it came in through a path that doesn't feed
+                # the Store (req/resp range sync, reorg replay). Backfill the
+                # missing ancestors from the DB, then retry once.
+                if self._fc_backfill_ancestors(bytes(signed_block.message.parent_root)) and \
+                        fc.on_block_with_state(self.fc_store, signed_block, post_state):
+                    self._fc_mark_applied_payload(hash_tree_root(signed_block.message))
+                    return
+                logger.info(
+                    f"fork-choice store: parent of slot {signed_block.message.slot} "
+                    f"({bytes(signed_block.message.parent_root).hex()[:12]}) unknown, block not added"
+                )
                 return
             # The envelope usually arrives (and is applied) before the block
             # is adopted as head, i.e. before this hook runs, so the
@@ -922,7 +975,29 @@ class BeaconNode:
                 except Exception as e:
                     logger.debug(f"fork-choice store block slashing failed: {e!r}")
         except Exception as e:
-            logger.warning(f"fork-choice store on_block failed: {e!r}")
+            logger.warning(f"fork-choice store on_block failed: {e!r}", exc_info=True)
+
+    def _fc_backfill_ancestors(self, root: bytes, limit: int = 64) -> bool:
+        """Feed stored ancestors of ``root`` (oldest first) into the Store
+        until it connects. Returns True if ``root`` is in the Store after."""
+        from .spec import fork_choice as fc
+        chain = []
+        cur = bytes(root)
+        while cur not in self.fc_store.block_states and len(chain) < limit:
+            signed = self.store.get_block(cur)
+            state = self.store.get_state(cur)
+            if signed is None or state is None:
+                return False
+            chain.append((signed, state))
+            cur = bytes(signed.message.parent_root)
+        if cur not in self.fc_store.block_states:
+            return False
+        for signed, state in reversed(chain):
+            if not fc.on_block_with_state(self.fc_store, signed, state):
+                return False
+            self._fc_mark_applied_payload(hash_tree_root(signed.message))
+        logger.info(f"fork-choice store: backfilled {len(chain)} ancestor block(s) from the DB")
+        return True
 
     def _fc_mark_applied_payload(self, block_root: bytes) -> None:
         """If the node already applied ``block_root``'s payload envelope,
@@ -995,6 +1070,13 @@ class BeaconNode:
             from .spec import fork_choice as fc
             from .spec import fast_confirmation as fcr
             t0 = time.monotonic()
+            # A confirmed/observed root that fell out of the store (pruned or
+            # never imported) would KeyError every run from now on: fall back
+            # to the finalized checkpoint, which the store always holds.
+            for attr in ("confirmed_root", "previous_slot_head", "current_slot_head"):
+                root = getattr(self.fcr_store, attr, None)
+                if root is not None and bytes(root) not in self.fc_store.blocks:
+                    setattr(self.fcr_store, attr, self.fc_store.finalized_checkpoint.root)
             await asyncio.get_running_loop().run_in_executor(None, fcr.on_fast_confirmation, self.fcr_store)
             self.confirmed_root = self.fcr_store.confirmed_root
             confirmed_block = self.fc_store.blocks.get(self.confirmed_root)
@@ -1013,7 +1095,13 @@ class BeaconNode:
                 except Exception as e:
                     logger.debug(f"emit_fast_confirmation failed: {e}")
             if slot % SLOTS_PER_EPOCH() == 0:
-                removed = fc.prune_store(self.fc_store)
+                removed = fc.prune_store(
+                    self.fc_store,
+                    extra_keep=[
+                        getattr(self.fcr_store, a, None)
+                        for a in ("confirmed_root", "previous_slot_head", "current_slot_head")
+                    ],
+                )
                 if removed:
                     logger.debug(f"fork-choice store pruned {removed} blocks")
         except RuntimeError as e:
@@ -1220,6 +1308,12 @@ class BeaconNode:
             self.beacon_gossip.subscribe_execution_payloads(self._on_p2p_execution_payload)
             self.beacon_gossip.subscribe_payload_attestation_messages(self._on_p2p_payload_attestation_message)
             self.beacon_gossip.subscribe_proposer_preferences(self._on_p2p_proposer_preferences)
+            # Heze (FOCIL): inclusion list gossip + InclusionListsByIndices serving
+            from .focil import PROTO_INCLUSION_LISTS_BY_INDICES
+            self.beacon_gossip.subscribe_inclusion_lists(self.focil.on_gossip)
+            self.beacon_gossip.set_raw_rpc_provider(
+                PROTO_INCLUSION_LISTS_BY_INDICES, self.focil.serve_by_indices
+            )
             self.beacon_gossip.set_status_provider(self._get_chain_status)
             self.beacon_gossip.set_block_provider(self._get_block_for_slot)
             self.beacon_gossip.set_block_by_root_provider(self._get_block_by_root)
@@ -1407,6 +1501,8 @@ class BeaconNode:
             (net_config.electra_fork_epoch, net_config.electra_fork_version),
             (net_config.fulu_fork_epoch, net_config.fulu_fork_version),
             (net_config.gloas_fork_epoch, net_config.gloas_fork_version),
+            (net_config.heze_fork_epoch, net_config.heze_fork_version),
+            (net_config.eip8198_fork_epoch, net_config.eip8198_fork_version),
         ]
 
         for fork_epoch, fork_version in forks:
@@ -1437,6 +1533,8 @@ class BeaconNode:
             (net_config.electra_fork_version, "electra"),
             (net_config.fulu_fork_version, "fulu"),
             (net_config.gloas_fork_version, "gloas"),
+            (net_config.heze_fork_version, "heze"),
+            (net_config.eip8198_fork_version, "eip8198"),
         ]
 
         fork_epochs = [
@@ -1448,6 +1546,8 @@ class BeaconNode:
             net_config.electra_fork_epoch,
             net_config.fulu_fork_epoch,
             net_config.gloas_fork_epoch,
+            net_config.heze_fork_epoch,
+            net_config.eip8198_fork_epoch,
         ]
 
         for i, (fork_version, fork_name) in enumerate(forks):
@@ -1590,9 +1690,7 @@ class BeaconNode:
             return
 
         network_config = get_config()
-        current_time = int(time.time())
-        slot_duration_sec = network_config.slot_duration_ms // 1000
-        current_slot = (current_time - self._genesis_time) // slot_duration_sec
+        current_slot = self._wall_slot()
 
         # Prepare for the next slot (current_slot + 1, or slot 1 if before genesis)
         target_slot = max(1, current_slot + 1)
@@ -1609,13 +1707,17 @@ class BeaconNode:
         This is used when we need to build a block but don't have a valid payload_id,
         or when the existing payload_id might be for a different slot.
         """
+        # Snapshot the head once: the fcU below awaits, and a block adopted in
+        # the meantime must not make the recorded parent beacon root disagree
+        # with the parentBeaconBlockRoot the EL actually builds on.
+        prep_head_root = self._state_head_root(self.state) if self.state is not None else b"\x00" * 32
         if not self.engine or not self.state:
             logger.warning("Cannot request payload: no engine or state")
             return
 
         try:
             network_config = get_config()
-            timestamp = self._genesis_time + slot * (network_config.slot_duration_ms // 1000)
+            timestamp = self._slot_timestamp(slot)
 
             # Get the current head block hash. In Gloas the EL chain tip is
             # the most recently installed bid's payload (already imported via
@@ -1660,11 +1762,19 @@ class BeaconNode:
                 "prevRandao": "0x" + prev_randao.hex(),
                 "suggestedFeeRecipient": "0x" + "00" * 20,
                 "withdrawals": withdrawals_list,
-                "parentBeaconBlockRoot": "0x" + (self.head_root or b"\x00" * 32).hex(),
+                "parentBeaconBlockRoot": "0x" + prep_head_root.hex(),
             }
             if hasattr(self.state, "ptc_window"):
                 payload_attributes["slotNumber"] = hex(int(slot))
                 payload_attributes["targetGasLimit"] = hex(self._target_gas_limit_for_slot(slot))
+            if network_config.is_heze_active(int(slot) // SLOTS_PER_EPOCH()):
+                # [New in Heze:EIP7805] PayloadAttributesV5
+                payload_attributes["inclusionListTransactions"] = [
+                    "0x" + tx.hex()
+                    for tx in self.focil.payload_attribute_transactions(
+                        int(slot), prep_head_root
+                    )
+                ]
 
             # Debug: compare head_root with hash of latest_block_header
             latest_header_hash = hash_tree_root(self.state.latest_block_header)
@@ -1686,8 +1796,11 @@ class BeaconNode:
             if response.payload_id:
                 logger.info(f"Got fresh payload_id for slot {slot}: {response.payload_id.hex()}")
                 self._current_payload_id = response.payload_id
+                self._prepared_payloads[int(slot)] = (bytes(response.payload_id), bytes(prep_head_root))
+                for _old in [k for k in self._prepared_payloads if k < int(slot) - 4]:
+                    del self._prepared_payloads[_old]
                 # Store the beacon root used in this forkchoiceUpdated for later use in newPayloadV5
-                self._current_payload_beacon_root = self.head_root or b"\x00" * 32
+                self._current_payload_beacon_root = prep_head_root
                 self._current_payload_slot = int(slot)
             else:
                 logger.warning(
@@ -1716,18 +1829,19 @@ class BeaconNode:
         - AGGREGATE_DUE_BPS_GLOAS: 50% of slot
         """
         network_config = get_config()
-        slot_duration = network_config.slot_duration_ms / 1000.0
 
         last_slot_processed = -1
         last_attestation_slot = -1
         last_ptc_slot = -1
         last_sync_committee_slot = -1
+        last_il_slot = -1
 
         while self._running:
             try:
                 now = time.time()
-                current_slot = int((now - self._genesis_time) // slot_duration)
-                slot_start_time = self._genesis_time + current_slot * slot_duration
+                # [EIP-8198] piecewise slot clock over SLOT_DURATION_SCHEDULE
+                current_slot = self._wall_slot(now)
+                slot_start_time = self._slot_start_time(current_slot)
                 time_into_slot = now - slot_start_time
 
                 # Calculate current epoch for fork-aware timing
@@ -1736,8 +1850,9 @@ class BeaconNode:
 
                 # Get attestation timing based on active fork (Gloas has different timing)
                 attestation_offset = network_config.get_attestation_due_offset(current_epoch)
-                ptc_offset = network_config.get_payload_attestation_due_offset()
+                ptc_offset = network_config.get_payload_attestation_due_offset(current_epoch)
                 gloas_active = network_config.is_gloas_active(current_epoch)
+                heze_active = network_config.is_heze_active(current_epoch)
 
                 # Phase 1: Slot start - propose blocks and update forkchoice
                 if current_slot > last_slot_processed:
@@ -1766,6 +1881,19 @@ class BeaconNode:
                 # expected_block_root filter then drops all of ours,
                 # which is why our 83 sync committee validators never
                 # appear in any block's sync_aggregate.
+                # Heze (FOCIL): IL committee members publish their inclusion
+                # list well before INCLUSION_LIST_DUE_BPS, built on the head
+                # once this slot's block has had the attestation window to
+                # land. Kicked off before attestation production (which can
+                # take seconds of BLS work) so short slots don't make it late.
+                if (
+                    heze_active
+                    and current_slot > last_il_slot
+                    and time_into_slot >= attestation_offset
+                ):
+                    last_il_slot = current_slot
+                    asyncio.create_task(self._produce_inclusion_lists_safe(current_slot))
+
                 if current_slot > last_attestation_slot and time_into_slot >= attestation_offset:
                     last_attestation_slot = current_slot
                     await self._produce_attestations(current_slot)
@@ -1773,6 +1901,7 @@ class BeaconNode:
                 if current_slot > last_sync_committee_slot and time_into_slot >= attestation_offset:
                     last_sync_committee_slot = current_slot
                     await self._produce_sync_committee_messages(current_slot)
+
 
                 # Phase 3: PTC due time (Gloas) - produce payload attestations
                 # Vote on whether slot M's execution payload was revealed in
@@ -1784,6 +1913,12 @@ class BeaconNode:
                 ):
                     last_ptc_slot = current_slot
                     await self._produce_payload_attestations(current_slot)
+                    # Heze: the next slot's payload was requested at slot
+                    # start, before this slot's inclusion lists existed. Past
+                    # INCLUSION_LIST_DUE (PTC due > IL due) re-issue the fcU
+                    # so the EL builds with this slot's IL transactions.
+                    if heze_active:
+                        asyncio.create_task(self._refresh_payload_with_inclusion_lists(current_slot))
 
                 # Calculate sleep time - wake up for next event
                 attested_this_slot = current_slot == last_attestation_slot
@@ -1791,7 +1926,7 @@ class BeaconNode:
 
                 if attested_this_slot and ptc_done_this_slot:
                     # All slot duties done, sleep until next slot
-                    next_slot_time = self._genesis_time + (current_slot + 1) * slot_duration
+                    next_slot_time = self._slot_start_time(current_slot + 1)
                     sleep_time = max(0.05, next_slot_time - time.time())
                 elif not attested_this_slot:
                     # Next wakeup: attestation due time
@@ -1861,6 +1996,8 @@ class BeaconNode:
 
         if slot % slots_per_epoch == 0:
             logger.info(f"New epoch: {epoch}")
+            if get_config().is_heze_active(epoch):
+                logger.info(f"[IL] stats: {dict(self.focil.stats)}")
             # Prune old attestations from pool
             self.attestation_pool.prune(slot)
             # Prune old sync committee messages
@@ -1949,6 +2086,10 @@ class BeaconNode:
 
     async def _update_forkchoice_for_slot(self, slot: int) -> None:
         """Update forkchoice with EL and prepare payload for NEXT slot (slot + 1)."""
+        # Snapshot the head once: the fcU below awaits, and a block adopted in
+        # the meantime must not make the recorded parent beacon root disagree
+        # with the parentBeaconBlockRoot the EL actually builds on.
+        prep_head_root = self._state_head_root(self.state) if self.state is not None else b"\x00" * 32
         if not self.engine or not self.state:
             return
 
@@ -1969,7 +2110,7 @@ class BeaconNode:
             # Prepare payload attributes for NEXT slot (slot + 1)
             network_config = get_config()
             next_slot = slot + 1
-            timestamp = self._genesis_time + next_slot * (network_config.slot_duration_ms // 1000)
+            timestamp = self._slot_timestamp(next_slot)
             if next_slot <= int(self.state.slot) or timestamp < int(time.time()):
                 # A late prep (e.g. queued behind a slow block import): the
                 # slot we'd build for has already started, and the EL rejects
@@ -2018,7 +2159,7 @@ class BeaconNode:
                 "prevRandao": "0x" + prev_randao.hex(),
                 "suggestedFeeRecipient": "0x" + "00" * 20,  # Default fee recipient
                 "withdrawals": withdrawals_list,
-                "parentBeaconBlockRoot": "0x" + (self.head_root or b"\x00" * 32).hex(),
+                "parentBeaconBlockRoot": "0x" + prep_head_root.hex(),
             }
             # Gate slotNumber on the NEXT slot's fork, not the current state's.
             # The engine routes to FCU v4 by timestamp (see engine/client.py
@@ -2032,6 +2173,16 @@ class BeaconNode:
                 payload_attributes["targetGasLimit"] = hex(
                     self._target_gas_limit_for_slot(next_slot)
                 )
+            if network_config.is_heze_active(int(next_slot) // SLOTS_PER_EPOCH()):
+                # [New in Heze:EIP7805] PayloadAttributesV5: ILs of slot next_slot - 1
+                il_txs = self.focil.payload_attribute_transactions(
+                    int(next_slot), prep_head_root
+                )
+                payload_attributes["inclusionListTransactions"] = ["0x" + tx.hex() for tx in il_txs]
+                if il_txs:
+                    logger.info(
+                        f"[IL] payload for slot {next_slot} built with {len(il_txs)} inclusion list txs"
+                    )
 
             response = await self.engine.forkchoice_updated(
                 forkchoice_state,
@@ -2043,8 +2194,11 @@ class BeaconNode:
             if response.payload_id:
                 logger.info(f"Payload prepared for slot {next_slot}: id={response.payload_id.hex()}")
                 self._current_payload_id = response.payload_id
+                self._prepared_payloads[int(next_slot)] = (bytes(response.payload_id), bytes(prep_head_root))
+                for _old in [k for k in self._prepared_payloads if k < int(next_slot) - 4]:
+                    del self._prepared_payloads[_old]
                 # Store the beacon root used in this forkchoiceUpdated for later use in newPayloadV5
-                self._current_payload_beacon_root = self.head_root or b"\x00" * 32
+                self._current_payload_beacon_root = prep_head_root
                 self._current_payload_slot = int(next_slot)
             else:
                 logger.warning(
@@ -2138,11 +2292,7 @@ class BeaconNode:
         """
         if not self.state or not self.head_root or not self._genesis_time:
             return False
-        try:
-            slot_duration = get_config().slot_duration_ms / 1000.0
-        except Exception:
-            return False
-        current_slot = int((time.time() - self._genesis_time) // slot_duration)
+        current_slot = self._wall_slot()
         if self.head_slot >= current_slot - 1:
             return True
         # Empty intervening slots are not "being behind". If we just asked
@@ -2165,16 +2315,15 @@ class BeaconNode:
         if not self._is_synced():
             logger.debug(
                 f"[ATTESTER] slot={slot} skipped — not synced "
-                f"(head={self.head_slot}, current={int((time.time() - self._genesis_time) / (get_config().slot_duration_ms / 1000.0))})"
+                f"(head={self.head_slot}, current={self._wall_slot()})"
             )
             return
 
         # Log timing for debugging attestation rate issues
         network_config = get_config()
-        slot_duration = network_config.slot_duration_ms / 1000.0
         slots_per_epoch = SLOTS_PER_EPOCH()
         epoch = slot // slots_per_epoch
-        slot_start = self._genesis_time + slot * slot_duration
+        slot_start = self._slot_start_time(slot)
         time_into_slot = time.time() - slot_start
 
         duties = self._attester_duties.get(epoch, [])
@@ -3012,7 +3161,7 @@ class BeaconNode:
 
         try:
             network_config = get_config()
-            timestamp = self._genesis_time + slot * (network_config.slot_duration_ms // 1000)
+            timestamp = self._slot_timestamp(slot)
 
             # Don't propose from a stale state (e.g. while catching up after a
             # late start): the lookahead we read our duty from is then wrong
@@ -3031,16 +3180,17 @@ class BeaconNode:
             # Only fall back to a fresh build if the prep is missing, was
             # built for a different slot, or the head has shifted since
             # then (e.g. a reorg made the prep extend a stale parent).
-            current_head_root = self.head_root or b"\x00" * 32
-            prep_is_valid = (
-                self._current_payload_id is not None
-                and self._current_payload_slot == int(slot)
-                and self._current_payload_beacon_root == current_head_root
+            # The block is built on self.state, so compare against its root
+            # (self.head_root can lag self.state during an import).
+            current_head_root = (
+                self._state_head_root(self.state) if self.state is not None else b"\x00" * 32
             )
+            prep = self._prepared_payloads.get(int(slot))
+            prep_is_valid = prep is not None and prep[1] == current_head_root
             if prep_is_valid:
                 logger.info(
                     f"Reusing prepared payload_id for slot {slot}: "
-                    f"{self._current_payload_id.hex()}"
+                    f"{prep[0].hex()}"
                 )
             else:
                 logger.info(
@@ -3050,6 +3200,7 @@ class BeaconNode:
                     f"head={current_head_root.hex()[:16]})"
                 )
                 await self._request_payload_for_slot(slot)
+                prep = self._prepared_payloads.get(int(slot))
                 # Safety net for the case where head-adoption re-prep
                 # (in _on_p2p_block) didn't fire in time and we still
                 # ended up issuing fcU{payload_attributes} at slot start.
@@ -3060,11 +3211,12 @@ class BeaconNode:
                 # `else` branch handles the rare case — the warm path
                 # (prep_is_valid=True) skips this entirely.
                 await asyncio.sleep(0.5)
-            if not self._current_payload_id:
+            if prep is None:
                 logger.error("Cannot produce block: failed to get payload_id")
                 return
+            payload_id, payload_beacon_root = prep
 
-            payload_response = await self.engine.get_payload(self._current_payload_id, timestamp=timestamp)
+            payload_response = await self.engine.get_payload(payload_id, timestamp=timestamp)
             execution_payload_dict = payload_response.execution_payload
             block_hash = execution_payload_dict.get("blockHash", "unknown")
             block_number = execution_payload_dict.get("blockNumber", "unknown")
@@ -3095,6 +3247,44 @@ class BeaconNode:
             if signed_block is None:
                 logger.error("Failed to build block")
                 return
+
+            # The state can advance between payload prep and the build (a
+            # late parent imported meanwhile). A payload whose
+            # parentBeaconBlockRoot/prevRandao belong to another parent makes
+            # the block invalid for every peer: rebuild once on a fresh payload.
+            if (
+                hasattr(signed_block.message.body, "signed_execution_payload_bid")
+                and bytes(signed_block.message.parent_root) != bytes(payload_beacon_root)
+            ):
+                logger.warning(
+                    f"Prepared payload for slot {slot} was built on parent "
+                    f"{bytes(payload_beacon_root).hex()[:16]} but the block's parent is "
+                    f"{bytes(signed_block.message.parent_root).hex()[:16]}: rebuilding on a fresh payload"
+                )
+                self._prepared_payloads.pop(int(slot), None)
+                await self._request_payload_for_slot(slot)
+                await asyncio.sleep(0.3)
+                prep = self._prepared_payloads.get(int(slot))
+                if prep is None:
+                    logger.error("Cannot produce block: failed to get fresh payload_id")
+                    return
+                payload_id, payload_beacon_root = prep
+                payload_response = await self.engine.get_payload(payload_id, timestamp=timestamp)
+                execution_payload_dict = payload_response.execution_payload
+                el_execution_requests = payload_response.execution_requests or []
+                signed_block = await self.block_builder.build_block(
+                    slot, proposer_key, execution_payload_dict,
+                    blobs_bundle=payload_response.blobs_bundle,
+                    execution_requests=el_execution_requests,
+                    execution_head_hash=(
+                        bytes.fromhex(execution_payload_dict["parentHash"][2:])
+                        if hasattr(self.state, "latest_execution_payload_bid")
+                        and execution_payload_dict.get("parentHash") else None
+                    ),
+                )
+                if signed_block is None:
+                    logger.error("Failed to rebuild block")
+                    return
 
             # PUBLISH IMMEDIATELY before doing any local validation, engine
             # round-trips, or state persistence. The block was built from
@@ -3144,7 +3334,7 @@ class BeaconNode:
                 # Use the beacon root that was stored when forkchoiceUpdated was called.
                 # This MUST match the parentBeaconBlockRoot used in that call, as Geth uses it
                 # to compute the block hash. self.head_root may have changed since then.
-                parent_beacon_root = self._current_payload_beacon_root or bytes(block.parent_root)
+                parent_beacon_root = bytes(payload_beacon_root)
 
                 # For GLOAS self-build, validate with EL using raw payload dict
                 # (bypasses SSZ round-trip to avoid blockhash mismatch)
@@ -3159,6 +3349,9 @@ class BeaconNode:
                     versioned_hashes,
                     parent_beacon_root,
                     el_execution_requests,
+                    inclusion_list_transactions=self.focil.new_payload_transactions(
+                        b"", block_slot=int(block.slot), parent_root=bytes(block.parent_root)
+                    ),
                 )
 
                 if status.status != PayloadStatusEnum.VALID:
@@ -3193,7 +3386,7 @@ class BeaconNode:
 
                 # Use the beacon root that was stored when forkchoiceUpdated was called.
                 # This MUST match the parentBeaconBlockRoot used in that call.
-                parent_beacon_root = self._current_payload_beacon_root or bytes(block.parent_root)
+                parent_beacon_root = bytes(payload_beacon_root)
 
                 # Log the SSZ payload's blockHash to verify it matches the original
                 ssz_block_hash = bytes(execution_payload.block_hash).hex()
@@ -3385,7 +3578,7 @@ class BeaconNode:
         fan out larger requests instead of one-block requests every poll.
         """
         network_config = get_config()
-        slot_duration = network_config.slot_duration_ms / 1000.0
+        slot_duration = network_config.genesis_slot_duration_ms / 1000.0
         # One full slot between polls. With 6s gloas-minimal slots that's
         # well under prysm's 128/10s ceiling even if we burst-request a
         # whole batch of blocks in one call.
@@ -3402,7 +3595,7 @@ class BeaconNode:
                     continue
 
                 now = time.time()
-                current_slot = int((now - self._genesis_time) // slot_duration)
+                current_slot = self._wall_slot(now)
                 if current_slot < 1:
                     await asyncio.sleep(poll)
                     continue
@@ -4155,8 +4348,7 @@ class BeaconNode:
 
     def _current_wall_slot(self) -> int:
         """Wall-clock slot derived from genesis time."""
-        slot_duration = get_config().slot_duration_ms / 1000.0
-        return int((time.time() - self._genesis_time) // slot_duration)
+        return self._wall_slot()
 
     async def _on_p2p_blob_sidecar(self, data: bytes, from_peer: str) -> None:
         """Handle a blob sidecar received via libp2p gossipsub."""
@@ -4799,6 +4991,10 @@ class BeaconNode:
     def _is_head_payload_revealed(self, bid_hash: bytes) -> bool:
         """True if the payload committed by the head's bid is known to us —
         our EL validated it, or we hold its envelope (gossip/req-resp/self)."""
+        # [Heze:EIP7805] a payload that does not satisfy the inclusion lists
+        # is never extended: build on the head block's EMPTY variant.
+        if self.head_root and self.__dict__.get("_il_satisfaction", {}).get(bytes(self.head_root)) is False:
+            return False
         if bid_hash in self._el_validated_hashes:
             return True
         if self.head_root and self.store.get_payload(self.head_root) is not None:
@@ -5181,16 +5377,27 @@ class BeaconNode:
             versioned_hashes = self._versioned_hashes_for_envelope(envelope)
             execution_requests = self._encode_execution_requests(envelope.execution_requests)
 
+            block_root = bytes(envelope.beacon_block_root)
             status = await self.engine.new_payload(
                 envelope.payload,
                 versioned_hashes,
                 parent_beacon_root,
                 execution_requests,
                 timestamp=int(envelope.payload.timestamp),
+                inclusion_list_transactions=self.focil.new_payload_transactions(block_root),
             )
 
             if status.status == PayloadStatusEnum.VALID:
-                logger.info("Execution payload validated")
+                logger.info(
+                    "Execution payload validated"
+                    + (
+                        f" (inclusionListSatisfied={status.inclusion_list_satisfied})"
+                        if status.inclusion_list_satisfied is not None else ""
+                    )
+                )
+                # [Heze] a VALID payload that ignores the ILs stays valid but
+                # fork choice must not extend it.
+                self.focil.record_satisfaction(block_root, status.inclusion_list_satisfied)
                 self._el_validated_hashes.add(bytes(envelope.payload.block_hash))
                 return True
             elif status.status == PayloadStatusEnum.SYNCING:
@@ -5244,12 +5451,76 @@ class BeaconNode:
         except Exception as e:
             logger.error(f"Failed to update forkchoice: {e}")
 
+    # ------------------------------------------------------------------
+    # Heze (FOCIL) hooks
+    # ------------------------------------------------------------------
+
+    async def _produce_inclusion_lists_safe(self, slot: int) -> None:
+        try:
+            await self.focil.produce(slot)
+        except Exception as e:
+            logger.warning(f"[IL] produce failed for slot {slot}: {e!r}")
+        finally:
+            try:
+                self.focil.prune(slot)
+            except Exception:
+                pass
+
+    async def _refresh_payload_with_inclusion_lists(self, slot: int) -> None:
+        try:
+            if not self.focil.payload_attribute_transactions(slot + 1, self.head_root or b"\x00" * 32):
+                return
+            await self._update_forkchoice_for_slot(slot)
+        except Exception as e:
+            logger.warning(f"[IL] payload refresh for slot {slot + 1} failed: {e!r}")
+
+    def inclusion_list_bits_for_bid(self, state, slot: int, parent_block_root: bytes) -> list[bool]:
+        """Block builder hook: self-build bid ``inclusion_list_bits``."""
+        return self.focil.bits_for_bid(state, slot, parent_block_root)
+
+    # ------------------------------------------------------------------
+    # EIP-8198 slot clock: every wall-clock <-> slot conversion goes through
+    # the piecewise SLOT_DURATION_SCHEDULE, never a fixed slot length.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _state_head_root(state) -> bytes:
+        """Root of the block ``state`` is the post-state of.
+
+        ``self.head_root`` is published a few awaits after ``self.state``
+        during block import, so anything that pairs a root with state-derived
+        data (payload prep: prevRandao, withdrawals, parentBeaconBlockRoot)
+        must take the root from the state itself.
+        """
+        header = state.latest_block_header
+        if bytes(header.state_root) == b"\x00" * 32:
+            header = header.copy()
+            header.state_root = hash_tree_root(state)
+        return hash_tree_root(header)
+
+    def _slot_start_time(self, slot: int) -> float:
+        """Unix seconds (float) at the start of ``slot``."""
+        return get_config().compute_time_at_slot_f(self._genesis_time, int(slot))
+
+    def _slot_timestamp(self, slot: int) -> int:
+        """Integer Unix timestamp of ``slot`` (execution payload timestamp)."""
+        return get_config().compute_time_at_slot(int(self._genesis_time), int(slot))
+
+    def _wall_slot(self, now: Optional[float] = None) -> int:
+        """Slot at wall-clock ``now`` (defaults to time.time())."""
+        if now is None:
+            now = time.time()
+        if now < self._genesis_time:
+            return 0
+        return get_config().compute_slot_at_time(self._genesis_time, now)
+
+    def _slot_duration_s(self, slot: int) -> float:
+        return get_config().get_slot_duration_ms_at_slot(int(slot)) / 1000.0
+
     @property
     def current_slot(self) -> int:
         """Get the current slot based on time."""
-        network_config = get_config()
-        now = int(time.time())
-        return (now - self._genesis_time) // (network_config.slot_duration_ms // 1000)
+        return self._wall_slot()
 
     @property
     def current_epoch(self) -> int:

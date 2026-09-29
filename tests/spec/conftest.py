@@ -41,6 +41,7 @@ def pytest_configure(config):
         "consensoor.spec.types.electra",
         "consensoor.spec.types.fulu",
         "consensoor.spec.types.gloas",
+        "consensoor.spec.types.heze",
         "consensoor.spec.types.base",
     ]
     for mod in type_modules:
@@ -92,3 +93,57 @@ def clear_caches():
     clear_spec_caches()
     yield
     clear_spec_caches()
+
+
+_FORK_ORDER = ["phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas", "heze"]
+
+
+@pytest.fixture(autouse=True)
+def fork_epochs_for_case(request):
+    """Mirror pyspec's vector config: the fork under test and every earlier
+    fork activate at genesis, later forks stay unscheduled.
+
+    Only applied from Gloas on (earlier forks' code paths do not consult
+    fork epochs for state-transition rules).
+    """
+    callspec = getattr(request.node, "callspec", None)
+    case = None
+    case_path = None
+    if callspec is not None:
+        for v in callspec.params.values():
+            if isinstance(v, tuple) and v and isinstance(v[0], str) and "/" in v[0]:
+                case = v[0]
+                case_path = next((x for x in v if isinstance(x, Path)), None)
+                break
+    fork = case.split("/", 1)[0] if case else None
+    if fork not in ("gloas", "heze"):
+        yield
+        return
+    from consensoor.spec.network_config import get_config
+    config = get_config()
+    far = 2**64 - 1
+    saved = {}
+    idx = _FORK_ORDER.index(fork)
+    for i, name in enumerate(_FORK_ORDER[1:], start=1):
+        attr = f"{name}_fork_epoch"
+        if not hasattr(config, attr):
+            continue
+        saved[attr] = getattr(config, attr)
+        setattr(config, attr, 0 if i <= idx else far)
+    saved["eip8198_fork_epoch"] = config.eip8198_fork_epoch
+    config.eip8198_fork_epoch = far
+    # A case may carry its own config.yaml (e.g. GLOAS_FORK_EPOCH: 1).
+    if case_path is not None and (case_path / "config.yaml").exists():
+        import yaml
+        with open(case_path / "config.yaml") as f:
+            case_cfg = yaml.safe_load(f) or {}
+        for key, value in case_cfg.items():
+            attr = key.lower()
+            if attr.endswith("_fork_epoch") and hasattr(config, attr):
+                saved.setdefault(attr, getattr(config, attr))
+                setattr(config, attr, int(value))
+    try:
+        yield
+    finally:
+        for attr, v in saved.items():
+            setattr(config, attr, v)

@@ -248,7 +248,8 @@ def get_flag_index_deltas(
     active_increments = get_total_active_balance(state) // EFFECTIVE_BALANCE_INCREMENT
 
     for index in get_eligible_validator_indices(state):
-        base_reward = get_base_reward(state, index)
+        # [Modified in EIP8198] priced at the previous epoch's slot duration
+        base_reward = get_base_reward(state, index, previous_epoch)
         if index in unslashed_participating_indices:
             if not is_in_inactivity_leak(state):
                 reward_numerator = base_reward * weight * unslashed_participating_increments
@@ -286,6 +287,13 @@ def get_inactivity_penalty_deltas(
     else:
         inactivity_penalty_quotient = INACTIVITY_PENALTY_QUOTIENT_ALTAIR
 
+    # [Modified in EIP8198] quadratic in the slot duration ratio of the
+    # previous epoch (reduces to BIAS * QUOTIENT with a genesis-only schedule)
+    from ..helpers.accessors import _slot_duration_ratio
+    prev_ms, genesis_ms = _slot_duration_ratio(previous_epoch)
+    inactivity_penalty_denominator = (
+        INACTIVITY_SCORE_BIAS * inactivity_penalty_quotient * genesis_ms**2 // prev_ms**2
+    )
     for index in get_eligible_validator_indices(state):
         if index not in matching_target_indices:
             # Penalty based on inactivity score and effective balance
@@ -293,7 +301,7 @@ def get_inactivity_penalty_deltas(
                 int(state.validators[index].effective_balance)
                 * int(state.inactivity_scores[index])
             )
-            penalty_denominator = INACTIVITY_SCORE_BIAS * inactivity_penalty_quotient
+            penalty_denominator = inactivity_penalty_denominator
             penalties[index] += penalty_numerator // penalty_denominator
 
     return rewards, penalties

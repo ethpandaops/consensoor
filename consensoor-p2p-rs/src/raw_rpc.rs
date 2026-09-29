@@ -27,6 +27,9 @@ pub const PROTO_COLUMNS_BY_ROOT: &str =
     "/eth2/beacon_chain/req/data_column_sidecars_by_root/1/ssz_snappy";
 pub const PROTO_COLUMNS_BY_RANGE: &str =
     "/eth2/beacon_chain/req/data_column_sidecars_by_range/1/ssz_snappy";
+/// Heze (EIP-7805) InclusionListsByIndices v1.
+pub const PROTO_INCLUSION_LISTS_BY_INDICES: &str =
+    "/eth2/beacon_chain/req/inclusion_lists_by_indices/1/ssz_snappy";
 
 /// Largest request we accept (DataColumnsByRootIdentifiers for 128 blocks x
 /// 128 columns is ~135 KiB).

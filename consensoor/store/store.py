@@ -105,6 +105,8 @@ class Store:
         logger.info(f"Fork detection: type={type_name}, module={module_name}")
 
         # Check module name for fork-specific modules
+        if "heze" in module_name.lower():
+            return "heze"
         if "gloas" in module_name.lower():
             return "gloas"
         if "fulu" in module_name.lower():
@@ -167,6 +169,7 @@ class Store:
         """Get all beacon state types for deserialization."""
         from ..spec.types.fulu import FuluBeaconState
         from ..spec.types.gloas import BeaconState as GloasBeaconState
+        from ..spec.types.heze import BeaconState as HezeBeaconState
         from ..spec.types.electra import ElectraBeaconState
         from ..spec.types.deneb import DenebBeaconState
         from ..spec.types.capella import CapellaBeaconState
@@ -177,6 +180,7 @@ class Store:
         return {
             "fulu": FuluBeaconState,
             "gloas": GloasBeaconState,
+            "heze": HezeBeaconState,
             "electra": ElectraBeaconState,
             "deneb": DenebBeaconState,
             "capella": CapellaBeaconState,
@@ -189,6 +193,7 @@ class Store:
         """Get all signed beacon block types for deserialization."""
         from ..spec.types.fulu import FuluSignedBeaconBlock
         from ..spec.types.gloas import SignedBeaconBlock as GloasSignedBeaconBlock
+        from ..spec.types.heze import SignedBeaconBlock as HezeSignedBeaconBlock
         from ..spec.types.electra import ElectraSignedBeaconBlock
         from ..spec.types.deneb import DenebSignedBeaconBlock
         from ..spec.types.capella import CapellaSignedBeaconBlock
@@ -199,6 +204,7 @@ class Store:
         return {
             "fulu": FuluSignedBeaconBlock,
             "gloas": GloasSignedBeaconBlock,
+            "heze": HezeSignedBeaconBlock,
             "electra": ElectraSignedBeaconBlock,
             "deneb": DenebSignedBeaconBlock,
             "capella": CapellaSignedBeaconBlock,

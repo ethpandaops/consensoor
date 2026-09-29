@@ -480,6 +480,27 @@ def MIN_BUILDER_WITHDRAWABILITY_DELAY() -> int:
     return get_config().min_builder_withdrawability_delay
 
 # =============================================================================
+# Heze (EIP-7805: FOCIL)
+# =============================================================================
+
+INCLUSION_LIST_COMMITTEE_SIZE: Final[int] = 16
+DOMAIN_INCLUSION_LIST_COMMITTEE: Final[bytes] = b"\x10\x00\x00\x00"
+MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE_HEZE: Final[int] = 196934
+MAX_SIGNED_INCLUSION_LIST_SIZE: Final[int] = 41112
+MAX_REQUEST_INCLUSION_LIST: Final[int] = 16
+
+
+def MIN_SLOTS_FOR_INCLUSION_LISTS_REQUESTS() -> int:
+    from .network_config import get_config
+    return get_config().min_slots_for_inclusion_lists_requests
+
+
+def MAX_TRANSACTIONS_BYTES_PER_INCLUSION_LIST() -> int:
+    from .network_config import get_config
+    return get_config().max_transactions_bytes_per_inclusion_list
+
+
+# =============================================================================
 # Networking Constants
 # =============================================================================
 

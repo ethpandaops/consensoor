@@ -51,8 +51,11 @@ def get_ptc(state: "BeaconState", slot: int) -> Sequence[int]:
     """
     if hasattr(state, "ptc_window"):
         from ...constants import MIN_SEED_LOOKAHEAD
+        from ...network_config import get_config
 
         epoch = compute_epoch_at_slot(slot)
+        # [Modified in Gloas] pre-Gloas slots have no PTC (specs #5663)
+        assert epoch >= get_config().gloas_fork_epoch, "PTC requested for pre-Gloas slot"
         state_epoch = get_current_epoch(state)
         spe = SLOTS_PER_EPOCH()
 

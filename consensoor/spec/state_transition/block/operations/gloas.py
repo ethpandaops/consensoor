@@ -74,6 +74,7 @@ def process_execution_payload_bid(state: "BeaconState", signed_bid) -> None:
     assert int(bid.slot) == int(state.slot), "Bid slot mismatch"
     assert int(state.slot) > GENESIS_SLOT, "Bid in genesis slot"
     assert bytes(bid.parent_block_hash) == bytes(state.latest_block_hash), "Parent block hash mismatch"
+    assert bytes(bid.block_hash) != bytes(bid.parent_block_hash), "Bid block hash equals parent block hash"
     assert bytes(bid.parent_block_root) == bytes(
         get_block_root_at_slot(state, int(state.slot) - 1)
     ), "Parent block root mismatch"

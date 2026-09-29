@@ -130,9 +130,13 @@ class Store:
     payloads: Dict[bytes, object]
     payload_timeliness_vote: Dict[bytes, List[Optional[bool]]]
     payload_data_availability_vote: Dict[bytes, List[Optional[bool]]]
+    # [New in Heze:EIP7805] beacon block root -> payload satisfied the ILs
+    payload_inclusion_list_satisfaction: Dict[bytes, bool] = field(default_factory=dict)
     # implementation hooks
     is_data_available: Callable[[bytes], bool] = field(default=lambda root: True)
     verify_new_payload: Callable[..., bool] = field(default=lambda *a, **k: True)
+    # [New in Heze:EIP7805] ExecutionEngine.is_inclusion_list_satisfied
+    is_inclusion_list_satisfied: Callable[..., bool] = field(default=lambda *a, **k: True)
     # performance: plain-python index of the immutable per-block facts the
     # hot paths need (slot, parent_root, bid block_hash, parent payload
     # status) so get_ancestor/get_weight never touch remerkleable views;
@@ -149,7 +153,7 @@ def get_forkchoice_store(anchor_state, anchor_block, is_data_available=None, ver
     justified_checkpoint = Checkpoint(epoch=anchor_epoch, root=anchor_root)
     finalized_checkpoint = Checkpoint(epoch=anchor_epoch, root=anchor_root)
     store = Store(
-        time=int(anchor_state.genesis_time) + SLOT_DURATION_MS() * int(anchor_state.slot) // 1000,
+        time=get_config().compute_time_at_slot(int(anchor_state.genesis_time), int(anchor_state.slot)),
         genesis_time=int(anchor_state.genesis_time),
         justified_checkpoint=justified_checkpoint,
         finalized_checkpoint=finalized_checkpoint,
@@ -181,7 +185,18 @@ def get_forkchoice_store(anchor_state, anchor_block, is_data_available=None, ver
 
 
 def get_slots_since_genesis(store: Store) -> int:
-    return (store.time - store.genesis_time) * 1000 // SLOT_DURATION_MS()
+    # [Modified in EIP8198] piecewise over SLOT_DURATION_SCHEDULE
+    return get_config().compute_slot_at_time_ms(
+        seconds_to_milliseconds(store.genesis_time), seconds_to_milliseconds(store.time)
+    )
+
+
+def get_time_into_slot_ms(store: Store) -> int:
+    """Milliseconds elapsed since the start of the store's current slot."""
+    config = get_config()
+    genesis_ms = seconds_to_milliseconds(store.genesis_time)
+    slot_start_ms = config.compute_time_at_slot_ms(genesis_ms, get_current_slot(store))
+    return seconds_to_milliseconds(store.time) - slot_start_ms
 
 
 def get_current_slot(store: Store) -> int:
@@ -202,28 +217,39 @@ def seconds_to_milliseconds(seconds: int) -> int:
     return seconds * 1000
 
 
-def get_slot_component_duration_ms(basis_points: int) -> int:
-    return basis_points * SLOT_DURATION_MS() // BASIS_POINTS
+def get_slot_component_duration_ms(basis_points: int, slot: int | None = None) -> int:
+    """Deadline offset in ms. [Modified in EIP8198] priced at the slot
+    duration in effect at ``slot`` (genesis duration when omitted)."""
+    config = get_config()
+    duration = (
+        config.genesis_slot_duration_ms if slot is None else config.get_slot_duration_ms_at_slot(slot)
+    )
+    return basis_points * duration // BASIS_POINTS
 
 
-def get_attestation_due_ms() -> int:
-    return get_slot_component_duration_ms(int(get_config().attestation_due_bps_gloas))
+def get_attestation_due_ms(slot: int | None = None) -> int:
+    return get_slot_component_duration_ms(int(get_config().attestation_due_bps_gloas), slot)
 
 
-def get_aggregate_due_ms() -> int:
-    return get_slot_component_duration_ms(int(get_config().aggregate_due_bps_gloas))
+def get_aggregate_due_ms(slot: int | None = None) -> int:
+    return get_slot_component_duration_ms(int(get_config().aggregate_due_bps_gloas), slot)
 
 
-def get_proposer_reorg_cutoff_ms() -> int:
-    return get_slot_component_duration_ms(int(get_config().proposer_reorg_cutoff_bps))
+def get_proposer_reorg_cutoff_ms(slot: int | None = None) -> int:
+    return get_slot_component_duration_ms(int(get_config().proposer_reorg_cutoff_bps), slot)
 
 
-def get_payload_due_ms() -> int:
-    return get_slot_component_duration_ms(int(get_config().payload_due_bps))
+def get_payload_due_ms(slot: int | None = None) -> int:
+    return get_slot_component_duration_ms(int(get_config().payload_due_bps), slot)
 
 
-def get_payload_attestation_due_ms() -> int:
-    return get_slot_component_duration_ms(int(get_config().payload_attestation_due_bps))
+def get_payload_attestation_due_ms(slot: int | None = None) -> int:
+    return get_slot_component_duration_ms(int(get_config().payload_attestation_due_bps), slot)
+
+
+def get_inclusion_list_due_ms(slot: int | None = None) -> int:
+    """[New in Heze:EIP7805]"""
+    return get_slot_component_duration_ms(int(get_config().inclusion_list_due_bps), slot)
 
 
 # ---------------------------------------------------------------- payload status helpers
@@ -343,7 +369,8 @@ def get_checkpoint_block(store: Store, root: bytes, epoch: int) -> bytes:
 
 
 def get_supported_node(store: Store, message: LatestMessage) -> ForkChoiceNode:
-    if _meta(store, message.root)[0] < message.slot:
+    meta = _meta(store, message.root)
+    if meta is not None and meta[0] < message.slot:
         payload_status = PAYLOAD_STATUS_FULL if message.payload_present else PAYLOAD_STATUS_EMPTY
     else:
         payload_status = PAYLOAD_STATUS_PENDING
@@ -401,9 +428,22 @@ def should_build_on_full(store: Store, head: ForkChoiceNode, slot: int) -> bool:
     return True
 
 
+def is_payload_inclusion_list_satisfied(store: Store, root: bytes) -> bool:
+    """[New in Heze:EIP7805] A payload not locally available never satisfies.
+
+    Pre-Heze payloads have no entry and are treated as satisfied.
+    """
+    if not is_payload_verified(store, root):
+        return False
+    return store.payload_inclusion_list_satisfaction.get(root, True)
+
+
 def should_extend_payload(store: Store, root: bytes) -> bool:
     assert _meta(store, root)[0] + 1 == get_current_slot(store)
     if not is_payload_verified(store, root):
+        return False
+    # [New in Heze:EIP7805]
+    if not is_payload_inclusion_list_satisfied(store, root):
         return False
     proposer_root = store.proposer_boost_root
     payload_is_timely = payload_timeliness(store, root, timely=True)
@@ -586,9 +626,8 @@ def is_finalization_ok(store: Store, slot: int) -> bool:
 
 
 def is_proposing_on_time(store: Store) -> bool:
-    seconds_since_genesis = store.time - store.genesis_time
-    time_into_slot_ms = seconds_to_milliseconds(seconds_since_genesis) % SLOT_DURATION_MS()
-    return time_into_slot_ms <= get_proposer_reorg_cutoff_ms()
+    time_into_slot_ms = get_time_into_slot_ms(store)
+    return time_into_slot_ms <= get_proposer_reorg_cutoff_ms(get_current_slot(store))
 
 
 def is_head_weak(store: Store, head_root: bytes) -> bool:
@@ -671,9 +710,12 @@ def on_tick_per_slot(store: Store, time: int) -> None:
 
 def on_tick(store: Store, time: int) -> None:
     time = int(time)
-    tick_slot = (time - store.genesis_time) * 1000 // SLOT_DURATION_MS()
+    config = get_config()
+    tick_slot = config.compute_slot_at_time_ms(
+        seconds_to_milliseconds(store.genesis_time), seconds_to_milliseconds(time)
+    )
     while get_current_slot(store) < tick_slot:
-        previous_time = store.genesis_time + (get_current_slot(store) + 1) * SLOT_DURATION_MS() // 1000
+        previous_time = config.compute_time_at_slot(store.genesis_time, get_current_slot(store) + 1)
         on_tick_per_slot(store, previous_time)
     on_tick_per_slot(store, time)
 
@@ -727,12 +769,12 @@ def update_latest_messages(store: Store, attesting_indices: Sequence[int], attes
 
 def record_block_timeliness(store: Store, root: bytes) -> None:
     block = store.blocks[root]
-    seconds_since_genesis = store.time - store.genesis_time
-    time_into_slot_ms = seconds_to_milliseconds(seconds_since_genesis) % SLOT_DURATION_MS()
+    time_into_slot_ms = get_time_into_slot_ms(store)
     is_current_slot = get_current_slot(store) == int(block.slot)
+    slot = int(block.slot)
     store.block_timeliness[root] = [
         is_current_slot and time_into_slot_ms < threshold
-        for threshold in (get_attestation_due_ms(), get_payload_attestation_due_ms())
+        for threshold in (get_attestation_due_ms(slot), get_payload_attestation_due_ms(slot))
     ]
 
 
@@ -858,7 +900,7 @@ def verify_execution_payload_envelope(store: Store, state, signed_envelope) -> N
 
     assert int(payload.slot_number) == int(state.slot)
     assert bytes(payload.parent_hash) == bytes(state.latest_block_hash)
-    assert int(payload.timestamp) == compute_time_at_slot(int(state.genesis_time), int(state.slot), SLOT_DURATION_MS())
+    assert int(payload.timestamp) == compute_time_at_slot(int(state.genesis_time), int(state.slot))
     assert hash_tree_root(payload.withdrawals) == hash_tree_root(state.payload_expected_withdrawals)
     assert store.verify_new_payload(
         payload,
@@ -875,6 +917,11 @@ def on_execution_payload_envelope(store: Store, signed_envelope) -> None:
     assert store.is_data_available(root)
     state = store.block_states[root]
     verify_execution_payload_envelope(store, state, signed_envelope)
+    # [New in Heze:EIP7805]
+    if hasattr(_bid(store.blocks[root]), "inclusion_list_bits"):
+        record_payload_inclusion_list_satisfaction(
+            store, root, store.is_inclusion_list_satisfied(root, envelope.payload)
+        )
     store.payloads[root] = envelope
 
 
@@ -936,23 +983,106 @@ def on_block_with_state(store: Store, signed_block, post_state) -> bool:
     return True
 
 
-def on_execution_payload_envelope_trusted(store: Store, signed_envelope) -> bool:
+def on_execution_payload_envelope_trusted(
+    store: Store, signed_envelope, inclusion_list_satisfied: Optional[bool] = None
+) -> bool:
     """Record an envelope the node already verified (signature, bid
-    consistency, EL newPayload). Returns False if the block is unknown."""
+    consistency, EL newPayload). Returns False if the block is unknown.
+
+    ``inclusion_list_satisfied`` is the EL's PayloadStatusV2 verdict (Heze);
+    None means not a Heze payload or not yet validated (optimistically
+    satisfied per heze/optimistic-sync.md).
+    """
     root = bytes(signed_envelope.message.beacon_block_root)
     if root not in store.block_states:
         return False
     store.payloads[root] = signed_envelope.message
+    if inclusion_list_satisfied is not None:
+        record_payload_inclusion_list_satisfaction(store, root, bool(inclusion_list_satisfied))
     return True
 
 
-def prune_store(store: Store, keep_epochs: int = 2) -> int:
+def record_payload_inclusion_list_satisfaction(store: Store, root: bytes, satisfied: bool) -> None:
+    """[New in Heze:EIP7805] A payload recorded as satisfied stays satisfied."""
+    if store.payload_inclusion_list_satisfaction.get(root) is True:
+        return
+    store.payload_inclusion_list_satisfaction[root] = bool(satisfied)
+
+
+def compute_shuffling_lookahead_start_slot(epoch: int) -> int:
+    lookahead_epoch = max(0, int(epoch) - MIN_SEED_LOOKAHEAD)
+    return compute_start_slot_at_epoch(lookahead_epoch)
+
+
+def is_valid_dependent_root(store: Store, root: bytes, dependent_slot: int) -> bool:
+    """Whether ``root`` is, or could become on some branch, the latest block
+    at or before ``dependent_slot`` (gloas/fork-choice.md)."""
+    if root == get_head(store).root:
+        return True
+    for block_root, meta in store.block_meta.items():
+        # meta = (slot, parent_root, ...)
+        if meta[1] == root and meta[0] > dependent_slot:
+            return True
+    return False
+
+
+def on_inclusion_list(store: Store, signed_inclusion_list, timely: Optional[bool] = None) -> None:
+    """[New in Heze:EIP7805] ``on_inclusion_list``; raises on invalid input.
+
+    ``timely`` may be supplied by the caller (gossip arrival time); otherwise
+    it is derived from the store clock as in the spec.
+    """
+    from .inclusion_list import (
+        get_inclusion_list_committee,
+        get_inclusion_list_store,
+        is_valid_inclusion_list_signature,
+        process_inclusion_list,
+    )
+    from .state_transition import process_slots
+
+    inclusion_list = signed_inclusion_list.message
+    current_slot = get_current_slot(store)
+    il_slot = int(inclusion_list.slot)
+    assert il_slot <= current_slot
+    assert il_slot + int(get_config().min_slots_for_inclusion_lists_requests) >= current_slot
+
+    txs = [bytes(tx) for tx in inclusion_list.transactions]
+    size = sum(len(tx) for tx in txs)
+    assert size > 0
+    assert size <= int(get_config().max_transactions_bytes_per_inclusion_list)
+    assert all(len(tx) > 0 for tx in txs)
+
+    dependent_root = bytes(inclusion_list.dependent_root)
+    assert dependent_root in store.blocks
+    assert dependent_root in store.block_states
+
+    epoch = compute_epoch_at_slot(il_slot)
+    dependent_slot = compute_shuffling_dependent_slot(epoch)
+    assert _meta(store, dependent_root)[0] <= dependent_slot
+    assert is_valid_dependent_root(store, dependent_root, dependent_slot)
+
+    state = store.block_states[dependent_root]
+    lookahead_start_slot = compute_shuffling_lookahead_start_slot(epoch)
+    if int(state.slot) < lookahead_start_slot:
+        state = process_slots(state.copy(), lookahead_start_slot)
+    committee = get_inclusion_list_committee(state, il_slot)
+    assert int(inclusion_list.validator_index) in committee
+    assert is_valid_inclusion_list_signature(state, signed_inclusion_list)
+
+    if timely is None:
+        timely = il_slot == current_slot and get_time_into_slot_ms(store) < get_inclusion_list_due_ms(il_slot)
+    process_inclusion_list(get_inclusion_list_store(), signed_inclusion_list, bool(timely))
+
+
+def prune_store(store: Store, keep_epochs: int = 2, extra_keep: Sequence[bytes] = ()) -> int:
     """Drop blocks/states older than ``keep_epochs`` before finalization
-    (the finalized checkpoint block itself is kept). Returns count removed."""
+    (the finalized checkpoint block itself is kept, as are ``extra_keep``
+    roots, e.g. the fast-confirmation roots). Returns count removed."""
     cutoff_epoch = max(0, store.finalized_checkpoint.epoch - keep_epochs)
     cutoff_slot = compute_start_slot_at_epoch(cutoff_epoch)
     keep = {store.finalized_checkpoint.root, store.justified_checkpoint.root,
             store.unrealized_justified_checkpoint.root, store.unrealized_finalized_checkpoint.root}
+    keep.update(bytes(r) for r in extra_keep if r)
     doomed = [r for r, b in store.blocks.items() if int(b.slot) < cutoff_slot and r not in keep]
     store._ancestor_cache.clear()
     for r in doomed:
@@ -964,6 +1094,15 @@ def prune_store(store: Store, keep_epochs: int = 2) -> int:
         store.payloads.pop(r, None)
         store.payload_timeliness_vote.pop(r, None)
         store.payload_data_availability_vote.pop(r, None)
+        store.payload_inclusion_list_satisfaction.pop(r, None)
+    # A vote for a pruned block cannot support any node left in the tree
+    # (everything kept descends from the finalized checkpoint); keeping it
+    # would make get_supported_node dereference an unknown root.
+    if doomed:
+        doomed_set = set(doomed)
+        for vi in [vi for vi, m in store.latest_messages.items() if m.root in doomed_set]:
+            del store.latest_messages[vi]
+        store._score_cache = None
     for ckpt in [c for c in store.checkpoint_states if c.epoch < cutoff_epoch and c not in
                  (store.justified_checkpoint, store.finalized_checkpoint)]:
         store.checkpoint_states.pop(ckpt, None)

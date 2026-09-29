@@ -251,6 +251,24 @@ def get_validator_churn_limit(state: "BeaconState") -> int:
     )
 
 
+def _slot_duration_ratio(epoch: int) -> tuple[int, int]:
+    """(duration at ``epoch``, genesis duration) per EIP-8198's schedule.
+
+    Pre-EIP8198 networks have a genesis-only schedule, so the ratio is 1:1
+    and every scaled formula reduces to its unscaled form.
+    """
+    from ...network_config import get_config
+    config = get_config()
+    return config.get_slot_duration_ms(int(epoch)), config.genesis_slot_duration_ms
+
+
+def _scale_by_slot_duration(value: int, epoch: int) -> int:
+    num, den = _slot_duration_ratio(epoch)
+    if num == den:
+        return value
+    return value * num // den
+
+
 def _is_gloas_state(state: "BeaconState") -> bool:
     """Check if state is Gloas (ePBS) by presence of the builders field."""
     return hasattr(state, "builders")
@@ -274,14 +292,30 @@ def get_balance_churn_limit(state: "BeaconState") -> int:
 
 
 def get_exit_churn_limit(state: "BeaconState") -> int:
-    """Return the exit churn limit for the current epoch (Gloas EIP-8061)."""
-    return get_balance_churn_limit(state)
+    """Return the exit churn limit for the current epoch (Gloas EIP-8061).
+
+    [Modified in EIP8198] scaled by the slot duration ratio before rounding.
+    """
+    churn = max(
+        MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA(),
+        get_total_active_balance(state) // CHURN_LIMIT_QUOTIENT_GLOAS(),
+    )
+    churn = _scale_by_slot_duration(churn, get_current_epoch(state))
+    return churn - (churn % EFFECTIVE_BALANCE_INCREMENT)
 
 
 def get_activation_churn_limit_gloas(state: "BeaconState") -> int:
-    """Return the activation churn limit for the current epoch (Gloas EIP-8061)."""
-    churn = get_balance_churn_limit(state)
-    return min(MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS(), churn)
+    """Return the activation churn limit for the current epoch (Gloas EIP-8061).
+
+    [Modified in EIP8198] the cap is applied before scaling.
+    """
+    churn = max(
+        MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA(),
+        get_total_active_balance(state) // CHURN_LIMIT_QUOTIENT_GLOAS(),
+    )
+    churn = min(MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT_GLOAS(), churn)
+    churn = _scale_by_slot_duration(churn, get_current_epoch(state))
+    return churn - (churn % EFFECTIVE_BALANCE_INCREMENT)
 
 
 def get_pending_balance_to_withdraw_for_builder(
@@ -334,6 +368,8 @@ def get_consolidation_churn_limit(state: "BeaconState") -> int:
     """
     if _is_gloas_state(state):
         churn = get_total_active_balance(state) // CONSOLIDATION_CHURN_LIMIT_QUOTIENT()
+        # [Modified in EIP8198]
+        churn = _scale_by_slot_duration(churn, get_current_epoch(state))
         return churn - (churn % EFFECTIVE_BALANCE_INCREMENT)
     return get_balance_churn_limit(state) - get_activation_exit_churn_limit(state)
 
@@ -396,23 +432,26 @@ def get_total_active_balance(state: "BeaconState") -> int:
     return result
 
 
-def get_base_reward_per_increment(state: "BeaconState") -> int:
+def get_base_reward_per_increment(state: "BeaconState", epoch: int | None = None) -> int:
     """Return the base reward per increment (Altair+).
 
-    Args:
-        state: Beacon state
-
-    Returns:
-        Base reward per increment in Gwei
+    [Modified in EIP8198] priced at the slot duration in effect at ``epoch``
+    (defaults to the state's current epoch).
     """
+    current_epoch = get_current_epoch(state)
+    if epoch is None:
+        epoch = current_epoch
+    num, den = _slot_duration_ratio(epoch)
     # Derived from total_active_balance — same fork-safe key shape.
-    key = (get_current_epoch(state), state.validators.get_backing())
+    key = (current_epoch, state.validators.get_backing(), num, den)
     if key in _base_reward_per_increment_cache:
         return _base_reward_per_increment_cache[key]
 
     result = (
         EFFECTIVE_BALANCE_INCREMENT
         * BASE_REWARD_FACTOR
+        * num
+        // den
         // integer_squareroot(get_total_active_balance(state))
     )
 
@@ -421,7 +460,7 @@ def get_base_reward_per_increment(state: "BeaconState") -> int:
     return result
 
 
-def get_base_reward(state: "BeaconState", index: int) -> int:
+def get_base_reward(state: "BeaconState", index: int, epoch: int | None = None) -> int:
     """Return the base reward for a validator.
 
     Handles both Phase0 and Altair+ formulas.
@@ -439,7 +478,7 @@ def get_base_reward(state: "BeaconState", index: int) -> int:
         increments = (
             int(state.validators[index].effective_balance) // EFFECTIVE_BALANCE_INCREMENT
         )
-        return increments * get_base_reward_per_increment(state)
+        return increments * get_base_reward_per_increment(state, epoch)
     else:
         # Phase0 formula: effective_balance * BASE_REWARD_FACTOR // sqrt(total) // BASE_REWARDS_PER_EPOCH
         total_balance = get_total_active_balance(state)

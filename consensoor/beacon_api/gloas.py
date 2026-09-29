@@ -140,6 +140,10 @@ def signed_bid_to_json(signed_bid) -> dict:
             "execution_payment": str(int(bid.execution_payment)),
             "blob_kzg_commitments": [_hex(c) for c in bid.blob_kzg_commitments],
             "execution_requests_root": _hex(bid.execution_requests_root),
+            **(
+                {"inclusion_list_bits": _hex(bytes(bid.inclusion_list_bits.encode_bytes()))}
+                if hasattr(bid, "inclusion_list_bits") else {}
+            ),
         },
         "signature": _hex(signed_bid.signature),
     }

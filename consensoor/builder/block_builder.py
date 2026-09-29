@@ -143,7 +143,10 @@ class BlockBuilder:
             return None
 
         fork = self._get_fork_for_slot(slot)
-        logger.debug(f"Building block for fork: {fork}")
+        # Heze/EIP-8198 blocks are Gloas-shaped; only the bid (and so the
+        # body/block containers) change type.
+        self._heze = get_config().is_heze_active(slot // SLOTS_PER_EPOCH())
+        logger.debug(f"Building block for fork: {fork} (heze={self._heze})")
 
         # Work on a copy of the state to compute state_root
         # Use SSZ round-trip instead of copy.deepcopy for deterministic behavior across architectures
@@ -267,7 +270,10 @@ class BlockBuilder:
             )
             # Self-build uses G2 point-at-infinity signature (no actual signing needed)
             g2_point_at_infinity = b"\xc0" + b"\x00" * 95
-            signed_execution_payload_bid = SignedExecutionPayloadBid(
+            signed_bid_cls = SignedExecutionPayloadBid
+            if self._heze:
+                from ..spec.types.heze import SignedExecutionPayloadBid as signed_bid_cls
+            signed_execution_payload_bid = signed_bid_cls(
                 message=execution_payload_bid,
                 signature=BLSSignature(g2_point_at_infinity),
             )
@@ -311,10 +317,10 @@ class BlockBuilder:
         except Exception as e:
             # Zero state_root means the block we're about to publish is
             # spec-invalid — every peer will reject it. Surface this loudly.
-            logger.error(f"Failed to compute state_root: {e}, using zero")
+            logger.error(f"Built block for slot {slot} fails process_block ({e}); not publishing it")
             import traceback
             traceback.print_exc()
-            state_root = b"\x00" * 32
+            return None
 
         total_time = time_mod.time() - build_start
         logger.info(f"Total block build time: {total_time*1000:.1f}ms")
@@ -362,6 +368,15 @@ class BlockBuilder:
                 body=body,
             )
         elif fork == "gloas":
+            if getattr(self, "_heze", False):
+                from ..spec.types.heze import BeaconBlock as HezeBeaconBlock
+                return HezeBeaconBlock(
+                    slot=Slot(slot),
+                    proposer_index=ValidatorIndex(proposer_index),
+                    parent_root=Root(parent_root),
+                    state_root=Root(state_root),
+                    body=body,
+                )
             return GloasBeaconBlock(
                 slot=Slot(slot),
                 proposer_index=ValidatorIndex(proposer_index),
@@ -396,6 +411,9 @@ class BlockBuilder:
                 signature=BLSSignature(signature),
             )
         elif fork == "gloas":
+            if getattr(self, "_heze", False):
+                from ..spec.types.heze import SignedBeaconBlock as SignedHezeBeaconBlock
+                return SignedHezeBeaconBlock(message=block, signature=BLSSignature(signature))
             return SignedGloasBeaconBlock(
                 message=block,
                 signature=BLSSignature(signature),
@@ -822,7 +840,23 @@ class BlockBuilder:
         exec_requests_obj = self._decode_execution_requests_hex(execution_requests, gloas=True)
         execution_requests_root = hash_tree_root(exec_requests_obj)
 
-        bid = ExecutionPayloadBid(
+        bid_cls = ExecutionPayloadBid
+        extra = {}
+        if getattr(self, "_heze", False):
+            # [New in Heze:EIP7805] commit to every valid, non-equivocating
+            # inclusion list we have seen for slot - 1 (only_timely=False),
+            # matching the IL transactions handed to the EL for this payload.
+            from ..spec.types.heze import ExecutionPayloadBid as bid_cls, InclusionListBits
+            bits = [False] * len(InclusionListBits())
+            hook = getattr(self.node, "inclusion_list_bits_for_bid", None)
+            if hook is not None:
+                try:
+                    bits = hook(state, slot, bytes(parent_block_root))
+                except Exception as e:
+                    logger.warning(f"inclusion_list_bits for bid failed: {e}")
+            extra["inclusion_list_bits"] = InclusionListBits(*bits)
+
+        bid = bid_cls(
             parent_block_hash=Hash32(parent_block_hash),
             parent_block_root=Root(parent_block_root),
             block_hash=Hash32(hex_to_bytes(execution_payload_dict["blockHash"])),
@@ -835,6 +869,7 @@ class BlockBuilder:
             execution_payment=Gwei(0),
             blob_kzg_commitments=kzg_commitments,
             execution_requests_root=Root(execution_requests_root),
+            **extra,
         )
 
         logger.debug(
@@ -906,7 +941,10 @@ class BlockBuilder:
 
         gloas_attestations = [upgrade_attestation_to_gloas(a) for a in (attestations or [])]
 
-        return GloasBeaconBlockBody(
+        body_cls = GloasBeaconBlockBody
+        if getattr(self, "_heze", False):
+            from ..spec.types.heze import BeaconBlockBody as body_cls
+        return body_cls(
             randao_reveal=randao_reveal,
             eth1_data=state.eth1_data,
             graffiti=Bytes32(self.node.config.graffiti_bytes),

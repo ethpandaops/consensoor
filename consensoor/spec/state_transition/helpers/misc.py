@@ -92,18 +92,15 @@ def compute_fork_digest(
     return compute_fork_data_root(current_version, genesis_validators_root)[:4]
 
 
-def compute_time_at_slot(genesis_time: int, slot: int, slot_duration_ms: int) -> int:
+def compute_time_at_slot(genesis_time: int, slot: int, slot_duration_ms: int | None = None) -> int:
     """Return the Unix timestamp at the start of the given slot.
 
-    Args:
-        genesis_time: Genesis Unix timestamp
-        slot: Slot number
-        slot_duration_ms: Slot duration in milliseconds from network config
-
-    Returns:
-        Unix timestamp at start of slot
+    [Modified in EIP8198] walks SLOT_DURATION_SCHEDULE piecewise. The
+    ``slot_duration_ms`` argument is legacy and ignored: a single duration
+    cannot describe a chain whose slot length changed.
     """
-    return genesis_time + slot * (slot_duration_ms // 1000)
+    from ...network_config import get_config
+    return get_config().compute_time_at_slot(int(genesis_time), int(slot))
 
 
 def convert_builder_index_to_validator_index(builder_index: int) -> int:
