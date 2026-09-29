@@ -294,6 +294,7 @@ class BlockBuilder:
                 fork,
                 attestations,
                 execution_requests=execution_requests,
+                blobs_bundle=blobs_bundle,
             )
         logger.debug(f"Block body attestations count after build: {len(body.attestations)}")
 
@@ -525,6 +526,7 @@ class BlockBuilder:
         fork: str,
         attestations=None,
         execution_requests: list | None = None,
+        blobs_bundle: dict | None = None,
     ):
         """Build the beacon block body for the appropriate fork."""
         from ..spec.state_transition.helpers.accessors import get_block_root_at_slot
@@ -590,7 +592,13 @@ class BlockBuilder:
         if fork == "capella":
             return CapellaBeaconBlockBody(**base_fields)
 
-        base_fields["blob_kzg_commitments"] = []
+        # Commit to the payload's blobs: the EL validates the payload's blob
+        # transactions against the versioned hashes of these commitments.
+        from ..spec.types import KZGCommitment
+        base_fields["blob_kzg_commitments"] = [
+            KZGCommitment(bytes.fromhex(c[2:] if c.startswith("0x") else c))
+            for c in ((blobs_bundle or {}).get("commitments") or [])
+        ]
 
         if fork == "deneb":
             return DenebBeaconBlockBody(**base_fields)

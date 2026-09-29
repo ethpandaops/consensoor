@@ -1764,7 +1764,10 @@ class BeaconNode:
                 "withdrawals": withdrawals_list,
                 "parentBeaconBlockRoot": "0x" + prep_head_root.hex(),
             }
-            if hasattr(self.state, "ptc_window"):
+            # Gate on the target slot's fork, not the state's: at the first
+            # Gloas slot the state is still Fulu, but the EL expects V4
+            # attributes (slotNumber, targetGasLimit) for that timestamp.
+            if network_config.is_gloas_active(int(slot) // SLOTS_PER_EPOCH()):
                 payload_attributes["slotNumber"] = hex(int(slot))
                 payload_attributes["targetGasLimit"] = hex(self._target_gas_limit_for_slot(slot))
             if network_config.is_heze_active(int(slot) // SLOTS_PER_EPOCH()):
@@ -3301,6 +3304,30 @@ class BeaconNode:
                     logger.info(f"Block published EARLY to P2P: slot={slot}")
                 except Exception as e:
                     logger.error(f"Failed to publish block to P2P (early): {e}")
+
+            # Pre-Gloas (Fulu) blocks carry their blobs' commitments in the
+            # body, so the proposer publishes the data column sidecars with
+            # the block (Gloas does it with the payload envelope instead).
+            if (
+                self.beacon_gossip
+                and hasattr(signed_block.message.body, "blob_kzg_commitments")
+                and len(signed_block.message.body.blob_kzg_commitments) > 0
+                and getattr(self, "das", None) is not None
+                and payload_response.blobs_bundle
+            ):
+                try:
+                    from .das import compute_subnet_for_data_column_sidecar
+                    fulu_sidecars = await asyncio.get_running_loop().run_in_executor(
+                        None, self.das.build_fulu_sidecars, signed_block, payload_response.blobs_bundle
+                    )
+                    for sc in fulu_sidecars:
+                        await self.beacon_gossip.publish_data_column_sidecar(
+                            compute_subnet_for_data_column_sidecar(int(sc.index)), sc.encode_bytes()
+                        )
+                    if fulu_sidecars:
+                        logger.info(f"Published {len(fulu_sidecars)} fulu data column sidecars for slot {slot}")
+                except Exception as e:
+                    logger.error(f"Failed to build/publish fulu data column sidecars for slot {slot}: {e}")
 
             block = signed_block.message
             block_root = hash_tree_root(block)

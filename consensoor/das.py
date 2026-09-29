@@ -139,6 +139,52 @@ class DataColumnManager:
         )
         return sidecars
 
+    def build_fulu_sidecars(self, signed_block, blobs_bundle: dict) -> list:
+        """Fulu ``get_data_column_sidecars`` for our own (pre-Gloas) block:
+        every column carries the signed block header, the block's KZG
+        commitments and their inclusion proof into the block body."""
+        from .spec.types.fulu import DataColumnSidecar as FuluDataColumnSidecar
+        from .spec.types import SignedBeaconBlockHeader, BeaconBlockHeader
+
+        blobs_hex = blobs_bundle.get("blobs") or []
+        block = signed_block.message
+        body = block.body
+        if not blobs_hex or len(body.blob_kzg_commitments) == 0:
+            return []
+        t0 = time.monotonic()
+        cells_and_proofs = [
+            kzg.compute_cells_and_kzg_proofs(bytes.fromhex(b[2:] if b.startswith("0x") else b))
+            for b in blobs_hex
+        ]
+        header = SignedBeaconBlockHeader(
+            message=BeaconBlockHeader(
+                slot=block.slot,
+                proposer_index=block.proposer_index,
+                parent_root=block.parent_root,
+                state_root=block.state_root,
+                body_root=body.hash_tree_root(),
+            ),
+            signature=signed_block.signature,
+        )
+        proof = kzg_commitments_inclusion_proof(body)
+        sidecars = []
+        for column_index in range(NUMBER_OF_COLUMNS):
+            sidecars.append(
+                FuluDataColumnSidecar(
+                    index=uint64(column_index),
+                    column=[Cell(cells[column_index]) for cells, _ in cells_and_proofs],
+                    kzg_commitments=list(body.blob_kzg_commitments),
+                    kzg_proofs=[proofs[column_index] for _, proofs in cells_and_proofs],
+                    signed_block_header=header,
+                    kzg_commitments_inclusion_proof=proof,
+                )
+            )
+        logger.info(
+            f"Built {len(sidecars)} fulu data column sidecars for slot {int(block.slot)} "
+            f"({len(blobs_hex)} blobs) in {(time.monotonic() - t0) * 1000:.0f}ms"
+        )
+        return sidecars
+
     def store_sidecars(self, sidecars: Iterable[DataColumnSidecar]) -> None:
         for sc in sidecars:
             self._remember(bytes(sc.beacon_block_root), int(sc.slot), int(sc.index), bytes(sc.encode_bytes()))
@@ -319,6 +365,26 @@ class DataColumnManager:
 # ---------------------------------------------------------------------------
 # Custody backfill (fulu/validator.md, "Validator custody")
 # ---------------------------------------------------------------------------
+
+
+def kzg_commitments_inclusion_proof(body) -> list[bytes]:
+    """Merkle branch of ``body.blob_kzg_commitments`` in an Electra/Fulu
+    BeaconBlockBody (``compute_merkle_proof(body, get_generalized_index(
+    BeaconBlockBody, "blob_kzg_commitments"))``)."""
+    from .crypto import sha256 as _sha256
+
+    field_names = list(type(body).fields().keys())
+    leaves = [bytes(getattr(body, name).hash_tree_root()) for name in field_names]
+    depth = (len(leaves) - 1).bit_length()
+    leaves += [b"\x00" * 32] * ((1 << depth) - len(leaves))
+    index = field_names.index("blob_kzg_commitments")
+    branch = []
+    layer = leaves
+    for _ in range(depth):
+        branch.append(layer[index ^ 1])
+        layer = [_sha256(layer[i] + layer[i + 1]) for i in range(0, len(layer), 2)]
+        index //= 2
+    return branch
 
 
 def blob_commitment_count(signed_block) -> int:
