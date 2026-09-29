@@ -537,7 +537,21 @@ def ATTESTATION_SUBNET_EXTRA_BITS() -> int:
 
 
 def MIN_EPOCHS_FOR_BLOCK_REQUESTS() -> int:
-    return 33024 if _config.preset == "mainnet" else 272
+    """``compute_min_epochs_for_block_requests`` (phase0 / Gloas p2p-interface).
+
+    Pre-Gloas: MIN_VALIDATOR_WITHDRAWABILITY_DELAY + CHURN_LIMIT_QUOTIENT // 2
+    (33024 mainnet, 272 minimal). [Modified in Gloas:EIP8061] once Gloas is
+    scheduled the weak-subjectivity churn arithmetic is used (specs #5680).
+    """
+    from .network_config import get_config
+    cfg = get_config()
+    if cfg.gloas_fork_epoch != FAR_FUTURE_EPOCH:
+        q_exit = cfg.churn_limit_quotient_gloas
+        q_cons = cfg.consolidation_churn_limit_quotient
+        numerator = 3 * q_exit * q_cons
+        denominator = 2 * q_cons + 3 * q_exit
+        return cfg.min_validator_withdrawability_delay + (numerator // denominator) // 2
+    return cfg.min_validator_withdrawability_delay + cfg.churn_limit_quotient // 2
 
 
 def MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT() -> int:

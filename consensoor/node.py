@@ -198,6 +198,8 @@ class BeaconNode:
         # first-valid-message dedup rule in gloas/p2p-interface.md. Builders
         # consult this to match bid.fee_recipient to the proposer's wishes.
         self.proposer_preferences: dict[tuple[bytes, int, int], object] = {}
+        # Slots we already cast PTC votes for (early votes, specs #5612)
+        self._ptc_voted_slots: set[int] = set()
         # Tuples we already broadcast for our own validators, to avoid
         # re-publishing the same preferences every slot.
         self._published_prefs_keys: set[tuple[bytes, int, int]] = set()
@@ -861,6 +863,9 @@ class BeaconNode:
         except Exception as e:
             logger.error(f"data column sidecar handling failed: {e}")
             return
+        if verdict == "accept" and self.head_root is not None and self.head_slot is not None:
+            # last custody column may complete availability -> early PTC vote
+            self._maybe_early_ptc_vote(int(self.head_slot))
         if verdict == "reject":
             logger.debug(f"P2P: rejected data column sidecar from {from_peer[:16]}: {reason}")
             self._record_peer_event(from_peer, "gossip_invalid_data_column")
@@ -2401,7 +2406,18 @@ class BeaconNode:
                 f"pool_size={self.sync_committee_pool.size}"
             )
 
-    async def _produce_payload_attestations(self, slot: int) -> None:
+    def _maybe_early_ptc_vote(self, slot: int) -> None:
+        """Vote as soon as the envelope and blob data are in (specs #5612)."""
+        if slot in self._ptc_voted_slots or not self.validator_client:
+            return
+        try:
+            if slot != self._current_wall_slot():
+                return
+        except Exception:
+            return
+        asyncio.create_task(self._produce_payload_attestations(slot, early=True))
+
+    async def _produce_payload_attestations(self, slot: int, early: bool = False) -> None:
         """Produce PTC payload attestations at the 75% slot mark (Gloas).
 
         For each of our validators in the PTC for `slot`, sign a
@@ -2414,6 +2430,8 @@ class BeaconNode:
         depend on gossip echo to include our own votes.
         """
         if not self.state or not self.validator_client or not self.beacon_gossip:
+            return
+        if slot in self._ptc_voted_slots:
             return
         if not self._is_synced():
             return
@@ -2462,6 +2480,14 @@ class BeaconNode:
                 n_commitments = 0
             if n_commitments > 0:
                 blob_data_available = das.is_available(beacon_block_root)
+
+        # [Modified in Gloas] vote early only once both are true; a False
+        # vote may only be cast after PAYLOAD_ATTESTATION_DUE (specs #5612)
+        if early and not (payload_present and blob_data_available):
+            return
+        self._ptc_voted_slots.add(int(slot))
+        for old in [s_ for s_ in self._ptc_voted_slots if s_ + 2 < int(slot)]:
+            self._ptc_voted_slots.discard(old)
 
         produced: list[int] = []
         for validator_index in our_in_ptc:
@@ -4036,8 +4062,9 @@ class BeaconNode:
         """
         from .spec.state_transition.helpers.beacon_committee import is_valid_proposal_slot
         from .spec.state_transition.helpers.misc import compute_epoch_at_slot
-        from .spec.state_transition.helpers.domain import get_domain, compute_signing_root
-        from .spec.constants import DOMAIN_PROPOSER_PREFERENCES, MIN_SEED_LOOKAHEAD
+        from .spec.state_transition.helpers.domain import compute_domain, compute_signing_root
+        from .spec.constants import DOMAIN_PROPOSER_PREFERENCES, MIN_SEED_LOOKAHEAD, SLOTS_PER_EPOCH
+        from .spec.network_config import get_config
         from .crypto.crypto import verify_async
 
         if self.state is None or not hasattr(self.state, "proposer_lookahead"):
@@ -4049,17 +4076,22 @@ class BeaconNode:
         dependent_root = bytes(prefs.dependent_root)
 
         current_slot = self._current_wall_slot()
-        # [IGNORE] proposal_slot has not already passed
+        key = (dependent_root, proposal_slot, validator_index)
+        # [IGNORE] first valid preferences for (proposal_slot, dependent_root)
+        # (seen check moved to the top, specs #5586; key has no validator, #5577)
+        if any(k[0] == dependent_root and k[1] == proposal_slot for k in self.proposer_preferences):
+            return False, "ignore"
+        proposal_epoch = compute_epoch_at_slot(proposal_slot)
+        # [IGNORE] the proposal epoch is after the Gloas upgrade (specs #5559)
+        if proposal_epoch < get_config().gloas_fork_epoch:
+            return False, "ignore"
+        # [IGNORE] proposal_slot has not already started
         if proposal_slot <= current_slot:
             return False, "ignore"
-        # [IGNORE] proposal_slot within the proposer lookahead
-        proposal_epoch = compute_epoch_at_slot(proposal_slot)
-        current_epoch = compute_epoch_at_slot(current_slot)
-        if not (current_epoch <= proposal_epoch <= current_epoch + MIN_SEED_LOOKAHEAD):
-            return False, "ignore"
-        # [IGNORE] first valid message for the tuple
-        key = (dependent_root, proposal_slot, validator_index)
-        if key in self.proposer_preferences:
+        # [IGNORE] the proposer for the proposal slot is known, i.e. the
+        # shuffling lookahead start slot is not in the future (specs #5602)
+        lookahead_start_slot = max(0, proposal_epoch - MIN_SEED_LOOKAHEAD) * SLOTS_PER_EPOCH()
+        if lookahead_start_slot > current_slot:
             return False, "ignore"
         # [Modified in alpha.13] dependent-root checks (specs #5443)
         # [IGNORE] the block with root dependent_root has been seen
@@ -4089,7 +4121,13 @@ class BeaconNode:
         # [REJECT] signature valid for the validator's pubkey
         if validator_index >= len(self.state.validators):
             return False, "reject"
-        domain = get_domain(self.state, DOMAIN_PROPOSER_PREFERENCES, proposal_epoch)
+        # [Modified in Gloas] domain from the proposal epoch's fork version,
+        # not the verifying state's fork (specs #5665)
+        domain = compute_domain(
+            DOMAIN_PROPOSER_PREFERENCES,
+            get_config().get_fork_version(proposal_epoch),
+            bytes(self.state.genesis_validators_root),
+        )
         signing_root = compute_signing_root(prefs, domain)
         pubkey = bytes(self.state.validators[validator_index].pubkey)
         if not await verify_async(pubkey, signing_root, bytes(signed.signature)):
@@ -5010,6 +5048,7 @@ class BeaconNode:
             f"state_root={state_root.hex()[:16]}"
         )
         self._fc_on_envelope(signed_envelope)
+        self._maybe_early_ptc_vote(int(envelope_slot))
         # Envelopes that arrived before their block were not sent to the EL yet.
         env_hash = bytes(signed_envelope.message.payload.block_hash)
         if self.engine and env_hash not in self._el_validated_hashes:

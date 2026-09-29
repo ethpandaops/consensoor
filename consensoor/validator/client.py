@@ -444,7 +444,14 @@ class ValidatorClient:
                 target_gas_limit=target_gas_limit,
             )
             epoch = compute_epoch_at_slot(proposal_slot)
-            domain = get_domain(state, DOMAIN_PROPOSER_PREFERENCES, epoch)
+            # [Modified in Gloas] sign with the proposal epoch's fork version (specs #5665)
+            from ..spec.state_transition.helpers.domain import compute_domain
+            from ..spec.network_config import get_config
+            domain = compute_domain(
+                DOMAIN_PROPOSER_PREFERENCES,
+                get_config().get_fork_version(epoch),
+                bytes(state.genesis_validators_root),
+            )
             signing_root = compute_signing_root(preferences, domain)
             signature = await bls_sign_async(validator_key.privkey, signing_root)
 
