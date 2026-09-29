@@ -104,7 +104,22 @@ class FocilService:
     def _state_for_committee(self, dependent_root: bytes, slot: int):
         """State able to compute the IL committee of ``slot``: the dependent
         block's post-state advanced to the lookahead start (spec), falling
-        back to the head state."""
+        back to the head state. Cached per (dependent root, epoch): advancing
+        a pre-fork dependent state across a fork boundary (e.g. the last
+        Fulu block for the first Heze epochs) runs the fork upgrade, which
+        is far too slow to repeat for every inclusion list."""
+        epoch = slot // SLOTS_PER_EPOCH()
+        cache = self.node.__dict__.setdefault("_il_state_cache", {})
+        key = (bytes(dependent_root), epoch)
+        if key in cache:
+            return cache[key]
+        state = self._load_state_for_committee(dependent_root, slot)
+        cache[key] = state
+        while len(cache) > 4:
+            cache.pop(next(iter(cache)))
+        return state
+
+    def _load_state_for_committee(self, dependent_root: bytes, slot: int):
         epoch = slot // SLOTS_PER_EPOCH()
         state = None
         fc_store = getattr(self.node, "fc_store", None)

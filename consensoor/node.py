@@ -320,6 +320,7 @@ class BeaconNode:
         await self._prepare_initial_payload()
 
         self._slot_ticker_task = asyncio.create_task(self._slot_ticker())
+        self._il_refresh_task = asyncio.create_task(self._inclusion_list_refresh_loop())
         self._block_sync_task = asyncio.create_task(self._block_sync_loop())
 
         logger.info(f"Beacon node started at slot {self.head_slot}")
@@ -329,6 +330,8 @@ class BeaconNode:
         logger.info("Stopping beacon node")
         self._running = False
 
+        if getattr(self, "_il_refresh_task", None):
+            self._il_refresh_task.cancel()
         if self._slot_ticker_task:
             self._slot_ticker_task.cancel()
             try:
@@ -1916,12 +1919,6 @@ class BeaconNode:
                 ):
                     last_ptc_slot = current_slot
                     await self._produce_payload_attestations(current_slot)
-                    # Heze: the next slot's payload was requested at slot
-                    # start, before this slot's inclusion lists existed. Past
-                    # INCLUSION_LIST_DUE (PTC due > IL due) re-issue the fcU
-                    # so the EL builds with this slot's IL transactions.
-                    if heze_active:
-                        asyncio.create_task(self._refresh_payload_with_inclusion_lists(current_slot))
 
                 # Calculate sleep time - wake up for next event
                 attested_this_slot = current_slot == last_attestation_slot
@@ -5492,6 +5489,42 @@ class BeaconNode:
                 self.focil.prune(slot)
             except Exception:
                 pass
+
+    async def _inclusion_list_refresh_loop(self) -> None:
+        """Heze: the next slot's payload is requested at slot start, before
+        that slot's inclusion lists exist. Just past INCLUSION_LIST_DUE the
+        fcU is re-issued with the IL transactions, leaving the EL the rest of
+        the slot to rebuild. Runs on its own so attestation/PTC work in the
+        slot ticker can't delay it."""
+        config = get_config()
+        # A little past the deadline so ILs gossiped right at it are in.
+        margin_bps = 300
+        last_slot = -1
+        while self._running:
+            try:
+                if not self._genesis_time:
+                    await asyncio.sleep(1)
+                    continue
+                now = time.time()
+                slot = self._wall_slot(now)
+                epoch = slot // SLOTS_PER_EPOCH()
+                offset = config.get_slot_component_duration_ms(
+                    int(config.inclusion_list_due_bps) + margin_bps, slot
+                ) / 1000.0
+                fire_at = self._slot_start_time(slot) + offset
+                if slot > last_slot and now >= fire_at:
+                    last_slot = slot
+                    if config.is_heze_active(epoch) or config.is_heze_active((slot + 1) // SLOTS_PER_EPOCH()):
+                        asyncio.create_task(self._refresh_payload_with_inclusion_lists(slot))
+                    fire_at = self._slot_start_time(slot + 1) + offset
+                elif slot <= last_slot:
+                    fire_at = self._slot_start_time(slot + 1) + offset
+                await asyncio.sleep(max(0.02, fire_at - time.time()))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning(f"[IL] refresh loop error: {e!r}")
+                await asyncio.sleep(1)
 
     async def _refresh_payload_with_inclusion_lists(self, slot: int) -> None:
         try:
