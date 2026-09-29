@@ -25,17 +25,12 @@ if TYPE_CHECKING:
     from ....types.gloas import BeaconState, PayloadAttestation
 
 
-def process_execution_payload_bid(state: "BeaconState", signed_bid) -> int:
+def process_execution_payload_bid(state: "BeaconState", signed_bid) -> None:
     """Process an execution payload bid (ePBS).
 
     Args:
         state: Beacon state (modified in place)
         signed_bid: Signed execution payload bid
-
-    Returns:
-        The parent block's slot, read from the bid in the state before it is
-        overwritten by the new bid. Later given to process_attestation to
-        look up the payload availability of the attested block.
 
     Raises:
         AssertionError: If validation fails
@@ -105,12 +100,7 @@ def process_execution_payload_bid(state: "BeaconState", signed_bid) -> int:
             SLOTS_PER_EPOCH() + int(bid.slot) % SLOTS_PER_EPOCH()
         ] = pending_payment
 
-    # Cache the parent block's slot before overwriting the bid
-    parent_slot = int(state.latest_execution_payload_bid.slot)
-
     state.latest_execution_payload_bid = bid
-
-    return parent_slot
 
 
 def settle_builder_payment(state: "BeaconState", payment_index: int) -> None:
@@ -144,7 +134,8 @@ def apply_parent_execution_payload(state: "BeaconState", requests) -> None:
     from .builder_request import process_builder_deposit_request, process_builder_exit_request
 
     parent_bid = state.latest_execution_payload_bid
-    parent_slot = int(parent_bid.slot)
+    # [Modified in Gloas] parent slot from the header, not the bid (specs #5554)
+    parent_slot = int(state.latest_block_header.slot)
     parent_epoch = compute_epoch_at_slot(parent_slot)
 
     # [Modified in alpha.13] MAX_DEPOSIT_REQUESTS_PER_PAYLOAD removed in Gloas (specs #5436)
@@ -196,7 +187,6 @@ def process_parent_execution_payload(state: "BeaconState", block) -> None:
     apply the parent execution_requests.
     """
     from .....crypto import hash_tree_root
-    from ....constants import SLOTS_PER_HISTORICAL_ROOT
     # Gloas ExecutionRequests (adds EIP-8282 builder request fields)
     from ....types.gloas import ExecutionRequests
 
@@ -213,15 +203,9 @@ def process_parent_execution_payload(state: "BeaconState", block) -> None:
     assert hash_tree_root(requests) == bytes(parent_bid.execution_requests_root), (
         "execution_requests_root mismatch"
     )
+    # apply_parent_execution_payload also marks the parent payload available
+    # and latches latest_block_hash
     apply_parent_execution_payload(state, requests)
-
-    # Mark parent slot's payload as available + latch the parent's
-    # block_hash as our `latest_block_hash`. These were what the envelope
-    # handler used to do; we move them here so state matches lighthouse's
-    # "envelope = pure verification" semantics.
-    parent_slot = int(parent_bid.slot)
-    state.execution_payload_availability[parent_slot % SLOTS_PER_HISTORICAL_ROOT()] = 0b1
-    state.latest_block_hash = parent_bid.block_hash
 
 
 def process_payload_attestation(state: "BeaconState", payload_attestation: "PayloadAttestation") -> None:

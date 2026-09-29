@@ -372,12 +372,14 @@ def process_block(state: "BeaconState", block: "BeaconBlock") -> None:
         # process_parent_execution_payload -> process_block_header -> process_withdrawals
         # -> process_execution_payload_bid -> process_randao -> process_eth1_data
         # -> process_operations -> process_sync_aggregate
+        # [Modified in Gloas] parent slot read from the header before
+        # process_block_header overwrites it (specs #5554); process_attestation
+        # needs it for payload availability lookups (specs #5473)
+        parent_slot = int(state.latest_block_header.slot)
         process_parent_execution_payload(state, block)
         process_block_header(state, block)
         process_withdrawals(state)
-        # [Modified in alpha.13] bid returns the parent block's slot, which
-        # process_attestation needs for payload availability lookups (specs #5473)
-        parent_slot = process_execution_payload_bid(state, block.body.signed_execution_payload_bid)
+        process_execution_payload_bid(state, block.body.signed_execution_payload_bid)
         process_randao(state, block.body)
         process_eth1_data(state, block.body)
         process_operations(state, block.body, is_gloas=True, parent_slot=parent_slot)
