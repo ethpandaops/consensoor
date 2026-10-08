@@ -1017,13 +1017,15 @@ class BeaconNode:
             logger.debug(f"fork-choice store payload catch-up failed: {e!r}")
 
     def _fc_on_envelope(self, signed_envelope) -> None:
-        if self.fc_store is None:
-            return
-        try:
-            from .spec import fork_choice as fc
-            fc.on_execution_payload_envelope_trusted(self.fc_store, signed_envelope)
-        except Exception as e:
-            logger.debug(f"fork-choice store envelope failed: {e}")
+        if self.fc_store is not None:
+            try:
+                from .spec import fork_choice as fc
+                fc.on_execution_payload_envelope_trusted(self.fc_store, signed_envelope)
+            except Exception as e:
+                logger.debug(f"fork-choice store envelope failed: {e}")
+                return
+        if self.beacon_api:
+            self.beacon_api.emit_execution_payload(signed_envelope, gossip=False)
 
     def _fc_on_attestation(self, attestation) -> None:
         if self.fc_store is None:
@@ -1094,7 +1096,7 @@ class BeaconNode:
             )
             if self.beacon_api and confirmed_slot is not None:
                 try:
-                    await self.beacon_api.emit_fast_confirmation(confirmed_slot, self.confirmed_root)
+                    await self.beacon_api.emit_fast_confirmation(confirmed_slot, self.confirmed_root, slot)
                 except Exception as e:
                     logger.debug(f"emit_fast_confirmation failed: {e}")
             if slot % SLOTS_PER_EPOCH() == 0:
@@ -1670,6 +1672,7 @@ class BeaconNode:
             )
 
             self.beacon_gossip.update_fork_digest(new_digest)
+            self._push_status_snapshot()
         except Exception as e:
             logger.error(f"Failed to update fork_digest for epoch {epoch}: {e}")
 
@@ -1840,6 +1843,7 @@ class BeaconNode:
         last_attestation_slot = -1
         last_ptc_slot = -1
         last_sync_committee_slot = -1
+        last_contribution_slot = -1
         last_il_slot = -1
 
         while self._running:
@@ -1857,6 +1861,7 @@ class BeaconNode:
                 # Get attestation timing based on active fork (Gloas has different timing)
                 attestation_offset = network_config.get_attestation_due_offset(current_epoch)
                 ptc_offset = network_config.get_payload_attestation_due_offset(current_epoch)
+                aggregate_offset = network_config.get_aggregate_due_offset(current_epoch)
                 gloas_active = network_config.is_gloas_active(current_epoch)
                 heze_active = network_config.is_heze_active(current_epoch)
 
@@ -1908,6 +1913,11 @@ class BeaconNode:
                     last_sync_committee_slot = current_slot
                     await self._produce_sync_committee_messages(current_slot)
 
+                if current_slot > last_contribution_slot and time_into_slot >= aggregate_offset:
+                    last_contribution_slot = current_slot
+                    asyncio.create_task(
+                        self._broadcast_sync_committee_contributions(current_slot, self.state)
+                    )
 
                 # Phase 3: PTC due time (Gloas) - produce payload attestations
                 # Vote on whether slot M's execution payload was revealed in
@@ -1921,21 +1931,15 @@ class BeaconNode:
                     await self._produce_payload_attestations(current_slot)
 
                 # Calculate sleep time - wake up for next event
-                attested_this_slot = current_slot == last_attestation_slot
-                ptc_done_this_slot = (not gloas_active) or current_slot == last_ptc_slot
-
-                if attested_this_slot and ptc_done_this_slot:
-                    # All slot duties done, sleep until next slot
-                    next_slot_time = self._slot_start_time(current_slot + 1)
-                    sleep_time = max(0.05, next_slot_time - time.time())
-                elif not attested_this_slot:
-                    # Next wakeup: attestation due time
-                    attestation_time = slot_start_time + attestation_offset
-                    sleep_time = max(0.05, attestation_time - time.time())
-                else:
-                    # Next wakeup: PTC due time
-                    ptc_time = slot_start_time + ptc_offset
-                    sleep_time = max(0.05, ptc_time - time.time())
+                pending = []
+                if current_slot != last_attestation_slot:
+                    pending.append(slot_start_time + attestation_offset)
+                if current_slot != last_contribution_slot:
+                    pending.append(slot_start_time + aggregate_offset)
+                if gloas_active and current_slot != last_ptc_slot:
+                    pending.append(slot_start_time + ptc_offset)
+                next_event = min(pending) if pending else self._slot_start_time(current_slot + 1)
+                sleep_time = max(0.05, next_event - time.time())
 
                 await asyncio.sleep(sleep_time)
             except asyncio.CancelledError:
@@ -1984,12 +1988,6 @@ class BeaconNode:
 
         # Propose block — now has up-to-date state with correct RANDAO
         await self._maybe_propose_block(slot)
-
-        # Yield to event loop so gossipsub blocks can be processed
-        await asyncio.sleep(0)
-
-        # Broadcast sync committee contributions (BLS-heavy, deferred until after block proposal)
-        await self._broadcast_sync_committee_contributions(slot, self.state)
 
         # Yield to event loop so gossipsub blocks can be processed
         await asyncio.sleep(0)
@@ -2066,18 +2064,25 @@ class BeaconNode:
                 "withdrawals": spec_withdrawals,
                 "parent_beacon_block_root": "0x" + (self.head_root or b"\x00" * 32).hex(),
             }
+            gloas_hashes = {}
             if is_gloas:
+                payload_attributes["slot_number"] = str(int(proposal_slot))
                 payload_attributes["target_gas_limit"] = str(
                     self._target_gas_limit_for_slot(proposal_slot)
                 )
+                gloas_hashes = {
+                    "safe_block_hash": self._safe_block_hash(parent_block_hash),
+                    "finalized_block_hash": self._resolve_finalized_block_hash() or b"\x00" * 32,
+                }
 
             await self.beacon_api.emit_payload_attributes(
                 proposal_slot=int(proposal_slot),
                 proposer_index=proposer_index,
                 parent_block_root=self.head_root or b"\x00" * 32,
                 parent_block_hash=parent_block_hash,
-                version="gloas" if is_gloas else "electra",
+                version=network_config.fork_name_at_slot(int(proposal_slot)),
                 payload_attributes=payload_attributes,
+                **gloas_hashes,
             )
         except Exception as e:
             logger.error(
@@ -2663,6 +2668,8 @@ class BeaconNode:
             try:
                 self.payload_attestation_pool.add_message(msg, ptc)
                 self._fc_on_payload_attestation(msg)
+                if self.beacon_api:
+                    self.beacon_api.emit_payload_attestation_message(msg)
             except Exception as e:
                 logger.warning(f"PTC self-feed failed for vi={validator_index}: {e}")
 
@@ -2807,7 +2814,7 @@ class BeaconNode:
             SyncAggregatorSelectionData,
         )
         from .spec.types.base import Bitvector, BLSSignature, uint64
-        from .spec.state_transition.helpers.domain import get_domain, compute_signing_root
+        from .spec.state_transition.helpers.domain import get_domain, get_domain_at_epoch, compute_signing_root
         from .crypto import sign_async as bls_sign_async, sha256
 
         sync_committee_size = SYNC_COMMITTEE_SIZE()
@@ -2823,6 +2830,7 @@ class BeaconNode:
 
             subcommittee_messages = []
             aggregator_key = None
+            beacon_block_root = None
 
             for position, pooled in messages.items():
                 if base_position <= position < base_position + subcommittee_size:
@@ -2831,6 +2839,7 @@ class BeaconNode:
                         for pubkey, key in self.validator_client.keys.items():
                             if key.validator_index == pooled.message.validator_index:
                                 aggregator_key = key
+                                beacon_block_root = bytes(pooled.message.beacon_block_root)
                                 break
 
             if not subcommittee_messages or not aggregator_key:
@@ -2838,13 +2847,12 @@ class BeaconNode:
 
             agg_bits = Bitvector[subcommittee_size]()
             signatures = []
-            beacon_block_root = None
 
             for bit_pos, pooled in subcommittee_messages:
+                if bytes(pooled.message.beacon_block_root) != beacon_block_root:
+                    continue
                 agg_bits[bit_pos] = True
                 signatures.append(bytes(pooled.message.signature))
-                if beacon_block_root is None:
-                    beacon_block_root = pooled.message.beacon_block_root
 
             if not signatures:
                 continue
@@ -2872,7 +2880,7 @@ class BeaconNode:
                 slot=slot,
                 subcommittee_index=uint64(subcommittee_index),
             )
-            selection_domain = get_domain(state, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, epoch)
+            selection_domain = get_domain_at_epoch(state, DOMAIN_SYNC_COMMITTEE_SELECTION_PROOF, epoch)
             selection_root = compute_signing_root(selection_data, selection_domain)
             selection_proof = await bls_sign_async(aggregator_key.privkey, selection_root)
 
@@ -2894,7 +2902,7 @@ class BeaconNode:
                 selection_proof=BLSSignature(selection_proof),
             )
 
-            contrib_domain = get_domain(state, DOMAIN_CONTRIBUTION_AND_PROOF, epoch)
+            contrib_domain = get_domain_at_epoch(state, DOMAIN_CONTRIBUTION_AND_PROOF, epoch)
             contrib_root = compute_signing_root(contribution_and_proof, contrib_domain)
             contrib_signature = await bls_sign_async(aggregator_key.privkey, contrib_root)
 
@@ -2948,7 +2956,7 @@ class BeaconNode:
             DOMAIN_SELECTION_PROOF, DOMAIN_AGGREGATE_AND_PROOF,
             TARGET_AGGREGATORS_PER_COMMITTEE,
         )
-        from .spec.state_transition.helpers.domain import get_domain, compute_signing_root
+        from .spec.state_transition.helpers.domain import get_domain_at_epoch, compute_signing_root
         from .spec.state_transition.helpers.beacon_committee import (
             get_beacon_committee,
         )
@@ -2963,7 +2971,7 @@ class BeaconNode:
         epoch = slot // SLOTS_PER_EPOCH()
 
         # Selection proof = BLS sign over Slot(slot) with DOMAIN_SELECTION_PROOF.
-        domain = get_domain(self.state, DOMAIN_SELECTION_PROOF, epoch)
+        domain = get_domain_at_epoch(self.state, DOMAIN_SELECTION_PROOF, epoch)
         signing_root = compute_signing_root(Slot(slot), domain)
         selection_proof = await sign_async(key.privkey, signing_root)
 
@@ -3010,7 +3018,7 @@ class BeaconNode:
             )
 
         # Sign the aggregate and proof
-        domain = get_domain(self.state, DOMAIN_AGGREGATE_AND_PROOF, epoch)
+        domain = get_domain_at_epoch(self.state, DOMAIN_AGGREGATE_AND_PROOF, epoch)
         signing_root = compute_signing_root(aggregate_and_proof, domain)
         signature = await sign_async(key.privkey, signing_root)
 
@@ -3055,47 +3063,15 @@ class BeaconNode:
             execution_requests: List of execution requests
             blobs_bundle: Optional blobs bundle from EL
         """
-        from .spec.types.gloas import (
-            ExecutionPayloadEnvelope,
-            SignedExecutionPayloadEnvelope,
-        )
-        from .spec.types import BLSSignature, Root, KZGCommitment
-        from .spec.types.base import List
-        from .spec.constants import BUILDER_INDEX_SELF_BUILD
-        # MAX_BLOB_COMMITMENTS_PER_BLOCK is 4096
-        MAX_BLOB_COMMITMENTS = 4096
+        from .spec.types.gloas import SignedExecutionPayloadEnvelope
+        from .spec.types import BLSSignature
 
-        # Build the execution payload using the same logic as block builder
-        execution_payload = self.block_builder._build_execution_payload(
-            execution_payload_dict, "gloas"
-        )
-
-        # Build execution requests. Use the block builder's decoder so the
-        # envelope carries the Gloas ExecutionRequests (EIP-8282 builder
-        # fields) and its root matches bid.execution_requests_root.
-        exec_requests_obj = self.block_builder._decode_execution_requests_hex(
-            execution_requests, gloas=True
-        )
-
-        # Get KZG commitments from blobs bundle
-        kzg_commitments = List[KZGCommitment, MAX_BLOB_COMMITMENTS]()
-        if blobs_bundle:
-            commitments = blobs_bundle.get("commitments", [])
-            for commitment_hex in commitments:
-                commitment_bytes = bytes.fromhex(commitment_hex.replace("0x", ""))
-                kzg_commitments.append(KZGCommitment(commitment_bytes))
-
-        # alpha-7 ExecutionPayloadEnvelope: payload, execution_requests,
-        # builder_index, beacon_block_root, parent_beacon_block_root.
-        # No `slot` / `state_root` — those are dev-spec only.
         parent_beacon_block_root = bytes(self.state.latest_block_header.parent_root)
-        envelope = ExecutionPayloadEnvelope(
-            payload=execution_payload,
-            execution_requests=exec_requests_obj,
-            builder_index=BUILDER_INDEX_SELF_BUILD,
-            beacon_block_root=Root(beacon_block_root),
-            parent_beacon_block_root=Root(parent_beacon_block_root),
+        envelope = self._build_execution_payload_envelope(
+            beacon_block_root, parent_beacon_block_root, execution_payload_dict, execution_requests
         )
+        execution_payload = envelope.payload
+        kzg_commitments = (blobs_bundle or {}).get("commitments", [])
 
         # Sign envelope with proposer key (self-build mode: builder_index ==
         # SELF_BUILD, so verify_execution_payload_envelope_signature uses
@@ -3133,21 +3109,160 @@ class BeaconNode:
 
         # PeerDAS: the builder (us, self-build) publishes the data column
         # sidecars of its payload right after the envelope.
+        await self._publish_payload_data_columns(beacon_block_root, slot, blobs_bundle)
+
+    async def _publish_payload_data_columns(
+        self, beacon_block_root: bytes, slot: int, blobs_bundle: dict | None
+    ) -> None:
         das = getattr(self, "das", None)
-        if das is not None and blobs_bundle and blobs_bundle.get("blobs"):
-            try:
-                sidecars = await asyncio.get_running_loop().run_in_executor(
-                    None, das.build_sidecars, bytes(beacon_block_root), int(slot), blobs_bundle
+        if das is None or not self.beacon_gossip or not blobs_bundle or not blobs_bundle.get("blobs"):
+            return
+        try:
+            sidecars = await asyncio.get_running_loop().run_in_executor(
+                None, das.build_sidecars, bytes(beacon_block_root), int(slot), blobs_bundle
+            )
+            das.store_sidecars(sidecars)
+            from .das import compute_subnet_for_data_column_sidecar
+            for sc in sidecars:
+                await self.beacon_gossip.publish_data_column_sidecar(
+                    compute_subnet_for_data_column_sidecar(int(sc.index)), sc.encode_bytes()
                 )
-                das.store_sidecars(sidecars)
-                from .das import compute_subnet_for_data_column_sidecar
-                for sc in sidecars:
-                    await self.beacon_gossip.publish_data_column_sidecar(
-                        compute_subnet_for_data_column_sidecar(int(sc.index)), sc.encode_bytes()
-                    )
-                logger.info(f"Published {len(sidecars)} data column sidecars for slot {slot}")
-            except Exception as e:
-                logger.error(f"Failed to build/publish data column sidecars for slot {slot}: {e}")
+            logger.info(f"Published {len(sidecars)} data column sidecars for slot {slot}")
+        except Exception as e:
+            logger.error(f"Failed to build/publish data column sidecars for slot {slot}: {e}")
+
+    def _build_execution_payload_envelope(
+        self,
+        beacon_block_root: bytes,
+        parent_beacon_block_root: bytes,
+        execution_payload_dict: dict,
+        execution_requests: list,
+    ):
+        """Unsigned self-build ExecutionPayloadEnvelope for an EL payload."""
+        from .spec.types.gloas import ExecutionPayloadEnvelope
+        from .spec.types import Root
+        from .spec.constants import BUILDER_INDEX_SELF_BUILD
+
+        execution_payload = self.block_builder._build_execution_payload(
+            execution_payload_dict, "gloas"
+        )
+        # The block builder's decoder yields the Gloas ExecutionRequests
+        # (EIP-8282 builder fields) so the root matches bid.execution_requests_root.
+        exec_requests_obj = self.block_builder._decode_execution_requests_hex(
+            execution_requests, gloas=True
+        )
+        return ExecutionPayloadEnvelope(
+            payload=execution_payload,
+            execution_requests=exec_requests_obj,
+            builder_index=BUILDER_INDEX_SELF_BUILD,
+            beacon_block_root=Root(beacon_block_root),
+            parent_beacon_block_root=Root(parent_beacon_block_root),
+        )
+
+    async def produce_block_for_api(
+        self, slot: int, randao_reveal: bytes, graffiti: Optional[bytes] = None
+    ) -> dict:
+        """Build an unsigned self-built Gloas block for a beacon-API validator
+        client (POST /eth/v4/validator/blocks/{slot}). The payload envelope and
+        blobs are cached for the envelope fetch/publish endpoints."""
+        if not self.engine or not self.block_builder or self.state is None:
+            raise RuntimeError("node cannot produce blocks (no engine/state)")
+        if int(slot) <= int(self.head_slot):
+            raise ValueError(f"slot {slot} is not after head slot {self.head_slot}")
+        epoch = int(slot) // SLOTS_PER_EPOCH()
+        state_epoch = int(self.state.slot) // SLOTS_PER_EPOCH()
+        if not hasattr(self.state, "proposer_lookahead") or not 0 <= epoch - state_epoch <= MIN_SEED_LOOKAHEAD:
+            raise ValueError(f"slot {slot} is outside the proposer lookahead of the head state")
+        proposer_index = int(
+            self.state.proposer_lookahead[(epoch - state_epoch) * SLOTS_PER_EPOCH() + int(slot) % SLOTS_PER_EPOCH()]
+        )
+
+        head_root = self._state_head_root(self.state)
+        prep = None
+        for _ in range(5):
+            prep = await self._prepared_payload_for_slot(slot)
+            if prep is not None and prep[1] == head_root:
+                break
+            self._prepared_payloads.pop(int(slot), None)
+            prep = None
+            await asyncio.sleep(0.3)
+        if prep is None:
+            raise RuntimeError("failed to get a payload on the current head from the execution client")
+        payload_id, payload_beacon_root = prep
+        payload_response = await self.engine.get_payload(payload_id, timestamp=self._slot_timestamp(slot))
+        execution_payload_dict = payload_response.execution_payload
+        el_execution_requests = payload_response.execution_requests or []
+        block = await self.block_builder.build_block(
+            slot, None, execution_payload_dict,
+            blobs_bundle=payload_response.blobs_bundle,
+            execution_requests=el_execution_requests,
+            execution_head_hash=(
+                bytes.fromhex(execution_payload_dict["parentHash"][2:])
+                if execution_payload_dict.get("parentHash") else None
+            ),
+            randao_reveal=randao_reveal,
+            proposer_index=proposer_index,
+            graffiti=graffiti,
+        )
+        if block is None:
+            raise ValueError("block production failed (invalid randao_reveal or state transition error)")
+        if not hasattr(block.body, "signed_execution_payload_bid"):
+            raise ValueError("block production via /eth/v4 is only available from Gloas")
+
+        block_root = hash_tree_root(block)
+        envelope = self._build_execution_payload_envelope(
+            block_root, bytes(block.parent_root), execution_payload_dict, el_execution_requests
+        )
+        blobs_bundle = payload_response.blobs_bundle or {}
+        self._api_produced_payloads = {
+            k: v for k, v in getattr(self, "_api_produced_payloads", {}).items() if k[0] + 2 >= int(slot)
+        }
+        self._api_produced_payloads[(int(slot), bytes(block_root))] = {
+            "envelope": envelope,
+            "blobs_bundle": blobs_bundle,
+        }
+        return {
+            "block": block,
+            "envelope": envelope,
+            "blobs_bundle": blobs_bundle,
+            "execution_payload_value": int(payload_response.block_value or 0),
+        }
+
+    def api_produced_payload(self, slot: int, beacon_block_root: bytes) -> Optional[dict]:
+        return getattr(self, "_api_produced_payloads", {}).get((int(slot), bytes(beacon_block_root)))
+
+    async def _prepared_payload_for_slot(self, slot: int):
+        """(payload_id, parent beacon root) of the EL payload to propose at ``slot``."""
+        current_head_root = (
+            self._state_head_root(self.state) if self.state is not None else b"\x00" * 32
+        )
+        prep = self._prepared_payloads.get(int(slot))
+        prep_is_valid = prep is not None and prep[1] == current_head_root
+        if prep_is_valid:
+            logger.info(
+                f"Reusing prepared payload_id for slot {slot}: "
+                f"{prep[0].hex()}"
+            )
+        else:
+            logger.info(
+                f"Requesting fresh payload for slot {slot} "
+                f"(prep_slot={self._current_payload_slot}, "
+                f"prep_head={self._current_payload_beacon_root.hex()[:16] if self._current_payload_beacon_root else 'None'}, "
+                f"head={current_head_root.hex()[:16]})"
+            )
+            await self._request_payload_for_slot(slot)
+            prep = self._prepared_payloads.get(int(slot))
+            # Safety net for the case where head-adoption re-prep
+            # (in _on_p2p_block) didn't fire in time and we still
+            # ended up issuing fcU{payload_attributes} at slot start.
+            # Geth typically needs ~500ms to seal txs into a payload
+            # after fcU; calling getPayload in the same tick yields
+            # tx_count=0. Sleep keeps the proposal honest at the
+            # cost of being ~500ms later than the slot start. The
+            # `else` branch handles the rare case — the warm path
+            # (prep_is_valid=True) skips this entirely.
+            await asyncio.sleep(0.5)
+        return prep
 
     async def _produce_and_broadcast_block(self, slot: int, proposer_key) -> None:
         """Produce and broadcast a block for the given slot."""
@@ -3182,35 +3297,7 @@ class BeaconNode:
             # then (e.g. a reorg made the prep extend a stale parent).
             # The block is built on self.state, so compare against its root
             # (self.head_root can lag self.state during an import).
-            current_head_root = (
-                self._state_head_root(self.state) if self.state is not None else b"\x00" * 32
-            )
-            prep = self._prepared_payloads.get(int(slot))
-            prep_is_valid = prep is not None and prep[1] == current_head_root
-            if prep_is_valid:
-                logger.info(
-                    f"Reusing prepared payload_id for slot {slot}: "
-                    f"{prep[0].hex()}"
-                )
-            else:
-                logger.info(
-                    f"Requesting fresh payload for slot {slot} "
-                    f"(prep_slot={self._current_payload_slot}, "
-                    f"prep_head={self._current_payload_beacon_root.hex()[:16] if self._current_payload_beacon_root else 'None'}, "
-                    f"head={current_head_root.hex()[:16]})"
-                )
-                await self._request_payload_for_slot(slot)
-                prep = self._prepared_payloads.get(int(slot))
-                # Safety net for the case where head-adoption re-prep
-                # (in _on_p2p_block) didn't fire in time and we still
-                # ended up issuing fcU{payload_attributes} at slot start.
-                # Geth typically needs ~500ms to seal txs into a payload
-                # after fcU; calling getPayload in the same tick yields
-                # tx_count=0. Sleep keeps the proposal honest at the
-                # cost of being ~500ms later than the slot start. The
-                # `else` branch handles the rare case — the warm path
-                # (prep_is_valid=True) skips this entirely.
-                await asyncio.sleep(0.5)
+            prep = await self._prepared_payload_for_slot(slot)
             if prep is None:
                 logger.error("Cannot produce block: failed to get payload_id")
                 return
@@ -4197,6 +4284,8 @@ class BeaconNode:
             payload_root = hash_tree_root(envelope)
             self.store.save_payload(payload_root, signed_envelope)
             self.store.save_payload(beacon_block_root, signed_envelope)
+            if self.beacon_api:
+                self.beacon_api.emit_execution_payload(signed_envelope, gossip=True)
 
             # Only hand the payload to the EL once we know its block: the
             # blob versioned hashes come from the block's bid, and without
@@ -4230,8 +4319,12 @@ class BeaconNode:
             msg = PayloadAttestationMessage.decode_bytes(data)
             slot = int(msg.data.slot)
             ptc = list(get_ptc(self.state, slot))
+            if int(msg.validator_index) not in ptc:
+                return
             self.payload_attestation_pool.add_message(msg, ptc)
             self._fc_on_payload_attestation(msg)
+            if self.beacon_api:
+                self.beacon_api.emit_payload_attestation_message(msg)
             # Drop messages older than current_epoch's start.
             current_slot = int(self.state.slot)
             from .spec.constants import SLOTS_PER_EPOCH

@@ -57,7 +57,15 @@ class PayloadAttestationPool:
         self._messages.setdefault(data_root, []).append((ptc_index, bytes(msg.signature)))
         self._data.setdefault(data_root, msg.data)
 
-    def get_aggregates_for_slot(self, parent_slot: int) -> list[PayloadAttestation]:
+    def get_aggregates(self, slot: int | None = None) -> list[PayloadAttestation]:
+        """All pooled aggregates, optionally only those for ``slot``."""
+        slots = {int(d.slot) for d in self._data.values()} if slot is None else {int(slot)}
+        aggregates: list[PayloadAttestation] = []
+        for s in sorted(slots):
+            aggregates.extend(self.get_aggregates_for_slot(s, limit=None))
+        return aggregates
+
+    def get_aggregates_for_slot(self, parent_slot: int, limit: int | None = MAX_PAYLOAD_ATTESTATIONS) -> list[PayloadAttestation]:
         """Return aggregated PayloadAttestations for messages that vote on
         the parent slot's payload. Capped at MAX_PAYLOAD_ATTESTATIONS.
 
@@ -95,7 +103,7 @@ class PayloadAttestationPool:
                     signature=BLSSignature(aggregated_sig),
                 )
             )
-            if len(aggregates) >= MAX_PAYLOAD_ATTESTATIONS:
+            if limit is not None and len(aggregates) >= limit:
                 break
         return aggregates
 

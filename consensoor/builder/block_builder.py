@@ -99,6 +99,12 @@ class BlockBuilder:
 
     def __init__(self, node: "BeaconNode"):
         self.node = node
+        self._graffiti: bytes | None = None
+
+    def _block_graffiti(self) -> bytes:
+        if self._graffiti is not None:
+            return self._graffiti
+        return self.node.config.graffiti_bytes
 
     def _get_fork_for_slot(self, slot: int) -> str:
         """Determine which fork is active for a given slot."""
@@ -125,8 +131,12 @@ class BlockBuilder:
         blobs_bundle: dict | None = None,
         execution_requests: list | None = None,
         execution_head_hash: bytes | None = None,
+        randao_reveal: bytes | None = None,
+        proposer_index: int | None = None,
+        graffiti: bytes | None = None,
     ) -> Optional[AnySignedBeaconBlock]:
-        """Build a complete signed beacon block."""
+        """Build a complete signed beacon block, or an unsigned BeaconBlock
+        when ``proposer_key`` is None (beacon-API block production)."""
         import time as time_mod
         from ..spec.state_transition import process_slots, process_block
 
@@ -137,7 +147,8 @@ class BlockBuilder:
             logger.error("Cannot build block: no state")
             return None
 
-        proposer_index = proposer_key.validator_index
+        if proposer_key is not None:
+            proposer_index = proposer_key.validator_index
         if proposer_index is None:
             logger.error("Cannot build block: proposer has no validator index")
             return None
@@ -176,7 +187,11 @@ class BlockBuilder:
         # Use temp_state (which may be upgraded) for RANDAO and body construction
         # This ensures correct fork version is used for domain computation
         t0 = time_mod.time()
-        randao_reveal = self._compute_randao_reveal(temp_state, slot, proposer_key)
+        if randao_reveal is None:
+            randao_reveal = self._compute_randao_reveal(temp_state, slot, proposer_key)
+        else:
+            randao_reveal = BLSSignature(randao_reveal)
+        self._graffiti = graffiti
         t1 = time_mod.time()
         logger.debug(f"RANDAO reveal took {(t1-t0)*1000:.1f}ms")
 
@@ -328,8 +343,11 @@ class BlockBuilder:
 
         # Rebuild block with correct state_root
         block = self._create_block(slot, proposer_index, parent_root, state_root, body, fork)
+        if proposer_key is None:
+            return block
 
-        domain = get_domain(state, DOMAIN_BEACON_PROPOSER, slot // SLOTS_PER_EPOCH())
+        from ..spec.state_transition.helpers.domain import get_domain_at_epoch
+        domain = get_domain_at_epoch(state, DOMAIN_BEACON_PROPOSER, slot // SLOTS_PER_EPOCH())
         signing_root = compute_signing_root(block, domain)
         signature = sign(proposer_key.privkey, signing_root)
 
@@ -574,7 +592,7 @@ class BlockBuilder:
         base_fields = {
             "randao_reveal": randao_reveal,
             "eth1_data": state.eth1_data,
-            "graffiti": Bytes32(self.node.config.graffiti_bytes),
+            "graffiti": Bytes32(self._block_graffiti()),
             "proposer_slashings": [],
             "attester_slashings": [],
             "attestations": attestations or [],
@@ -955,7 +973,7 @@ class BlockBuilder:
         return body_cls(
             randao_reveal=randao_reveal,
             eth1_data=state.eth1_data,
-            graffiti=Bytes32(self.node.config.graffiti_bytes),
+            graffiti=Bytes32(self._block_graffiti()),
             proposer_slashings=[],
             attester_slashings=[],
             attestations=gloas_attestations,
