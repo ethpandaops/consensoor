@@ -69,6 +69,18 @@ def compute_domain(
     return domain_type + fork_data_root[:28]
 
 
+def get_domain_at_epoch(state: "BeaconState", domain_type: bytes, epoch: int) -> bytes:
+    """Domain for signing a message of ``epoch`` from the fork schedule,
+    independent of how far ``state`` has been advanced."""
+    from ...network_config import get_config
+
+    return compute_domain(
+        domain_type,
+        get_config().get_fork_version(int(epoch)),
+        bytes(state.genesis_validators_root),
+    )
+
+
 def compute_signing_root(ssz_object: Any, domain: bytes) -> bytes:
     """Return the signing root for an object and domain.
 

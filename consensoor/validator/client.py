@@ -19,7 +19,7 @@ from ..spec.state_transition.helpers.accessors import (
     get_block_root_at_slot,
 )
 from ..spec.state_transition.helpers.misc import compute_epoch_at_slot
-from ..spec.state_transition.helpers.domain import get_domain, compute_signing_root
+from ..spec.state_transition.helpers.domain import get_domain_at_epoch, compute_signing_root
 from ..spec.types import AttestationData
 from ..spec.types.phase0 import Phase0Attestation
 from ..spec.types.electra import Attestation as ElectraAttestation
@@ -238,7 +238,7 @@ class ValidatorClient:
                 logger.error(f"No key found for pubkey {duty.pubkey.hex()[:16]}...")
                 return None
 
-            domain = get_domain(state, DOMAIN_BEACON_ATTESTER, epoch)
+            domain = get_domain_at_epoch(state, DOMAIN_BEACON_ATTESTER, epoch)
 
             if self._is_electra_fork(state):
                 # Electra+ attestations use committee_bits
@@ -352,7 +352,7 @@ class ValidatorClient:
             # process_sync_aggregate for the block at slot M+1 verifies with
             # epoch_at_slot(M) — matches when message.slot = M.
             epoch = compute_epoch_at_slot(slot)
-            domain = get_domain(state, DOMAIN_SYNC_COMMITTEE, epoch)
+            domain = get_domain_at_epoch(state, DOMAIN_SYNC_COMMITTEE, epoch)
             signing_root = compute_signing_root(beacon_block_root, domain)
             signature = await bls_sign_async(validator_key.privkey, signing_root)
 
@@ -400,7 +400,7 @@ class ValidatorClient:
                 blob_data_available=blob_data_available,
             )
             epoch = compute_epoch_at_slot(slot)
-            domain = get_domain(state, DOMAIN_PTC_ATTESTER, epoch)
+            domain = get_domain_at_epoch(state, DOMAIN_PTC_ATTESTER, epoch)
             signing_root = compute_signing_root(data, domain)
             signature = await bls_sign_async(validator_key.privkey, signing_root)
 

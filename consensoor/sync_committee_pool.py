@@ -38,7 +38,7 @@ class SyncCommitteePool:
     def __init__(self, max_slots: int = 8):
         self.max_slots = max_slots
         self._messages: dict[int, dict[int, PooledSyncMessage]] = defaultdict(dict)
-        self._contributions: dict[int, dict[int, PooledContribution]] = defaultdict(dict)
+        self._contributions: dict[int, dict[tuple[int, bytes], PooledContribution]] = defaultdict(dict)
 
     def add(
         self, message: SyncCommitteeMessage, committee_position: int
@@ -79,7 +79,8 @@ class SyncCommitteePool:
         slot = int(contribution.slot)
         subcommittee_index = int(contribution.subcommittee_index)
 
-        existing = self._contributions[slot].get(subcommittee_index)
+        key = (subcommittee_index, bytes(contribution.beacon_block_root))
+        existing = self._contributions[slot].get(key)
         if existing:
             try:
                 existing_bits = existing.contribution.aggregation_bits
@@ -125,7 +126,7 @@ class SyncCommitteePool:
                 if new_count <= existing_count:
                     return False
                 # Replace with new contribution
-                self._contributions[slot][subcommittee_index] = PooledContribution(
+                self._contributions[slot][key] = PooledContribution(
                     contribution=contribution,
                     subcommittee_index=subcommittee_index,
                 )
@@ -158,7 +159,7 @@ class SyncCommitteePool:
                     signature=BLSSignature(merged_sig),
                 )
 
-                self._contributions[slot][subcommittee_index] = PooledContribution(
+                self._contributions[slot][key] = PooledContribution(
                     contribution=merged_contribution,
                     subcommittee_index=subcommittee_index,
                 )
@@ -176,13 +177,13 @@ class SyncCommitteePool:
                 existing_count = sum(1 for b in existing_bits if b)
                 new_count = sum(1 for b in new_bits if b)
                 if new_count > existing_count:
-                    self._contributions[slot][subcommittee_index] = PooledContribution(
+                    self._contributions[slot][key] = PooledContribution(
                         contribution=contribution,
                         subcommittee_index=subcommittee_index,
                     )
                 return True
 
-        self._contributions[slot][subcommittee_index] = PooledContribution(
+        self._contributions[slot][key] = PooledContribution(
             contribution=contribution,
             subcommittee_index=subcommittee_index,
         )
@@ -221,10 +222,14 @@ class SyncCommitteePool:
         covered_positions: set[int] = set()
 
         contributions = self._contributions.get(slot, {})
-        for subcommittee_index, pooled in contributions.items():
+        used_subcommittees: set[int] = set()
+        for (subcommittee_index, root), pooled in contributions.items():
             contribution = pooled.contribution
-            if expected_block_root is not None and bytes(contribution.beacon_block_root) != expected_block_root:
+            if expected_block_root is not None and root != expected_block_root:
                 continue
+            if subcommittee_index in used_subcommittees:
+                continue
+            used_subcommittees.add(subcommittee_index)
             base_position = subcommittee_index * subcommittee_size
 
             has_bits = False
