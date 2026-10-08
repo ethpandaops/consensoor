@@ -191,26 +191,25 @@ class Store:
 
     def _get_block_types(self):
         """Get all signed beacon block types for deserialization."""
-        from ..spec.types.fulu import FuluSignedBeaconBlock
         from ..spec.types.gloas import SignedBeaconBlock as GloasSignedBeaconBlock
         from ..spec.types.heze import SignedBeaconBlock as HezeSignedBeaconBlock
-        from ..spec.types.electra import ElectraSignedBeaconBlock
-        from ..spec.types.deneb import DenebSignedBeaconBlock
-        from ..spec.types.capella import CapellaSignedBeaconBlock
-        from ..spec.types.bellatrix import BellatrixSignedBeaconBlock
-        from ..spec.types.altair import AltairSignedBeaconBlock
-        from ..spec.types.phase0 import Phase0SignedBeaconBlock
+        from ..spec.types.electra import SignedElectraBeaconBlock
+        from ..spec.types.deneb import SignedDenebBeaconBlock
+        from ..spec.types.capella import SignedCapellaBeaconBlock
+        from ..spec.types.bellatrix import SignedBellatrixBeaconBlock
+        from ..spec.types.altair import SignedAltairBeaconBlock
+        from ..spec.types.phase0 import SignedPhase0BeaconBlock
 
         return {
-            "fulu": FuluSignedBeaconBlock,
+            "fulu": SignedElectraBeaconBlock,
             "gloas": GloasSignedBeaconBlock,
             "heze": HezeSignedBeaconBlock,
-            "electra": ElectraSignedBeaconBlock,
-            "deneb": DenebSignedBeaconBlock,
-            "capella": CapellaSignedBeaconBlock,
-            "bellatrix": BellatrixSignedBeaconBlock,
-            "altair": AltairSignedBeaconBlock,
-            "phase0": Phase0SignedBeaconBlock,
+            "electra": SignedElectraBeaconBlock,
+            "deneb": SignedDenebBeaconBlock,
+            "capella": SignedCapellaBeaconBlock,
+            "bellatrix": SignedBellatrixBeaconBlock,
+            "altair": SignedAltairBeaconBlock,
+            "phase0": SignedPhase0BeaconBlock,
         }
 
     def _encode_value(self, fork: str, data: bytes) -> bytes:
