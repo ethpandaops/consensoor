@@ -37,8 +37,6 @@ def build_spec_response() -> dict:
         "GLOAS_FORK_EPOCH": str(net_config.gloas_fork_epoch),
         "HEZE_FORK_VERSION": to_hex(net_config.heze_fork_version, 4),
         "HEZE_FORK_EPOCH": str(net_config.heze_fork_epoch),
-        "EIP8198_FORK_VERSION": to_hex(net_config.eip8198_fork_version, 4),
-        "EIP8198_FORK_EPOCH": str(net_config.eip8198_fork_epoch),
         "SLOT_DURATION_MS": str(net_config.slot_duration_ms),
         "SECONDS_PER_SLOT": str(net_config.slot_duration_ms // 1000),
         # Intra-slot timing (basis points of the slot)
@@ -185,8 +183,7 @@ def build_spec_response() -> dict:
         "MAX_REQUEST_INCLUSION_LIST": str(net_config.max_request_inclusion_list),
         "MIN_SLOTS_FOR_INCLUSION_LISTS_REQUESTS": str(net_config.min_slots_for_inclusion_lists_requests),
         "MAX_TRANSACTIONS_BYTES_PER_INCLUSION_LIST": str(net_config.max_transactions_bytes_per_inclusion_list),
-        # EIP-8198
-        "SLOT_DURATION_MS_EIP8198": str(net_config.slot_duration_ms_eip8198),
+        "SLOT_DURATION_MS_HEZE": str(net_config.slot_duration_ms_heze),
         "MIN_BLOB_DATA_RETENTION_MS": str(net_config.min_blob_data_retention_ms),
         # Networking constants
         "MAX_PAYLOAD_SIZE": str(net_config.max_payload_size),

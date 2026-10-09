@@ -110,7 +110,7 @@ def decode_signed_beacon_block(ssz_bytes: bytes) -> AnySignedBeaconBlock:
 
         # Order newest-active-fork first; only the schemas the slot can
         # actually belong to are tried, and the first hit wins.
-        if fork_active("heze_fork_epoch") or fork_active("eip8198_fork_epoch"):
+        if fork_active("heze_fork_epoch"):
             from .spec.types.heze import SignedBeaconBlock as SignedHezeBeaconBlock
             candidates.append(("Heze", SignedHezeBeaconBlock))
         if fork_active("gloas_fork_epoch"):
@@ -384,7 +384,7 @@ class BeaconNode:
 
         detected_fork = None
         _cfg = get_config()
-        _heze_versions = {bytes(_cfg.heze_fork_version), bytes(_cfg.eip8198_fork_version)}
+        _heze_versions = {bytes(_cfg.heze_fork_version)}
         for fork_name, state_type in state_types:
             try:
                 self.state = state_type.decode_bytes(ssz_bytes)
@@ -1508,7 +1508,6 @@ class BeaconNode:
             (net_config.fulu_fork_epoch, net_config.fulu_fork_version),
             (net_config.gloas_fork_epoch, net_config.gloas_fork_version),
             (net_config.heze_fork_epoch, net_config.heze_fork_version),
-            (net_config.eip8198_fork_epoch, net_config.eip8198_fork_version),
         ]
 
         # [Modified in Fulu:EIP7892] (specs #5706)
@@ -1552,7 +1551,6 @@ class BeaconNode:
             (net_config.fulu_fork_version, "fulu"),
             (net_config.gloas_fork_version, "gloas"),
             (net_config.heze_fork_version, "heze"),
-            (net_config.eip8198_fork_version, "eip8198"),
         ]
 
         fork_epochs = [
@@ -1565,7 +1563,6 @@ class BeaconNode:
             net_config.fulu_fork_epoch,
             net_config.gloas_fork_epoch,
             net_config.heze_fork_epoch,
-            net_config.eip8198_fork_epoch,
         ]
 
         for i, (fork_version, fork_name) in enumerate(forks):
@@ -1862,7 +1859,7 @@ class BeaconNode:
         while self._running:
             try:
                 now = time.time()
-                # [EIP-8198] piecewise slot clock over get_slot_durations
+                # [Heze:EIP8198] piecewise slot clock over get_slot_durations
                 current_slot = self._wall_slot(now)
                 slot_start_time = self._slot_start_time(current_slot)
                 time_into_slot = now - slot_start_time
@@ -5645,7 +5642,7 @@ class BeaconNode:
         return self.focil.bits_for_bid(state, slot, parent_block_root)
 
     # ------------------------------------------------------------------
-    # EIP-8198 slot clock: every wall-clock <-> slot conversion goes through
+    # Heze (EIP-8198) slot clock: every wall-clock <-> slot conversion goes through
     # the piecewise get_slot_durations, never a fixed slot length.
     # ------------------------------------------------------------------
 

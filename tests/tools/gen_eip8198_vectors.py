@@ -1,7 +1,7 @@
-"""Generate EIP-8198 differential vectors from pyspec master (minimal)."""
+"""Generate Heze EIP-8198 differential vectors from pyspec (minimal)."""
 import json, random, sys
 from pathlib import Path
-from eth_consensus_specs.eip8198 import minimal as base_spec
+from eth_consensus_specs.heze import minimal as base_spec
 from eth_consensus_specs.test.context import spec_with_config_overrides, get_copy_of_spec
 from eth_consensus_specs.test.helpers.genesis import create_genesis_state
 from eth_consensus_specs.utils import bls
@@ -9,18 +9,18 @@ from eth_consensus_specs.utils import bls
 bls.bls_active = False
 OUT = Path(sys.argv[1])
 FORK_EPOCH = 3
-SLOT_DURATION_MS_EIP8198 = 4000
+SLOT_DURATION_MS_HEZE = 4000
 # Override in place: get_copy_of_spec() leaves cache_this-wrapped functions
 # (get_base_reward, ...) closed over the original config, so they would
 # silently ignore the slot duration overrides.
 spec, _ = spec_with_config_overrides(base_spec, {
-    "SLOT_DURATION_MS_EIP8198": SLOT_DURATION_MS_EIP8198, "EIP8198_FORK_EPOCH": FORK_EPOCH,
+    "SLOT_DURATION_MS_HEZE": SLOT_DURATION_MS_HEZE, "HEZE_FORK_EPOCH": FORK_EPOCH,
     "MIN_BLOB_DATA_RETENTION_MS": 196608000 // 4096 * 4,  # small window to exercise it
 })
 SPE = spec.SLOTS_PER_EPOCH
 meta = {
-    "eip8198_fork_epoch": FORK_EPOCH,
-    "slot_duration_ms_eip8198": SLOT_DURATION_MS_EIP8198,
+    "heze_fork_epoch": FORK_EPOCH,
+    "slot_duration_ms_heze": SLOT_DURATION_MS_HEZE,
     "min_blob_data_retention_ms": int(spec.config.MIN_BLOB_DATA_RETENTION_MS),
 }
 

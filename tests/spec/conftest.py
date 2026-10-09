@@ -130,8 +130,6 @@ def fork_epochs_for_case(request):
             continue
         saved[attr] = getattr(config, attr)
         setattr(config, attr, 0 if i <= idx else far)
-    saved["eip8198_fork_epoch"] = config.eip8198_fork_epoch
-    config.eip8198_fork_epoch = far
     # A case may carry its own config.yaml (e.g. GLOAS_FORK_EPOCH: 1).
     if case_path is not None and (case_path / "config.yaml").exists():
         import yaml

@@ -1171,7 +1171,7 @@ class BeaconAPI:
 
     @staticmethod
     def _signed_bid_type(version: str):
-        if version in ("heze", "eip8198"):
+        if version == "heze":
             from ..spec.types.heze import SignedExecutionPayloadBid
         else:
             from ..spec.types.gloas import SignedExecutionPayloadBid
@@ -1191,7 +1191,6 @@ class BeaconAPI:
             "fulu": electra.SignedElectraBeaconBlock,
             "gloas": gloas.SignedBeaconBlock,
             "heze": heze.SignedBeaconBlock,
-            "eip8198": heze.SignedBeaconBlock,
         }
         if version not in types:
             raise ValueError(f"unsupported consensus version {version!r}")
