@@ -41,14 +41,12 @@ CL_TO_EL_FORK = {
     "electra": "prague",
     "fulu": "osaka",
     "gloas": "amsterdam",
-    # EIP-8198 has no EL fork of its own: it rides Bogota's engine methods.
     "heze": "bogota",
-    "eip8198": "bogota",
 }
 
 # Engine API forks at or after Bogota (FOCIL: newPayloadV6 / fcuV5 carry
 # inclusion list transactions).
-_BOGOTA_CL_FORKS = ("heze", "eip8198")
+_BOGOTA_CL_FORKS = ("heze",)
 
 
 def get_fork_for_timestamp(timestamp: int) -> str:
@@ -56,8 +54,6 @@ def get_fork_for_timestamp(timestamp: int) -> str:
     from ..spec.network_config import get_config
     config = get_config()
 
-    if timestamp >= _epoch_to_timestamp(getattr(config, 'eip8198_fork_epoch', 2**64 - 1), config):
-        return "eip8198"
     if timestamp >= _epoch_to_timestamp(getattr(config, 'heze_fork_epoch', 2**64 - 1), config):
         return "heze"
     if hasattr(config, 'gloas_fork_epoch') and timestamp >= _epoch_to_timestamp(config.gloas_fork_epoch, config):
@@ -276,8 +272,6 @@ class EngineAPIClient:
                 return False
             return timestamp >= epoch_start_time(epoch)
 
-        if is_fork_active('eip8198_fork_epoch'):
-            return "eip8198"
         if is_fork_active('heze_fork_epoch'):
             return "heze"
         if is_fork_active('gloas_fork_epoch'):

@@ -184,7 +184,7 @@ def get_forkchoice_store(anchor_state, anchor_block, is_data_available=None, ver
 
 
 def get_slots_since_genesis(store: Store) -> int:
-    # [Modified in EIP8198] piecewise over get_slot_durations
+    # [Modified in Heze:EIP8198] piecewise over get_slot_durations
     return get_config().compute_slot_at_time_ms(
         seconds_to_milliseconds(store.genesis_time), seconds_to_milliseconds(store.time)
     )
@@ -217,7 +217,7 @@ def seconds_to_milliseconds(seconds: int) -> int:
 
 
 def get_slot_component_duration_ms(basis_points: int, slot: int | None = None) -> int:
-    """Deadline offset in ms. [Modified in EIP8198] priced at the slot
+    """Deadline offset in ms. [Modified in Heze:EIP8198] priced at the slot
     duration in effect at ``slot`` (genesis duration when omitted)."""
     config = get_config()
     duration = (

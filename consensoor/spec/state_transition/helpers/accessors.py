@@ -252,9 +252,9 @@ def get_validator_churn_limit(state: "BeaconState") -> int:
 
 
 def _slot_duration_ratio(epoch: int) -> tuple[int, int]:
-    """(duration at ``epoch``, genesis duration) per EIP-8198's ``get_slot_durations``.
+    """(duration at ``epoch``, genesis duration) per Heze's ``get_slot_durations``.
 
-    Before EIP8198_FORK_EPOCH only the genesis duration applies, so the ratio is 1:1
+    Before HEZE_FORK_EPOCH only the genesis duration applies, so the ratio is 1:1
     and every scaled formula reduces to its unscaled form.
     """
     from ...network_config import get_config
@@ -294,7 +294,7 @@ def get_balance_churn_limit(state: "BeaconState") -> int:
 def get_exit_churn_limit(state: "BeaconState") -> int:
     """Return the exit churn limit for the current epoch (Gloas EIP-8061).
 
-    [Modified in EIP8198] scaled by the slot duration ratio before rounding.
+    [Modified in Heze:EIP8198] scaled by the slot duration ratio before rounding.
     """
     churn = max(
         MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA(),
@@ -307,7 +307,7 @@ def get_exit_churn_limit(state: "BeaconState") -> int:
 def get_activation_churn_limit_gloas(state: "BeaconState") -> int:
     """Return the activation churn limit for the current epoch (Gloas EIP-8061).
 
-    [Modified in EIP8198] the cap is applied before scaling.
+    [Modified in Heze:EIP8198] the cap is applied before scaling.
     """
     churn = max(
         MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA(),
@@ -368,7 +368,7 @@ def get_consolidation_churn_limit(state: "BeaconState") -> int:
     """
     if _is_gloas_state(state):
         churn = get_total_active_balance(state) // CONSOLIDATION_CHURN_LIMIT_QUOTIENT()
-        # [Modified in EIP8198]
+        # [Modified in Heze:EIP8198]
         churn = _scale_by_slot_duration(churn, get_current_epoch(state))
         return churn - (churn % EFFECTIVE_BALANCE_INCREMENT)
     return get_balance_churn_limit(state) - get_activation_exit_churn_limit(state)
@@ -435,7 +435,7 @@ def get_total_active_balance(state: "BeaconState") -> int:
 def get_base_reward_per_increment(state: "BeaconState", epoch: int | None = None) -> int:
     """Return the base reward per increment (Altair+).
 
-    [Modified in EIP8198] priced at the slot duration in effect at ``epoch``
+    [Modified in Heze:EIP8198] priced at the slot duration in effect at ``epoch``
     (defaults to the state's current epoch).
     """
     current_epoch = get_current_epoch(state)
