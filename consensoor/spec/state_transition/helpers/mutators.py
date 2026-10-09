@@ -201,6 +201,14 @@ def slash_validator(
     increase_balance(state, proposer_index, proposer_reward)
     increase_balance(state, whistleblower_index, whistleblower_reward - proposer_reward)
 
+    # [New in Gloas:EIP7732]
+    if hasattr(state, "builder_pending_payments"):
+        from ...types.gloas import BuilderPendingPayment
+
+        for payment_index, payment in enumerate(state.builder_pending_payments):
+            if int(payment.proposer_index) == int(slashed_index):
+                state.builder_pending_payments[payment_index] = BuilderPendingPayment()
+
 
 # Electra mutators
 

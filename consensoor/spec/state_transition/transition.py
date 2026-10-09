@@ -266,9 +266,11 @@ def process_epoch(state: "BeaconState") -> None:
     process_slashings(state)
     timings['slashings'] = time.time() - t0
 
-    t0 = time.time()
-    process_eth1_data_reset(state)
-    timings['eth1_reset'] = time.time() - t0
+    # [Modified in Heze:EIP8015] process_eth1_data_reset removed
+    if hasattr(state, "eth1_data_votes"):
+        t0 = time.time()
+        process_eth1_data_reset(state)
+        timings['eth1_reset'] = time.time() - t0
 
     # Electra+ epoch processing (before effective balance updates per spec)
     if hasattr(state, "pending_deposits"):
@@ -381,7 +383,9 @@ def process_block(state: "BeaconState", block: "BeaconBlock") -> None:
         process_withdrawals(state)
         process_execution_payload_bid(state, block.body.signed_execution_payload_bid)
         process_randao(state, block.body)
-        process_eth1_data(state, block.body)
+        # [Modified in Heze:EIP8015] process_eth1_data removed
+        if hasattr(block.body, "eth1_data"):
+            process_eth1_data(state, block.body)
         process_operations(state, block.body, is_gloas=True, parent_slot=parent_slot)
         if hasattr(block.body, "sync_aggregate"):
             process_sync_aggregate(state, block.body.sync_aggregate)
@@ -460,9 +464,12 @@ def process_operations(
     assert len(body.attestations) <= max_attestations, (
         f"Too many attestations: {len(body.attestations)}"
     )
-    assert len(body.deposits) <= MAX_DEPOSITS, (
-        f"Too many deposits: {len(body.deposits)}"
-    )
+    # [Modified in Heze:EIP8015] body.deposits removed
+    has_deposits = hasattr(body, "deposits")
+    if has_deposits:
+        assert len(body.deposits) <= MAX_DEPOSITS, (
+            f"Too many deposits: {len(body.deposits)}"
+        )
     assert len(body.voluntary_exits) <= MAX_VOLUNTARY_EXITS, (
         f"Too many voluntary exits: {len(body.voluntary_exits)}"
     )
@@ -481,7 +488,9 @@ def process_operations(
         process_attestation(state, attestation, parent_slot=parent_slot)
 
     # Process deposits
-    if hasattr(state, "proposer_lookahead"):
+    if not has_deposits:
+        pass
+    elif hasattr(state, "proposer_lookahead"):
         # [Modified in Fulu] former deposit mechanism removed entirely
         assert len(body.deposits) == 0, (
             f"Fulu+ blocks must carry no deposits, got {len(body.deposits)}"
@@ -516,7 +525,7 @@ def process_operations(
             f"expected {expected_deposits}"
         )
 
-    for deposit in body.deposits:
+    for deposit in body.deposits if has_deposits else []:
         process_deposit(state, deposit)
 
     # Process voluntary exits

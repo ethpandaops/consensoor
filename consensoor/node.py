@@ -737,12 +737,13 @@ class BeaconNode:
 
     def _start_custody_backfill(self, new_columns: set, current_slot: int) -> None:
         """Backfill ``new_columns`` over the retention window ending now."""
-        from .spec.constants import MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS
         das_start = self._das_start_slot()
         if das_start is None:
             return
-        retention_slots = MIN_EPOCHS_FOR_DATA_COLUMN_SIDECARS_REQUESTS() * SLOTS_PER_EPOCH()
-        start_slot = max(das_start, current_slot - retention_slots, 1)
+        retention_start_epoch = get_config().get_data_column_retention_start_epoch(
+            current_slot // SLOTS_PER_EPOCH()
+        )
+        start_slot = max(das_start, retention_start_epoch * SLOTS_PER_EPOCH(), 1)
         end_slot = current_slot - 1
         if end_slot < start_slot:
             return
@@ -1510,9 +1511,21 @@ class BeaconNode:
             (net_config.eip8198_fork_epoch, net_config.eip8198_fork_version),
         ]
 
-        for fork_epoch, fork_version in forks:
-            if fork_epoch > current_epoch and fork_epoch < FAR_FUTURE_EPOCH:
-                return fork_version, fork_epoch
+        # [Modified in Fulu:EIP7892] (specs #5706)
+        upcoming = [
+            fork_epoch for fork_epoch, _ in forks
+            if current_epoch < fork_epoch < FAR_FUTURE_EPOCH
+        ]
+        if net_config.fulu_fork_epoch < FAR_FUTURE_EPOCH:
+            upcoming += [
+                int(entry["epoch"])
+                for entry in getattr(net_config, "blob_schedule", None) or []
+                if current_epoch < int(entry["epoch"]) < FAR_FUTURE_EPOCH
+                and int(entry["epoch"]) >= net_config.fulu_fork_epoch
+            ]
+        if upcoming:
+            next_fork_epoch = min(upcoming)
+            return net_config.get_fork_version(next_fork_epoch), next_fork_epoch
 
         current_version = net_config.get_fork_version(current_epoch)
         return current_version, FAR_FUTURE_EPOCH
@@ -1849,7 +1862,7 @@ class BeaconNode:
         while self._running:
             try:
                 now = time.time()
-                # [EIP-8198] piecewise slot clock over SLOT_DURATION_SCHEDULE
+                # [EIP-8198] piecewise slot clock over get_slot_durations
                 current_slot = self._wall_slot(now)
                 slot_start_time = self._slot_start_time(current_slot)
                 time_into_slot = now - slot_start_time
@@ -5633,7 +5646,7 @@ class BeaconNode:
 
     # ------------------------------------------------------------------
     # EIP-8198 slot clock: every wall-clock <-> slot conversion goes through
-    # the piecewise SLOT_DURATION_SCHEDULE, never a fixed slot length.
+    # the piecewise get_slot_durations, never a fixed slot length.
     # ------------------------------------------------------------------
 
     @staticmethod

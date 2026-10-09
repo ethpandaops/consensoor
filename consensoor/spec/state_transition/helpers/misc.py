@@ -95,7 +95,7 @@ def compute_fork_digest(
 def compute_time_at_slot(genesis_time: int, slot: int, slot_duration_ms: int | None = None) -> int:
     """Return the Unix timestamp at the start of the given slot.
 
-    [Modified in EIP8198] walks SLOT_DURATION_SCHEDULE piecewise. The
+    [Modified in EIP8198] walks get_slot_durations piecewise. The
     ``slot_duration_ms`` argument is legacy and ignored: a single duration
     cannot describe a chain whose slot length changed.
     """

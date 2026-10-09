@@ -1,5 +1,5 @@
 """Fast Confirmation Rule (FCR) — port of ``specs/phase0/fast-confirmation.md``
-(consensus-specs v1.7.0-alpha.14) on top of :mod:`consensoor.spec.fork_choice`.
+(consensus-specs v1.7.0-beta.4) on top of :mod:`consensoor.spec.fork_choice`.
 
 ``on_fast_confirmation`` is meant to run once per slot (after ``on_tick`` for
 that slot); ``get_safe_execution_block_hash`` gives the execution block hash

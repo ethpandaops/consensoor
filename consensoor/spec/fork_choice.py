@@ -1,7 +1,7 @@
 """Spec fork choice (phase0 base + Gloas/ePBS modifications).
 
 A faithful port of ``specs/phase0/fork-choice.md`` with the Gloas overrides
-from ``specs/gloas/fork-choice.md`` (consensus-specs v1.7.0-alpha.14):
+from ``specs/gloas/fork-choice.md`` (consensus-specs v1.7.0-beta.4):
 ``Store``, ``on_tick``/``on_block``/``on_attestation``/``on_attester_slashing``,
 ``on_execution_payload_envelope``/``on_payload_attestation_message`` and
 ``get_head`` over (root, payload_status) fork-choice nodes.
@@ -19,13 +19,12 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set
 
 from ..crypto import hash_tree_root
-from .constants import GENESIS_EPOCH, GENESIS_SLOT, MIN_SEED_LOOKAHEAD, PTC_SIZE, SLOTS_PER_EPOCH
+from .constants import EFFECTIVE_BALANCE_INCREMENT, GENESIS_EPOCH, GENESIS_SLOT, MIN_SEED_LOOKAHEAD, PTC_SIZE, SLOTS_PER_EPOCH
 from .network_config import get_config
 from .state_transition.epoch.justification import process_justification_and_finalization
 from .state_transition.helpers.accessors import (
     get_active_validator_indices,
     get_current_epoch,
-    get_total_active_balance,
 )
 from .state_transition.helpers.attestation import get_indexed_attestation
 from .state_transition.helpers.beacon_committee import get_beacon_committee, get_committee_count_per_slot
@@ -185,7 +184,7 @@ def get_forkchoice_store(anchor_state, anchor_block, is_data_available=None, ver
 
 
 def get_slots_since_genesis(store: Store) -> int:
-    # [Modified in EIP8198] piecewise over SLOT_DURATION_SCHEDULE
+    # [Modified in EIP8198] piecewise over get_slot_durations
     return get_config().compute_slot_at_time_ms(
         seconds_to_milliseconds(store.genesis_time), seconds_to_milliseconds(store.time)
     )
@@ -358,7 +357,15 @@ def is_ancestor(store: Store, node: ForkChoiceNode, ancestor: ForkChoiceNode) ->
 
 
 def calculate_committee_fraction(state, committee_percent: int) -> int:
-    committee_weight = get_total_active_balance(state) // SLOTS_PER_EPOCH()
+    # [Modified in beta.4] slashed validators excluded (specs #5679)
+    validators = state.validators
+    total_balance = sum(
+        int(validators[index].effective_balance)
+        for index in get_active_validator_indices(state, get_current_epoch(state))
+        if not validators[index].slashed
+    )
+    total_balance = max(EFFECTIVE_BALANCE_INCREMENT, total_balance)
+    committee_weight = total_balance // SLOTS_PER_EPOCH()
     return (committee_weight * committee_percent) // 100
 
 
@@ -401,8 +408,7 @@ def get_attestation_score(store: Store, node: ForkChoiceNode, state) -> int:
 
 
 def compute_proposer_score(state) -> int:
-    committee_weight = get_total_active_balance(state) // SLOTS_PER_EPOCH()
-    return (committee_weight * PROPOSER_SCORE_BOOST()) // 100
+    return calculate_committee_fraction(state, PROPOSER_SCORE_BOOST())
 
 
 def get_proposer_score(store: Store) -> int:

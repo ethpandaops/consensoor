@@ -970,14 +970,19 @@ class BlockBuilder:
         body_cls = GloasBeaconBlockBody
         if getattr(self, "_heze", False):
             from ..spec.types.heze import BeaconBlockBody as body_cls
+        # [Modified in Heze:EIP8015] eth1_data and deposits removed
+        legacy_fields = (
+            {"eth1_data": state.eth1_data, "deposits": []}
+            if "eth1_data" in body_cls.fields()
+            else {}
+        )
         return body_cls(
             randao_reveal=randao_reveal,
-            eth1_data=state.eth1_data,
+            **legacy_fields,
             graffiti=Bytes32(self._block_graffiti()),
             proposer_slashings=[],
             attester_slashings=[],
             attestations=gloas_attestations,
-            deposits=[],
             voluntary_exits=[],
             sync_aggregate=sync_aggregate,
             bls_to_execution_changes=[],

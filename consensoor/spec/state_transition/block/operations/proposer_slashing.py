@@ -5,9 +5,9 @@ Reference: https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/
 
 from typing import TYPE_CHECKING
 
-from ....constants import DOMAIN_BEACON_PROPOSER, SLOTS_PER_EPOCH
+from ....constants import DOMAIN_BEACON_PROPOSER
 from ...helpers.predicates import is_slashable_validator
-from ...helpers.accessors import get_current_epoch, get_previous_epoch
+from ...helpers.accessors import get_current_epoch
 from ...helpers.domain import get_domain, compute_signing_root
 from ...helpers.mutators import slash_validator
 from ...helpers.misc import compute_epoch_at_slot
@@ -69,24 +69,6 @@ def process_proposer_slashing(
             signing_root,
             bytes(signed_header.signature),
         ), "Invalid proposer slashing signature"
-
-    if hasattr(state, "builder_pending_payments"):
-        from ....types.gloas import BuilderPendingPayment
-
-        # [Modified in alpha.11+] only clear the payment when the slashed
-        # validator is the proposer it belongs to; an unrelated same-slot
-        # equivocation must not grief an honest proposer's payment.
-        slot = int(header_1.slot)
-        proposal_epoch = compute_epoch_at_slot(slot)
-        payment_index = None
-        if proposal_epoch == get_current_epoch(state):
-            payment_index = SLOTS_PER_EPOCH() + slot % SLOTS_PER_EPOCH()
-        elif proposal_epoch == get_previous_epoch(state):
-            payment_index = slot % SLOTS_PER_EPOCH()
-        if payment_index is not None:
-            payment = state.builder_pending_payments[payment_index]
-            if int(payment.proposer_index) == int(header_1.proposer_index):
-                state.builder_pending_payments[payment_index] = BuilderPendingPayment()
 
     # Slash the proposer
     slash_validator(state, proposer_index)

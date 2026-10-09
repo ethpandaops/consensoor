@@ -8,17 +8,21 @@ from eth_consensus_specs.utils import bls
 
 bls.bls_active = False
 OUT = Path(sys.argv[1])
-SCHEDULE = [{"EPOCH": 0, "SLOT_DURATION_MS": 6000}, {"EPOCH": 3, "SLOT_DURATION_MS": 4000},
-            {"EPOCH": 6, "SLOT_DURATION_MS": 2000}]
+FORK_EPOCH = 3
+SLOT_DURATION_MS_EIP8198 = 4000
 # Override in place: get_copy_of_spec() leaves cache_this-wrapped functions
 # (get_base_reward, ...) closed over the original config, so they would
-# silently ignore SLOT_DURATION_SCHEDULE.
+# silently ignore the slot duration overrides.
 spec, _ = spec_with_config_overrides(base_spec, {
-    "SLOT_DURATION_SCHEDULE": SCHEDULE, "EIP8198_FORK_EPOCH": 3,
+    "SLOT_DURATION_MS_EIP8198": SLOT_DURATION_MS_EIP8198, "EIP8198_FORK_EPOCH": FORK_EPOCH,
     "MIN_BLOB_DATA_RETENTION_MS": 196608000 // 4096 * 4,  # small window to exercise it
 })
 SPE = spec.SLOTS_PER_EPOCH
-meta = {"schedule": SCHEDULE, "min_blob_data_retention_ms": int(spec.config.MIN_BLOB_DATA_RETENTION_MS)}
+meta = {
+    "eip8198_fork_epoch": FORK_EPOCH,
+    "slot_duration_ms_eip8198": SLOT_DURATION_MS_EIP8198,
+    "min_blob_data_retention_ms": int(spec.config.MIN_BLOB_DATA_RETENTION_MS),
+}
 
 # --- time helpers ---------------------------------------------------------
 times = []

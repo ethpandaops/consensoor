@@ -1,10 +1,10 @@
 """Heze SSZ types (EIP-7805: Fork-choice enforced Inclusion Lists).
 
-Heze only modifies ``ExecutionPayloadBid`` (adds ``inclusion_list_bits``).
-Every container that transitively embeds the bid (``SignedExecutionPayloadBid``,
-``BeaconBlockBody``, ``BeaconBlock``, ``SignedBeaconBlock``, ``BeaconState``)
-gets a Heze-local class so its SSZ schema follows. Everything else is the
-Gloas type re-exported unchanged.
+Heze modifies ``ExecutionPayloadBid`` (adds ``inclusion_list_bits``) and, per
+EIP-8015, drops the eth1/deposit fields from ``BeaconBlockBody`` and
+``BeaconState``. Every container that transitively embeds them gets a
+Heze-local class so its SSZ schema follows. Everything else is the Gloas type
+re-exported unchanged.
 
 EIP-8198 (quick slots) is built on Heze and does not change any container,
 so these are also the EIP-8198 types.
@@ -18,8 +18,8 @@ from .base import (
     ParticipationFlags, KZGCommitment, WithdrawalIndex,
 )
 from .phase0 import (
-    Validator, Eth1Data, BeaconBlockHeader,
-    ProposerSlashing, Deposit, SignedVoluntaryExit,
+    Validator, BeaconBlockHeader,
+    ProposerSlashing, SignedVoluntaryExit,
 )
 from .altair import SyncCommittee, SyncAggregate
 from .capella import Withdrawal, SignedBLSToExecutionChange, HistoricalSummary
@@ -35,7 +35,6 @@ from ..constants import (
     SLOTS_PER_HISTORICAL_ROOT,
     EPOCHS_PER_HISTORICAL_VECTOR,
     EPOCHS_PER_SLASHINGS_VECTOR,
-    EPOCHS_PER_ETH1_VOTING_PERIOD,
     HISTORICAL_ROOTS_LIMIT,
     JUSTIFICATION_BITS_LENGTH,
     PTC_SIZE,
@@ -97,14 +96,17 @@ class SignedExecutionPayloadBid(Container):
     signature: BLSSignature
 
 
-class BeaconBlockBody(ProgressiveContainer(active_fields=[1] * 13)):
+def _active_fields(width: int, gaps: tuple[int, ...]) -> list[int]:
+    return [0 if index in gaps else 1 for index in range(width)]
+
+
+# [Modified in Heze:EIP8015]
+class BeaconBlockBody(ProgressiveContainer(active_fields=_active_fields(13, (1, 6)))):
     randao_reveal: BLSSignature
-    eth1_data: Eth1Data
     graffiti: Bytes32
     proposer_slashings: ProgressiveList[ProposerSlashing]
     attester_slashings: ProgressiveList[AttesterSlashing]
     attestations: ProgressiveList[Attestation]
-    deposits: ProgressiveList[Deposit]
     voluntary_exits: ProgressiveList[SignedVoluntaryExit]
     sync_aggregate: SyncAggregate
     bls_to_execution_changes: ProgressiveList[SignedBLSToExecutionChange]
@@ -127,7 +129,8 @@ class SignedBeaconBlock(Container):
     signature: BLSSignature
 
 
-class BeaconState(ProgressiveContainer(active_fields=[1] * 46)):
+# [Modified in Heze:EIP8015]
+class BeaconState(ProgressiveContainer(active_fields=_active_fields(46, (8, 9, 10, 28)))):
     genesis_time: uint64
     genesis_validators_root: Root
     slot: Slot
@@ -136,9 +139,6 @@ class BeaconState(ProgressiveContainer(active_fields=[1] * 46)):
     block_roots: Vector[Root, SLOTS_PER_HISTORICAL_ROOT()]
     state_roots: Vector[Root, SLOTS_PER_HISTORICAL_ROOT()]
     historical_roots: List[Root, HISTORICAL_ROOTS_LIMIT]
-    eth1_data: Eth1Data
-    eth1_data_votes: List[Eth1Data, EPOCHS_PER_ETH1_VOTING_PERIOD() * SLOTS_PER_EPOCH()]
-    eth1_deposit_index: uint64
     validators: ProgressiveList[Validator]
     balances: ProgressiveList[Gwei]
     randao_mixes: Vector[Bytes32, EPOCHS_PER_HISTORICAL_VECTOR()]
@@ -156,7 +156,6 @@ class BeaconState(ProgressiveContainer(active_fields=[1] * 46)):
     next_withdrawal_index: WithdrawalIndex
     next_withdrawal_validator_index: ValidatorIndex
     historical_summaries: List[HistoricalSummary, HISTORICAL_ROOTS_LIMIT]
-    deposit_requests_start_index: uint64
     deposit_balance_to_consume: Gwei
     exit_balance_to_consume: Gwei
     earliest_exit_epoch: Epoch

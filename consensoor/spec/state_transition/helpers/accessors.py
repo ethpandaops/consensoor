@@ -252,9 +252,9 @@ def get_validator_churn_limit(state: "BeaconState") -> int:
 
 
 def _slot_duration_ratio(epoch: int) -> tuple[int, int]:
-    """(duration at ``epoch``, genesis duration) per EIP-8198's schedule.
+    """(duration at ``epoch``, genesis duration) per EIP-8198's ``get_slot_durations``.
 
-    Pre-EIP8198 networks have a genesis-only schedule, so the ratio is 1:1
+    Before EIP8198_FORK_EPOCH only the genesis duration applies, so the ratio is 1:1
     and every scaled formula reduces to its unscaled form.
     """
     from ...network_config import get_config

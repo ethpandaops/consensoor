@@ -7,7 +7,7 @@ DOWNLOAD_REFTESTS := tests/download_reftests.sh
 DOWNLOAD_COMPTESTS := tests/download_comptests.sh
 
 VALID_PRESETS := minimal mainnet
-VALID_FORKS := phase0 altair bellatrix capella deneb electra fulu gloas
+VALID_FORKS := phase0 altair bellatrix capella deneb electra fulu gloas heze
 
 # Parse targets: separate known targets from test parameters.
 # Words like 'minimal', 'mainnet', fork names, and 'all' are test params.

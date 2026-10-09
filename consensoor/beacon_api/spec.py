@@ -186,6 +186,7 @@ def build_spec_response() -> dict:
         "MIN_SLOTS_FOR_INCLUSION_LISTS_REQUESTS": str(net_config.min_slots_for_inclusion_lists_requests),
         "MAX_TRANSACTIONS_BYTES_PER_INCLUSION_LIST": str(net_config.max_transactions_bytes_per_inclusion_list),
         # EIP-8198
+        "SLOT_DURATION_MS_EIP8198": str(net_config.slot_duration_ms_eip8198),
         "MIN_BLOB_DATA_RETENTION_MS": str(net_config.min_blob_data_retention_ms),
         # Networking constants
         "MAX_PAYLOAD_SIZE": str(net_config.max_payload_size),
@@ -237,11 +238,5 @@ def build_spec_response() -> dict:
             {k.upper(): str(v) for k, v in entry.items()}
             for entry in net_config.gas_limit_schedule
         ]
-
-    # [New in EIP8198] slot duration schedule
-    spec["SLOT_DURATION_SCHEDULE"] = [
-        {"EPOCH": str(e["epoch"]), "SLOT_DURATION_MS": str(e["slot_duration_ms"])}
-        for e in net_config.slot_duration_schedule
-    ] or [{"EPOCH": "0", "SLOT_DURATION_MS": str(net_config.slot_duration_ms)}]
 
     return spec

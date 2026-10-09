@@ -6,6 +6,7 @@ Reference: https://github.com/ethereum/consensus-specs/blob/master/specs/electra
 from typing import TYPE_CHECKING
 
 from ...constants import (
+    BLS_WITHDRAWAL_PREFIX,
     MAX_PENDING_DEPOSITS_PER_EPOCH,
     EFFECTIVE_BALANCE_INCREMENT,
     MAX_EFFECTIVE_BALANCE,
@@ -132,6 +133,11 @@ def apply_pending_deposit(state: "BeaconState", deposit: "PendingDeposit") -> bo
     pubkey = bytes(deposit.pubkey)
 
     if pubkey not in validator_pubkeys:
+        # [New in Heze:EIP8365] do not create validators with BLS withdrawal credentials
+        if not hasattr(state, "eth1_data") and (
+            bytes(deposit.withdrawal_credentials)[0] == BLS_WITHDRAWAL_PREFIX
+        ):
+            return False
         # New validator - validate signature first
         from ..block.operations.deposit import is_valid_deposit_signature
 

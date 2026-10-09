@@ -146,18 +146,7 @@ def apply_parent_execution_payload(state: "BeaconState", requests) -> None:
     assert len(requests.builder_deposits) <= MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD
     assert len(requests.builder_exits) <= MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD
 
-    for op in requests.deposits:
-        process_deposit_request(state, op)
-    for op in requests.withdrawals:
-        process_withdrawal_request(state, op)
-    for op in requests.consolidations:
-        process_consolidation_request(state, op)
-    # [New in Gloas:EIP8282]
-    for op in requests.builder_deposits:
-        process_builder_deposit_request(state, op)
-    for op in requests.builder_exits:
-        process_builder_exit_request(state, op)
-
+    # [Modified in Gloas] (specs #5695)
     current_epoch = get_current_epoch(state)
     previous_epoch = current_epoch - 1 if current_epoch > 0 else 0
     if parent_epoch == current_epoch:
@@ -174,6 +163,18 @@ def apply_parent_execution_payload(state: "BeaconState", requests) -> None:
                 builder_index=parent_bid.builder_index,
             )
         )
+
+    for op in requests.deposits:
+        process_deposit_request(state, op)
+    for op in requests.withdrawals:
+        process_withdrawal_request(state, op)
+    for op in requests.consolidations:
+        process_consolidation_request(state, op)
+    # [New in Gloas:EIP8282]
+    for op in requests.builder_deposits:
+        process_builder_deposit_request(state, op)
+    for op in requests.builder_exits:
+        process_builder_exit_request(state, op)
 
     state.execution_payload_availability[parent_slot % SLOTS_PER_HISTORICAL_ROOT()] = True
     state.latest_block_hash = parent_bid.block_hash

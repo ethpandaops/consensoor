@@ -174,6 +174,21 @@ def get_builder_withdrawals(
     return withdrawals, withdrawal_index, processed_count
 
 
+def get_builder_balance_after_withdrawals(
+    state: "BeaconState", builder_index: int, withdrawals: List["Withdrawal"]
+) -> int:
+    """Builder balance net of ``withdrawals`` already queued for it (Gloas)."""
+    from ..helpers.misc import convert_builder_index_to_validator_index
+
+    validator_index = convert_builder_index_to_validator_index(builder_index)
+    withdrawn = sum(
+        int(withdrawal.amount)
+        for withdrawal in withdrawals
+        if int(withdrawal.validator_index) == validator_index
+    )
+    return max(int(state.builders[builder_index].balance) - withdrawn, 0)
+
+
 def get_builders_sweep_withdrawals(
     state: "BeaconState",
     withdrawal_index: int,
@@ -199,13 +214,14 @@ def get_builders_sweep_withdrawals(
             break
 
         builder = state.builders[builder_index]
-        if int(builder.withdrawable_epoch) <= epoch and int(builder.balance) > 0:
+        balance = get_builder_balance_after_withdrawals(state, builder_index, all_withdrawals)
+        if int(builder.withdrawable_epoch) <= epoch and balance > 0:
             withdrawals.append(
                 Withdrawal(
                     index=withdrawal_index,
                     validator_index=convert_builder_index_to_validator_index(builder_index),
                     address=builder.execution_address,
-                    amount=int(builder.balance),
+                    amount=balance,
                 )
             )
             withdrawal_index += 1

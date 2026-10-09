@@ -455,14 +455,18 @@ def upgrade_to_gloas(pre: FuluBeaconState, fork_version: bytes, epoch: int) -> G
 def upgrade_to_heze(pre: GloasBeaconState, fork_version: bytes, epoch: int):
     """Upgrade a Gloas state to Heze (EIP-7805).
 
-    Only ``latest_execution_payload_bid`` changes shape (gains empty
-    ``inclusion_list_bits``); every other field carries over unchanged.
+    ``latest_execution_payload_bid`` gains empty ``inclusion_list_bits`` and
+    the EIP-8015 eth1/deposit fields are dropped; every other field carries
+    over unchanged.
     """
     from ..types.heze import (
         BeaconState as HezeBeaconState,
         ExecutionPayloadBid as HezeExecutionPayloadBid,
         InclusionListBits,
     )
+
+    # [New in Heze:EIP8015] the old deposit mechanism must be disabled
+    assert int(pre.eth1_deposit_index) == int(pre.deposit_requests_start_index)
 
     pre_bid = pre.latest_execution_payload_bid
     bid = HezeExecutionPayloadBid(

@@ -2,7 +2,7 @@
 
 Fixtures come from tests/tools/gen_eip8198_vectors.py run inside a
 consensus-specs checkout (``uv run python tests/tools/gen_eip8198_vectors.py
-<out>``): schedule 6000 ms -> 4000 ms at epoch 3 -> 2000 ms at epoch 6.
+<out>``): 6000 ms slots until EIP8198_FORK_EPOCH = 3, then SLOT_DURATION_MS_EIP8198 = 4000 ms.
 Upstream does not publish eip8198 reference tests yet.
 """
 import json
@@ -23,14 +23,11 @@ def cfg():
     prev = get_config()
     meta = json.loads((FIX / "meta.json").read_text())
     config = NetworkConfig.from_yaml(Path(__file__).parents[1] / "spec" / "configs" / "minimal.yaml")
-    config.slot_duration_schedule = [
-        {"epoch": e["EPOCH"], "slot_duration_ms": e["SLOT_DURATION_MS"]} for e in meta["schedule"]
-    ]
-    config._normalize_slot_duration_schedule()
+    config.slot_duration_ms_eip8198 = meta["slot_duration_ms_eip8198"]
     config.min_blob_data_retention_ms = meta["min_blob_data_retention_ms"]
     for attr in ("altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas", "heze"):
         setattr(config, f"{attr}_fork_epoch", 0)
-    config.eip8198_fork_epoch = 3
+    config.eip8198_fork_epoch = meta["eip8198_fork_epoch"]
     set_config(config)
     yield meta
     set_config(prev)
