@@ -15,6 +15,7 @@ from .encoding import (
     get_blob_sidecar_topic,
     get_sync_committee_subnet_topic,
     get_data_column_sidecar_topic,
+    get_attestation_subnet_topic,
     encode_message,
     decode_message,
     compute_fork_digest,
@@ -23,6 +24,7 @@ from .encoding import (
     VOLUNTARY_EXIT_TOPIC,
     PROPOSER_SLASHING_TOPIC,
     ATTESTER_SLASHING_TOPIC,
+    BLS_TO_EXECUTION_CHANGE_TOPIC,
     SYNC_COMMITTEE_CONTRIBUTION_AND_PROOF_TOPIC,
     EXECUTION_PAYLOAD_TOPIC,
     EXECUTION_PAYLOAD_BID_TOPIC,
@@ -116,6 +118,7 @@ class BeaconGossip:
         self._handlers: dict[str, MessageHandler] = {}
         self._data_column_handler = None
         self._data_column_subnets: list[int] = []
+        self._attestation_subnets: set[int] = set()
         # Digests (Fulu+) on which to subscribe DAS subnets; set by the node.
         self._das_fork_digests: list[bytes] = []
 
@@ -171,6 +174,31 @@ class BeaconGossip:
     def subscribe_attester_slashings(self, handler: MessageHandler) -> None:
         """Subscribe to attester slashing messages."""
         self._handlers[ATTESTER_SLASHING_TOPIC] = handler
+
+    def subscribe_bls_to_execution_changes(self, handler: MessageHandler) -> None:
+        """Subscribe to BLS-to-execution change messages."""
+        self._handlers[BLS_TO_EXECUTION_CHANGE_TOPIC] = handler
+
+    async def publish_operation(self, base_topic: str, message_ssz: bytes) -> None:
+        """Publish an operation (exit, slashing, BLS change) on its global topic."""
+        topic = get_topic_name(base_topic, self.fork_digest)
+        await self._host.publish(topic, encode_message(message_ssz))
+
+    async def ensure_attestation_subnets(self, subnet_ids, handler: Callable) -> None:
+        """Subscribe to ``beacon_attestation_{subnet}`` for the given subnets.
+        Handler receives (decoded_ssz, from_peer, subnet_id)."""
+        for subnet_id in subnet_ids:
+            if subnet_id in self._attestation_subnets:
+                continue
+            self._attestation_subnets.add(subnet_id)
+            wrapped_handler = self._wrap_subnet_handler(handler, subnet_id)
+            for fork_digest in self._all_fork_digests:
+                await self._host.subscribe(get_attestation_subnet_topic(subnet_id, fork_digest), wrapped_handler)
+
+    async def publish_attestation(self, subnet_id: int, attestation_ssz: bytes) -> None:
+        """Publish an unaggregated attestation on ``beacon_attestation_{subnet_id}``."""
+        topic = get_attestation_subnet_topic(subnet_id, self.fork_digest)
+        await self._host.publish(topic, encode_message(attestation_ssz))
 
     def subscribe_sync_committee_contributions(self, handler: MessageHandler) -> None:
         """Subscribe to sync committee contribution and proof messages."""
