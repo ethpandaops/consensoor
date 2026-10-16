@@ -159,12 +159,6 @@ class BlockBuilder:
         self._heze = get_config().is_heze_active(slot // SLOTS_PER_EPOCH())
         logger.debug(f"Building block for fork: {fork} (heze={self._heze})")
 
-        # Work on a copy of the state to compute state_root
-        # Use SSZ round-trip instead of copy.deepcopy for deterministic behavior across architectures
-        t0 = time_mod.time()
-        temp_state = state.__class__.decode_bytes(bytes(state.encode_bytes()))
-        t1 = time_mod.time()
-        logger.debug(f"State copy took {(t1-t0)*1000:.1f}ms")
         logger.info(
             f"Building block for slot={slot}: state_slot={state.slot}, "
             f"latest_header_slot={state.latest_block_header.slot}"
@@ -173,8 +167,11 @@ class BlockBuilder:
         # Process slots to advance state (fills in latest_block_header.state_root)
         # May return upgraded state type if crossing a fork boundary
         t0 = time_mod.time()
-        if slot > int(temp_state.slot):
-            temp_state = process_slots(temp_state, slot)
+        temp_state = self.node._advanced_state_for(state, slot)
+        if temp_state is None:
+            temp_state = state.copy()
+            if slot > int(temp_state.slot):
+                temp_state = process_slots(temp_state, slot)
         t1 = time_mod.time()
         logger.debug(f"process_slots took {(t1-t0)*1000:.1f}ms")
 

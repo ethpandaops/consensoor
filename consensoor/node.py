@@ -260,6 +260,39 @@ class BeaconNode:
         self._state_executor = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="consensoor-state"
         )
+        self._advanced_state = None
+
+    def _advance_state_ahead(self, state, target_slot: int) -> None:
+        from .spec.state_transition import process_slots
+        base_root = hash_tree_root(state)
+        advanced = process_slots(state.copy(), target_slot)
+        hash_tree_root(advanced)
+        self._advanced_state = (base_root, target_slot, advanced)
+
+    def _advanced_state_for(self, state, target_slot: int):
+        cached = self._advanced_state
+        if cached is None:
+            return None
+        base_root, cached_slot, advanced = cached
+        if cached_slot != target_slot or int(state.slot) >= target_slot:
+            return None
+        if hash_tree_root(state) != base_root:
+            return None
+        return advanced.copy()
+
+    async def _prepare_next_slot_state(self, next_slot: int) -> None:
+        state = self.state
+        if state is None or int(state.slot) >= next_slot:
+            return
+        try:
+            t0 = time.monotonic()
+            await self._on_state_thread(self._advance_state_ahead, state, next_slot)
+            logger.info(
+                f"Advanced head state to slot {next_slot} ahead of time "
+                f"in {(time.monotonic() - t0) * 1000:.0f}ms"
+            )
+        except Exception as e:
+            logger.warning(f"Advancing head state to slot {next_slot} failed: {e}")
 
     async def _on_state_thread(self, func: Callable[..., Any], *args, **kwargs) -> Any:
         """Run a CPU-bound state operation on the dedicated state worker."""
@@ -1855,6 +1888,7 @@ class BeaconNode:
         last_sync_committee_slot = -1
         last_contribution_slot = -1
         last_il_slot = -1
+        last_advance_slot = -1
 
         while self._running:
             try:
@@ -1940,8 +1974,21 @@ class BeaconNode:
                     last_ptc_slot = current_slot
                     await self._produce_payload_attestations(current_slot)
 
+                advance_offset = (
+                    network_config.get_slot_component_duration_ms(7500, current_slot) / 1000.0
+                )
+                if (
+                    (current_slot + 1) % slots_per_epoch == 0
+                    and current_slot > last_advance_slot
+                    and time_into_slot >= advance_offset
+                ):
+                    last_advance_slot = current_slot
+                    asyncio.create_task(self._prepare_next_slot_state(current_slot + 1))
+
                 # Calculate sleep time - wake up for next event
                 pending = []
+                if (current_slot + 1) % slots_per_epoch == 0 and current_slot != last_advance_slot:
+                    pending.append(slot_start_time + advance_offset)
                 if current_slot != last_attestation_slot:
                     pending.append(slot_start_time + attestation_offset)
                 if current_slot != last_contribution_slot:
@@ -2353,6 +2400,9 @@ class BeaconNode:
         temp_state = self.state
         if slot > int(temp_state.slot):
             def _advance(state, target_slot):
+                advanced = self._advanced_state_for(state, target_slot)
+                if advanced is not None:
+                    return advanced
                 cloned = state.copy()
                 return process_slots(cloned, target_slot)
             temp_state = await self._on_state_thread(_advance, temp_state, slot)
@@ -4922,10 +4972,12 @@ class BeaconNode:
                 # the memoized subtree hashes — an encode/decode round-trip
                 # would throw the hash cache away and force a full
                 # re-merkleization of the state on the next hash_tree_root.
-                pre_copy = state.copy()
                 target = int(sb.message.slot)
-                if target > int(pre_copy.slot):
-                    pre_copy = process_slots(pre_copy, target)
+                pre_copy = self._advanced_state_for(state, target)
+                if pre_copy is None:
+                    pre_copy = state.copy()
+                    if target > int(pre_copy.slot):
+                        pre_copy = process_slots(pre_copy, target)
                 process_block(pre_copy, sb.message)
                 computed = hash_tree_root(pre_copy)
                 claimed = bytes(sb.message.state_root)
