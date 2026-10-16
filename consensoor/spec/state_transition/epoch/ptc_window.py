@@ -3,6 +3,7 @@
 Reference: https://github.com/ethereum/consensus-specs/blob/master/specs/gloas/beacon-chain.md
 """
 
+import struct
 from typing import TYPE_CHECKING
 
 from ...constants import (
@@ -73,6 +74,9 @@ def _shuffle_inplace(values: list[int], seed: bytes) -> None:
                 values[i], values[flip] = values[flip], values[i]
 
 
+_UNPACK_RANDOM_VALUES = struct.Struct("<16H").unpack
+
+
 def process_ptc_window(state: "BeaconState") -> None:
     """Update the cached PTC window.
 
@@ -136,23 +140,22 @@ def process_ptc_window(state: "BeaconState") -> None:
         slot_seed = sha256(seed_ptc_base + int(slot).to_bytes(8, "little"))
 
         total = len(indices)
+        thresholds = [
+            effective_balances[candidate] * max_random_value for candidate in indices
+        ]
         selected: list[int] = []
-        # Hoist the sha256 out of the inner loop — random_bytes only
-        # refreshes every 16 iterations (8 random 16-bit values per hash).
         i = 0
-        random_bytes = sha256(slot_seed + b"\x00" * 8)
         while len(selected) < ptc_size:
-            r = i & 15
-            if r == 0 and i != 0:
-                random_bytes = sha256(
-                    slot_seed + (i >> 4).to_bytes(8, "little")
-                )
-            offset = r * 2
-            random_value = int.from_bytes(random_bytes[offset:offset + 2], "little")
-            candidate = indices[i % total]
-            if effective_balances[candidate] * max_random_value >= max_effective * random_value:
-                selected.append(candidate)
-            i += 1
+            random_values = _UNPACK_RANDOM_VALUES(
+                sha256(slot_seed + (i >> 4).to_bytes(8, "little"))
+            )
+            for random_value in random_values:
+                position = i % total
+                if thresholds[position] >= max_effective * random_value:
+                    selected.append(indices[position])
+                    if len(selected) == ptc_size:
+                        break
+                i += 1
 
         new_window[window_len - spe + j] = selected
 

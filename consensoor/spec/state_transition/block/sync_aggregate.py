@@ -18,7 +18,6 @@ from ..helpers.accessors import get_total_active_balance, get_base_reward_per_in
 from ..helpers.misc import compute_epoch_at_slot
 from ..helpers.domain import get_domain, compute_signing_root
 from ..helpers.beacon_committee import get_beacon_proposer_index
-from ..helpers.mutators import increase_balance, decrease_balance
 from ....crypto import bls_verify
 
 if TYPE_CHECKING:
@@ -113,25 +112,32 @@ def process_sync_aggregate(
 
     # Apply participant and proposer rewards
     # Get committee indices by looking up pubkeys in validator list
-    all_pubkeys = [bytes(v.pubkey) for v in state.validators]
-    committee_indices = []
-    for pubkey in state.current_sync_committee.pubkeys:
-        pk_bytes = bytes(pubkey)
-        if pk_bytes in all_pubkeys:
-            committee_indices.append(all_pubkeys.index(pk_bytes))
-        else:
-            committee_indices.append(0)
+    pubkey_to_index = {}
+    for index, validator in enumerate(state.validators):
+        pubkey_to_index.setdefault(bytes(validator.pubkey), index)
+    committee_indices = [
+        pubkey_to_index.get(bytes(pubkey), 0) for pubkey in committee_pubkeys
+    ]
 
     proposer_index = get_beacon_proposer_index(state)
 
+    balances = {}
     for participant_index, participation_bit in zip(
         committee_indices, sync_aggregate.sync_committee_bits
     ):
+        for index in (participant_index, proposer_index):
+            if index not in balances:
+                balances[index] = int(state.balances[index])
         if participation_bit:
-            increase_balance(state, participant_index, participant_reward)
-            increase_balance(state, proposer_index, proposer_reward)
+            balances[participant_index] += participant_reward
+            balances[proposer_index] += proposer_reward
         else:
-            decrease_balance(state, participant_index, participant_reward)
+            balance = balances[participant_index]
+            balances[participant_index] = (
+                0 if participant_reward > balance else balance - participant_reward
+            )
+    for index, balance in balances.items():
+        state.balances[index] = balance
 
 
 def get_sync_committee_participant_indices(state: "BeaconState") -> list:
