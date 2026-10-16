@@ -83,10 +83,12 @@ def process_rewards_and_penalties_altair(state: "BeaconState") -> None:
         for flag_index in range(len(PARTICIPATION_FLAG_WEIGHTS))
     ]
     deltas = flag_deltas + [get_inactivity_penalty_deltas(state)]
+    balances = [int(balance) for balance in state.balances]
     for rewards, penalties in deltas:
-        for index in range(len(state.validators)):
-            increase_balance(state, index, rewards[index])
-            decrease_balance(state, index, penalties[index])
+        for index in range(len(balances)):
+            balance = balances[index] + rewards[index]
+            balances[index] = 0 if penalties[index] > balance else balance - penalties[index]
+    state.balances = state.balances.__class__(*balances)
 
 
 # =============================================================================

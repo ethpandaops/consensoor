@@ -4,6 +4,7 @@ Implements shuffling, committee selection, and proposer selection.
 Reference: https://github.com/ethereum/consensus-specs/blob/master/specs/phase0/beacon-chain.md
 """
 
+import functools
 from typing import TYPE_CHECKING, Sequence
 
 from ...constants import (
@@ -51,25 +52,30 @@ def compute_shuffled_index(index: int, index_count: int, seed: bytes) -> int:
     """
     assert index < index_count
 
-    for current_round in range(SHUFFLE_ROUND_COUNT()):
-        pivot = (
-            int.from_bytes(
-                sha256(seed + current_round.to_bytes(1, "little"))[:8], "little"
-            )
-            % index_count
-        )
+    seed = bytes(seed)
+    for current_round, pivot in enumerate(_shuffle_pivots(seed, index_count, SHUFFLE_ROUND_COUNT())):
         flip = (pivot + index_count - index) % index_count
         position = max(index, flip)
-        source = sha256(
-            seed
-            + current_round.to_bytes(1, "little")
-            + (position // 256).to_bytes(4, "little")
-        )
+        source = _shuffle_source(seed, current_round, position // 256)
         byte = source[(position % 256) // 8]
         bit = (byte >> (position % 8)) & 1
         index = flip if bit else index
 
     return index
+
+
+@functools.lru_cache(maxsize=256)
+def _shuffle_pivots(seed: bytes, index_count: int, round_count: int) -> tuple[int, ...]:
+    return tuple(
+        int.from_bytes(sha256(seed + current_round.to_bytes(1, "little"))[:8], "little")
+        % index_count
+        for current_round in range(round_count)
+    )
+
+
+@functools.lru_cache(maxsize=65536)
+def _shuffle_source(seed: bytes, current_round: int, chunk: int) -> bytes:
+    return sha256(seed + current_round.to_bytes(1, "little") + chunk.to_bytes(4, "little"))
 
 
 def compute_proposer_index(
