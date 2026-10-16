@@ -416,6 +416,39 @@ class AttestationPool:
 
         return merged
 
+    @staticmethod
+    def committee_of(attestation: AnyAttestation) -> int:
+        """Committee index of a single-committee attestation, -1 otherwise."""
+        if hasattr(attestation, "committee_bits"):
+            bits = [i for i, b in enumerate(attestation.committee_bits) if b]
+            return bits[0] if len(bits) == 1 else -1
+        return int(attestation.data.index)
+
+    def get_attestations(
+        self, slot: int | None = None, committee_index: int | None = None
+    ) -> list[AnyAttestation]:
+        """Pooled attestations, optionally filtered by slot and committee."""
+        return [
+            p.attestation
+            for (s, _), pooled in sorted(self._attestations.items())
+            if slot is None or s == slot
+            for p in pooled
+            if committee_index is None or self.committee_of(p.attestation) == committee_index
+        ]
+
+    def get_aggregate(self, slot: int, data_root: bytes, committee_index: int) -> AnyAttestation | None:
+        """Best aggregate of the pooled attestations with ``data_root`` in ``committee_index``."""
+        matching = [
+            p
+            for (s, _), pooled in self._attestations.items()
+            if s == slot
+            for p in pooled
+            if p.data_root == data_root and self.committee_of(p.attestation) == committee_index
+        ]
+        if not matching:
+            return None
+        return self._aggregate_attestations(matching, hasattr(matching[0].attestation, "committee_bits"))
+
     def remove_included(self, attestations: list) -> int:
         """Remove attestations that have been included in a block.
 

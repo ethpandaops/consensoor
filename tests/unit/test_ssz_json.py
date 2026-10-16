@@ -49,3 +49,14 @@ def test_missing_field_rejected():
 
     with pytest.raises(ValueError):
         from_json(PayloadAttestationMessage, {"validator_index": "1"})
+
+
+def test_epoch_participation_is_uint8_array():
+    from consensoor.spec.types.gloas import BeaconState
+
+    state = BeaconState()
+    state.previous_epoch_participation = [7, 0]
+    obj = to_json(state)
+    assert obj["previous_epoch_participation"] == ["7", "0"]
+    assert obj["current_epoch_participation"] == []
+    assert from_json(BeaconState, obj).hash_tree_root() == state.hash_tree_root()

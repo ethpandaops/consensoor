@@ -4,6 +4,16 @@ from ..spec.network_config import get_config as get_network_config
 from ..spec import constants
 from .utils import to_hex
 
+SPEC_CONSTANTS = (
+    "BASE_REWARDS_PER_EPOCH", "BUILDER_INDEX_FLAG", "BUILDER_INDEX_SELF_BUILD",
+    "BUILDER_PAYMENT_THRESHOLD_DENOMINATOR", "BUILDER_PAYMENT_THRESHOLD_NUMERATOR",
+    "BUILDER_WITHDRAWAL_PREFIX", "DEPOSIT_CONTRACT_TREE_DEPTH", "FAR_FUTURE_EPOCH",
+    "FULL_EXIT_REQUEST_AMOUNT", "GENESIS_EPOCH", "GENESIS_SLOT", "JUSTIFICATION_BITS_LENGTH",
+    "PAYLOAD_BUILDER_VERSION", "PROPOSER_WEIGHT", "SYNC_REWARD_WEIGHT", "TIMELY_HEAD_FLAG_INDEX",
+    "TIMELY_HEAD_WEIGHT", "TIMELY_SOURCE_FLAG_INDEX", "TIMELY_SOURCE_WEIGHT", "TIMELY_TARGET_FLAG_INDEX",
+    "TIMELY_TARGET_WEIGHT", "UNSET_DEPOSIT_REQUESTS_START_INDEX", "WEIGHT_DENOMINATOR",
+)
+
 
 def build_spec_response() -> dict:
     """Build the spec response for GET /eth/v1/config/spec."""
@@ -222,6 +232,13 @@ def build_spec_response() -> dict:
         "TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE": str(constants.TARGET_AGGREGATORS_PER_SYNC_SUBCOMMITTEE),
         "SYNC_COMMITTEE_SUBNET_COUNT": str(constants.SYNC_COMMITTEE_SUBNET_COUNT),
     }
+
+    for name in SPEC_CONSTANTS:
+        value = getattr(constants, name)
+        if isinstance(value, bytes):
+            spec[name] = "0x" + value.hex()
+        else:
+            spec[name] = str(value)
 
     if net_config.blob_schedule:
         spec["BLOB_SCHEDULE"] = [

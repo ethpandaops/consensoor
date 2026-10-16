@@ -13,6 +13,7 @@ from remerkleable.byte_arrays import ByteList, ByteVector
 from remerkleable.progressive import ProgressiveBitlist, ProgressiveByteList
 
 _BYTES_TYPES = (ByteVector, ByteList, ProgressiveByteList, Bitvector, Bitlist, ProgressiveBitlist)
+_UINT8_ARRAY_FIELDS = frozenset({"previous_epoch_participation", "current_epoch_participation"})
 
 
 def _is_hex_type(typ) -> bool:
@@ -40,7 +41,10 @@ def to_json(value):
     if _is_hex_type(typ):
         return "0x" + bytes(value.encode_bytes()).hex()
     if hasattr(typ, "fields"):
-        return {name: to_json(getattr(value, name)) for name in typ.fields().keys()}
+        return {
+            name: [str(int(v)) for v in getattr(value, name)] if name in _UINT8_ARRAY_FIELDS else to_json(getattr(value, name))
+            for name in typ.fields().keys()
+        }
     if hasattr(typ, "element_cls"):
         return [to_json(v) for v in value]
     raise TypeError(f"unsupported SSZ type {typ}")
@@ -62,7 +66,10 @@ def from_json(typ, obj):
         for name, ftyp in typ.fields().items():
             if name not in obj:
                 raise ValueError(f"missing field {name!r} in {typ.__name__}")
-            kwargs[name] = from_json(ftyp, obj[name])
+            if name in _UINT8_ARRAY_FIELDS and isinstance(obj[name], list):
+                kwargs[name] = ftyp(*[int(v) for v in obj[name]])
+            else:
+                kwargs[name] = from_json(ftyp, obj[name])
         return typ(**kwargs)
     if hasattr(typ, "element_cls"):
         if not isinstance(obj, list):

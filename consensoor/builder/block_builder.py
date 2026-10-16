@@ -586,15 +586,19 @@ class BlockBuilder:
             for i, att in enumerate(attestations[:3]):  # Log first 3 for debugging
                 logger.debug(f"  Attestation {i}: slot={att.data.slot}, committee={att.data.index}, bits={sum(1 for b in att.aggregation_bits if b)}")
 
+        attester_slashing_type = (
+            ElectraBeaconBlockBody if fork in ("electra", "fulu") else BellatrixBeaconBlockBody
+        ).fields()["attester_slashings"].element_cls()
+        operations = self.node.operation_pool.get_for_block(state, attester_slashing_type)
         base_fields = {
             "randao_reveal": randao_reveal,
             "eth1_data": state.eth1_data,
             "graffiti": Bytes32(self._block_graffiti()),
-            "proposer_slashings": [],
-            "attester_slashings": [],
+            "proposer_slashings": operations["proposer_slashings"],
+            "attester_slashings": operations["attester_slashings"],
             "attestations": attestations or [],
             "deposits": [],
-            "voluntary_exits": [],
+            "voluntary_exits": operations["voluntary_exits"],
             "sync_aggregate": sync_aggregate,
             "execution_payload": execution_payload,
         }
@@ -602,7 +606,7 @@ class BlockBuilder:
         if fork == "bellatrix":
             return BellatrixBeaconBlockBody(**base_fields)
 
-        base_fields["bls_to_execution_changes"] = []
+        base_fields["bls_to_execution_changes"] = operations["bls_to_execution_changes"]
 
         if fork == "capella":
             return CapellaBeaconBlockBody(**base_fields)
@@ -973,16 +977,19 @@ class BlockBuilder:
             if "eth1_data" in body_cls.fields()
             else {}
         )
+        operations = self.node.operation_pool.get_for_block(
+            state, body_cls.fields()["attester_slashings"].element_cls()
+        )
         return body_cls(
             randao_reveal=randao_reveal,
             **legacy_fields,
             graffiti=Bytes32(self._block_graffiti()),
-            proposer_slashings=[],
-            attester_slashings=[],
+            proposer_slashings=operations["proposer_slashings"],
+            attester_slashings=operations["attester_slashings"],
             attestations=gloas_attestations,
-            voluntary_exits=[],
+            voluntary_exits=operations["voluntary_exits"],
             sync_aggregate=sync_aggregate,
-            bls_to_execution_changes=[],
+            bls_to_execution_changes=operations["bls_to_execution_changes"],
             signed_execution_payload_bid=signed_execution_payload_bid,
             payload_attestations=payload_attestations,
         )

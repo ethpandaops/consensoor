@@ -61,6 +61,7 @@ from .validator import ValidatorClient, load_keystores_teku_style
 from .builder import BlockBuilder
 from .attestation_pool import AttestationPool
 from .sync_committee_pool import SyncCommitteePool
+from .operation_pool import OperationPool
 from . import metrics
 
 logger = logging.getLogger(__name__)
@@ -196,6 +197,11 @@ class BeaconNode:
         self._custody_column_bits_cache: Optional[tuple[tuple[int, int], bytes]] = None
         self.attestation_pool = AttestationPool()
         self.sync_committee_pool = SyncCommitteePool()
+        self.operation_pool = OperationPool()
+        self.fee_recipients: dict[int, bytes] = {}
+        self.attestation_subnet_subscriptions: dict[int, int] = {}
+        self.liveness: dict[int, set[int]] = {}
+        self.api_validator_indices: set[int] = set()
         from .payload_attestation_pool import PayloadAttestationPool
         self.payload_attestation_pool = PayloadAttestationPool()
         # Heze (EIP-7805, FOCIL) inclusion list runtime
@@ -685,18 +691,29 @@ class BeaconNode:
         return self.state
 
     def _attached_validator_indices(self) -> list[int]:
-        if not self.validator_client:
-            return []
-        return [idx for idx in self.validator_client._validator_indices.values() if idx is not None]
+        indices = set(self.api_validator_indices)
+        if self.validator_client:
+            indices.update(idx for idx in self.validator_client._validator_indices.values() if idx is not None)
+        return sorted(indices)
+
+    def attach_api_validators(self, indices) -> None:
+        """Track validators that use this node through the beacon API (custody
+        requirement, fulu/validator.md)."""
+        new = {int(i) for i in indices} - self.api_validator_indices
+        if not new:
+            return
+        self.api_validator_indices.update(new)
+        if not self.config.supernode:
+            self._update_custody_group_count_from_state()
 
     def _on_epoch_start_validator_custody(self, slot: int) -> None:
         """Epoch hook: resolve indices of validators that activated since
         the last check and re-evaluate the custody requirement."""
-        if not self.validator_client or self.state is None or self.config.supernode:
+        if self.state is None or self.config.supernode:
             return
         try:
             vc = self.validator_client
-            if len(vc._validator_indices) < len(vc.pubkeys):
+            if vc and len(vc._validator_indices) < len(vc.pubkeys):
                 vc.update_validator_indices(self.state)
             self._update_custody_group_count_from_state()
         except Exception as e:
@@ -712,7 +729,7 @@ class BeaconNode:
         """
         if self.config.supernode:
             return  # supernode pinned at NUMBER_OF_CUSTODY_GROUPS in BeaconGossip
-        if not self.beacon_gossip or not self.validator_client or not self.state:
+        if not self.beacon_gossip or not self.state:
             return
         indices = self._attached_validator_indices()
         if not indices:
@@ -942,6 +959,8 @@ class BeaconNode:
         except Exception as e:
             logger.error(f"data column sidecar handling failed: {e}")
             return
+        if verdict == "accept" and self.beacon_api:
+            self.beacon_api.emit_data_column_sidecar(data)
         if verdict == "accept" and self.head_root is not None and self.head_slot is not None:
             # last custody column may complete availability -> early PTC vote
             self._maybe_early_ptc_vote(int(self.head_slot))
@@ -1341,6 +1360,10 @@ class BeaconNode:
 
             self.beacon_gossip.subscribe_blocks(self._on_p2p_block)
             self.beacon_gossip.subscribe_aggregates(self._on_p2p_aggregate)
+            self.beacon_gossip.subscribe_voluntary_exits(self._on_p2p_voluntary_exit)
+            self.beacon_gossip.subscribe_proposer_slashings(self._on_p2p_proposer_slashing)
+            self.beacon_gossip.subscribe_attester_slashings(self._on_p2p_attester_slashing)
+            self.beacon_gossip.subscribe_bls_to_execution_changes(self._on_p2p_bls_to_execution_change)
             self.beacon_gossip.subscribe_sync_committee_contributions(self._on_p2p_sync_committee_contribution)
             self.beacon_gossip.subscribe_sync_committee_messages(self._on_p2p_sync_committee_message)
             self.beacon_gossip.subscribe_blob_sidecars(self._on_p2p_blob_sidecar)
@@ -1809,7 +1832,7 @@ class BeaconNode:
             payload_attributes = {
                 "timestamp": hex(timestamp),
                 "prevRandao": "0x" + prev_randao.hex(),
-                "suggestedFeeRecipient": "0x" + "00" * 20,
+                "suggestedFeeRecipient": "0x" + self._fee_recipient_for_slot(slot).hex(),
                 "withdrawals": withdrawals_list,
                 "parentBeaconBlockRoot": "0x" + prep_head_root.hex(),
             }
@@ -2057,6 +2080,13 @@ class BeaconNode:
             self.attestation_pool.prune(slot)
             # Prune old sync committee messages
             self.sync_committee_pool.prune(slot)
+            if self.state is not None:
+                await self._on_state_thread(self.operation_pool.prune, self.state)
+            for old in [e for e in self.liveness if e + 2 < epoch]:
+                del self.liveness[old]
+            for subnet, until in list(self.attestation_subnet_subscriptions.items()):
+                if until < slot:
+                    del self.attestation_subnet_subscriptions[subnet]
             # Update fork_digest for publishing if we've crossed a fork boundary
             await self._update_fork_digest_for_epoch(epoch)
             # Recompute sync committee duties at epoch boundary (for the
@@ -2117,7 +2147,7 @@ class BeaconNode:
             payload_attributes = {
                 "timestamp": str(int(timestamp)),
                 "prev_randao": "0x" + prev_randao.hex(),
-                "suggested_fee_recipient": "0x" + "00" * 20,
+                "suggested_fee_recipient": "0x" + self._fee_recipient_for_slot(proposal_slot).hex(),
                 "withdrawals": spec_withdrawals,
                 "parent_beacon_block_root": "0x" + (self.head_root or b"\x00" * 32).hex(),
             }
@@ -2219,7 +2249,7 @@ class BeaconNode:
             payload_attributes = {
                 "timestamp": hex(timestamp),
                 "prevRandao": "0x" + prev_randao.hex(),
-                "suggestedFeeRecipient": "0x" + "00" * 20,  # Default fee recipient
+                "suggestedFeeRecipient": "0x" + self._fee_recipient_for_slot(next_slot).hex(),
                 "withdrawals": withdrawals_list,
                 "parentBeaconBlockRoot": "0x" + prep_head_root.hex(),
             }
@@ -3222,9 +3252,10 @@ class BeaconNode:
     async def produce_block_for_api(
         self, slot: int, randao_reveal: bytes, graffiti: Optional[bytes] = None
     ) -> dict:
-        """Build an unsigned self-built Gloas block for a beacon-API validator
-        client (POST /eth/v4/validator/blocks/{slot}). The payload envelope and
-        blobs are cached for the envelope fetch/publish endpoints."""
+        """Build an unsigned self-built block for a beacon-API validator client
+        (GET /eth/v3 and POST /eth/v4 validator/blocks/{slot}). For Gloas the
+        payload envelope and blobs are cached for the envelope fetch/publish
+        endpoints."""
         if not self.engine or not self.block_builder or self.state is None:
             raise RuntimeError("node cannot produce blocks (no engine/state)")
         if int(slot) <= int(self.head_slot):
@@ -3266,14 +3297,19 @@ class BeaconNode:
         )
         if block is None:
             raise ValueError("block production failed (invalid randao_reveal or state transition error)")
+        blobs_bundle = payload_response.blobs_bundle or {}
         if not hasattr(block.body, "signed_execution_payload_bid"):
-            raise ValueError("block production via /eth/v4 is only available from Gloas")
+            return {
+                "block": block,
+                "envelope": None,
+                "blobs_bundle": blobs_bundle,
+                "execution_payload_value": int(payload_response.block_value or 0),
+            }
 
         block_root = hash_tree_root(block)
         envelope = self._build_execution_payload_envelope(
             block_root, bytes(block.parent_root), execution_payload_dict, el_execution_requests
         )
-        blobs_bundle = payload_response.blobs_bundle or {}
         self._api_produced_payloads = {
             k: v for k, v in getattr(self, "_api_produced_payloads", {}).items() if k[0] + 2 >= int(slot)
         }
@@ -3689,6 +3725,7 @@ class BeaconNode:
 
             # Remove included attestations from pool to avoid re-inclusion
             self.attestation_pool.remove_included(list(block.body.attestations))
+            self.operation_pool.remove_included(block.body)
 
             # Now update forkchoice with the new block
             forkchoice_state = ForkchoiceState(
@@ -3937,6 +3974,9 @@ class BeaconNode:
             if self.store.get_block(block_root):
                 logger.debug(f"Block already known: {block_root.hex()[:16]}")
                 return
+            if self.beacon_api:
+                self.beacon_api.emit("block_gossip", {"slot": str(int(block.slot)), "block": "0x" + block_root.hex()})
+            self.record_liveness(int(block.slot) // SLOTS_PER_EPOCH(), [int(block.proposer_index)])
 
             # Best-effort: backfill any missing blob sidecars from the EL pool
             # (engine getBlobs, execution-apis #793). Runs in the background so
@@ -4035,6 +4075,7 @@ class BeaconNode:
                                     self.head_slot = int(missing_block.slot)
                                     self.head_root = missing_root
                                     self.store.set_head(missing_root)
+                                    self.operation_pool.remove_included(missing_block.body)
                                     try:
                                         await self._notify_el_of_received_block(
                                             missing_block
@@ -4155,6 +4196,7 @@ class BeaconNode:
                     self._fc_on_block(signed_block, self.state)
 
                     self.attestation_pool.remove_included(list(block.body.attestations))
+                    self.operation_pool.remove_included(block.body)
 
                     # For Gloas blocks: check if we have a pending envelope for phase 2
                     is_gloas_block = hasattr(block.body, "signed_execution_payload_bid")
@@ -4227,6 +4269,11 @@ class BeaconNode:
             # Add to attestation pool
             self.attestation_pool.add(attestation)
             self._fc_on_attestation(attestation)
+            self.record_liveness(
+                int(attestation.data.target.epoch), [int(signed_aggregate.message.aggregator_index)]
+            )
+            if self.beacon_api:
+                self.beacon_api.emit_attestation(attestation)
 
             logger.info(
                 f"P2P: Received aggregate slot={slot}, "
@@ -4235,6 +4282,156 @@ class BeaconNode:
             )
         except Exception as e:
             logger.error(f"Error processing P2P aggregate: {e}")
+
+    def record_liveness(self, epoch: int, validator_indices) -> None:
+        self.liveness.setdefault(int(epoch), set()).update(int(v) for v in validator_indices)
+
+    def _fee_recipient_for_slot(self, slot: int) -> bytes:
+        state = self.state
+        if state is None or not self.fee_recipients or not hasattr(state, "proposer_lookahead"):
+            return b"\x00" * 20
+        offset = int(slot) - (int(state.slot) // SLOTS_PER_EPOCH()) * SLOTS_PER_EPOCH()
+        if not 0 <= offset < len(state.proposer_lookahead):
+            return b"\x00" * 20
+        return self.fee_recipients.get(int(state.proposer_lookahead[offset]), b"\x00" * 20)
+
+    async def submit_operation(self, kind: str, op, publish: bool) -> bool:
+        """Validate ``op`` against the head state, pool it, emit its event and
+        optionally gossip it. Raises ValueError when invalid."""
+        from .p2p.encoding import (
+            VOLUNTARY_EXIT_TOPIC,
+            PROPOSER_SLASHING_TOPIC,
+            ATTESTER_SLASHING_TOPIC,
+            BLS_TO_EXECUTION_CHANGE_TOPIC,
+        )
+
+        if self.state is None:
+            raise ValueError("node has no state")
+        add, topic = {
+            "voluntary_exit": (self.operation_pool.add_voluntary_exit, VOLUNTARY_EXIT_TOPIC),
+            "proposer_slashing": (self.operation_pool.add_proposer_slashing, PROPOSER_SLASHING_TOPIC),
+            "attester_slashing": (self.operation_pool.add_attester_slashing, ATTESTER_SLASHING_TOPIC),
+            "bls_to_execution_change": (
+                self.operation_pool.add_bls_to_execution_change, BLS_TO_EXECUTION_CHANGE_TOPIC
+            ),
+        }[kind]
+        added = await self._on_state_thread(add, self.state, op)
+        if added and self.beacon_api:
+            from .beacon_api.ssz_json import to_json
+            self.beacon_api.emit(kind, to_json(op))
+        if publish and self.beacon_gossip:
+            await self.beacon_gossip.publish_operation(topic, op.encode_bytes())
+        return added
+
+    async def _on_p2p_operation(self, kind: str, op_type, data: bytes, from_peer: str) -> None:
+        try:
+            op = op_type.decode_bytes(data)
+            await self.submit_operation(kind, op, publish=False)
+        except ValueError as e:
+            logger.debug(f"P2P: invalid {kind} from {from_peer[:16]}: {e}")
+            self._record_peer_event(from_peer, f"gossip_invalid_{kind}")
+        except Exception as e:
+            logger.warning(f"P2P: {kind} handling failed: {e}")
+
+    async def _on_p2p_voluntary_exit(self, data: bytes, from_peer: str) -> None:
+        from .spec.types.phase0 import SignedVoluntaryExit
+        await self._on_p2p_operation("voluntary_exit", SignedVoluntaryExit, data, from_peer)
+
+    async def _on_p2p_proposer_slashing(self, data: bytes, from_peer: str) -> None:
+        from .spec.types.phase0 import ProposerSlashing
+        await self._on_p2p_operation("proposer_slashing", ProposerSlashing, data, from_peer)
+
+    async def _on_p2p_attester_slashing(self, data: bytes, from_peer: str) -> None:
+        await self._on_p2p_operation("attester_slashing", self.attester_slashing_type(), data, from_peer)
+
+    async def _on_p2p_bls_to_execution_change(self, data: bytes, from_peer: str) -> None:
+        from .spec.types.capella import SignedBLSToExecutionChange
+        await self._on_p2p_operation("bls_to_execution_change", SignedBLSToExecutionChange, data, from_peer)
+
+    def attester_slashing_type(self, fork: Optional[str] = None):
+        from .spec.types.phase0 import Phase0AttesterSlashing
+        from .spec.types.electra import AttesterSlashing as ElectraAttesterSlashing
+        from .spec.types.gloas import AttesterSlashing as GloasAttesterSlashing
+
+        if fork is None:
+            fork = get_config().fork_name_at_slot(self._wall_slot() if self._genesis_time else self.head_slot)
+        if fork in ("gloas", "heze"):
+            return GloasAttesterSlashing
+        if fork in ("electra", "fulu"):
+            return ElectraAttesterSlashing
+        return Phase0AttesterSlashing
+
+    async def on_single_attestation(self, single, publish_subnet: Optional[int] = None) -> None:
+        """Validate a SingleAttestation against the head state, pool it as an
+        Attestation, emit `single_attestation` and optionally gossip it.
+        Raises ValueError when invalid."""
+        from .spec.state_transition.helpers.beacon_committee import (
+            get_beacon_committee,
+            get_committee_count_per_slot,
+        )
+        from .spec.state_transition.helpers.domain import get_domain_at_epoch, compute_signing_root
+        from .spec.types.electra import Attestation as ElectraAttestation
+        from .spec.constants import DOMAIN_BEACON_ATTESTER
+        from .crypto.crypto import verify_async
+
+        state = self.state
+        if state is None:
+            raise ValueError("node has no state")
+        data = single.data
+        slot = int(data.slot)
+        epoch = slot // SLOTS_PER_EPOCH()
+        if int(data.target.epoch) != epoch:
+            raise ValueError("target epoch does not match slot")
+        state_epoch = int(state.slot) // SLOTS_PER_EPOCH()
+        if not state_epoch - 1 <= epoch <= state_epoch + MIN_SEED_LOOKAHEAD:
+            raise ValueError(f"attestation epoch {epoch} is too far from head epoch {state_epoch}")
+        committee_index = int(single.committee_index)
+        committees_per_slot = get_committee_count_per_slot(state, epoch)
+        if committee_index >= committees_per_slot:
+            raise ValueError(f"committee index {committee_index} out of range")
+        committee = [int(v) for v in get_beacon_committee(state, slot, committee_index)]
+        attester = int(single.attester_index)
+        if attester not in committee:
+            raise ValueError(f"validator {attester} is not in committee {committee_index} at slot {slot}")
+        domain = get_domain_at_epoch(state, DOMAIN_BEACON_ATTESTER, epoch)
+        if not await verify_async(
+            bytes(state.validators[attester].pubkey),
+            compute_signing_root(data, domain),
+            bytes(single.signature),
+        ):
+            raise ValueError("invalid signature")
+        fields = ElectraAttestation.fields()
+        bits = fields["aggregation_bits"](*[v == attester for v in committee])
+        committee_bits = fields["committee_bits"]()
+        committee_bits[committee_index] = True
+        attestation = ElectraAttestation(
+            aggregation_bits=bits, data=data, signature=single.signature, committee_bits=committee_bits
+        )
+        self.attestation_pool.add(attestation)
+        self._fc_on_attestation(attestation)
+        self.record_liveness(epoch, [attester])
+        if self.beacon_api:
+            from .beacon_api.ssz_json import to_json
+            self.beacon_api.emit("single_attestation", to_json(single))
+        if publish_subnet is not None and self.beacon_gossip:
+            await self.beacon_gossip.publish_attestation(publish_subnet, single.encode_bytes())
+
+    async def _on_p2p_attestation(self, data: bytes, from_peer: str, subnet_id: int) -> None:
+        from .spec.types.electra import SingleAttestation
+
+        try:
+            await self.on_single_attestation(SingleAttestation.decode_bytes(data))
+        except ValueError as e:
+            logger.debug(f"P2P: dropped attestation on subnet {subnet_id} from {from_peer[:16]}: {e}")
+        except Exception as e:
+            logger.debug(f"P2P: attestation handling failed on subnet {subnet_id}: {e}")
+
+    async def subscribe_attestation_subnet(self, subnet_id: int, until_slot: int) -> None:
+        self.attestation_subnet_subscriptions[int(subnet_id)] = max(
+            int(until_slot), self.attestation_subnet_subscriptions.get(int(subnet_id), 0)
+        )
+        if self.beacon_gossip:
+            await self.beacon_gossip.ensure_attestation_subnets([int(subnet_id)], self._on_p2p_attestation)
 
     async def _on_p2p_sync_committee_message(
         self, data: bytes, from_peer: str, subnet_id: int
@@ -4270,6 +4467,7 @@ class BeaconNode:
                     added_any = True
 
             if added_any:
+                self.record_liveness(int(message.slot) // SLOTS_PER_EPOCH(), [validator_index])
                 key = (int(message.slot), from_peer, subnet_id)
                 self._sync_msg_log_buffer.setdefault(key, []).append(validator_index)
                 if self._sync_msg_log_task is None or self._sync_msg_log_task.done():
@@ -4311,6 +4509,8 @@ class BeaconNode:
             subcommittee_index = int(contribution.subcommittee_index)
 
             added = self.sync_committee_pool.add_contribution(contribution)
+            if self.beacon_api:
+                self.beacon_api.emit_contribution_and_proof(signed_contribution)
 
             # Only log contributions that actually changed pool state. Steady-state
             # mesh chatter (everyone republishes the same aggregate to everyone)
@@ -4894,6 +5094,11 @@ class BeaconNode:
             self.store.save_state(block_state_root, new_state, data=state_data)
 
         old_head = self.head_root.hex()[:16] if self.head_root else "None"
+        old_head_root = self.head_root
+        old_head_slot = int(self.head_slot)
+        old_head_block = self.store.get_block(old_head_root) if old_head_root else None
+        ancestor_block = self.store.get_block(cursor)
+        ancestor_slot = int(ancestor_block.message.slot) if ancestor_block is not None else 0
 
         # Atomic swap.
         self.state = new_state
@@ -4905,6 +5110,7 @@ class BeaconNode:
         for _root, _signed in chain:
             _blk = _signed.message if hasattr(_signed, "message") else _signed
             self.attestation_pool.remove_included(list(_blk.body.attestations))
+            self.operation_pool.remove_included(_blk.body)
 
         from .spec import constants
         epoch = target_slot // constants.SLOTS_PER_EPOCH()
@@ -4918,6 +5124,19 @@ class BeaconNode:
             f"Reorg: head moved from {old_head} → "
             f"{target_root.hex()[:16]} at slot {target_slot}"
         )
+        if self.beacon_api and old_head_root is not None and old_head_root != cursor:
+            self.beacon_api.emit("chain_reorg", {
+                "slot": str(target_slot),
+                "depth": str(max(0, old_head_slot - ancestor_slot)),
+                "old_head_block": "0x" + old_head_root.hex(),
+                "new_head_block": "0x" + target_root.hex(),
+                "old_head_state": "0x" + (
+                    bytes(old_head_block.message.state_root) if old_head_block is not None else b"\x00" * 32
+                ).hex(),
+                "new_head_state": "0x" + block_state_root.hex(),
+                "epoch": str(epoch),
+                "execution_optimistic": False,
+            })
         self._fc_on_block(target_signed_block, self.state)
 
         # Forkchoice update with EL so it tracks the new head.
