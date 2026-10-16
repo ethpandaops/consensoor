@@ -29,8 +29,8 @@ class NetworkConfig:
     # entries; optional and introduces no validity rules.
     gas_limit_schedule: list = field(default_factory=list)
     slot_duration_ms: int = 12000
-    # [New in EIP8198]
-    slot_duration_ms_eip8198: int = 10000
+    # [New in Heze:EIP8198]
+    slot_duration_ms_heze: int = 10000
     seconds_per_eth1_block: int = 14
 
     # Intra-slot timing (basis points = hundredths of a percent)
@@ -78,8 +78,6 @@ class NetworkConfig:
     gloas_fork_epoch: int = 2**64 - 1
     heze_fork_version: bytes = field(default_factory=lambda: bytes.fromhex("08000000"))
     heze_fork_epoch: int = 2**64 - 1
-    eip8198_fork_version: bytes = field(default_factory=lambda: bytes.fromhex("e8198000"))
-    eip8198_fork_epoch: int = 2**64 - 1
 
     terminal_total_difficulty: int = 2**256 - 1
     terminal_block_hash: bytes = field(default_factory=lambda: b"\x00" * 32)
@@ -153,7 +151,7 @@ class NetworkConfig:
     min_slots_for_inclusion_lists_requests: int = 1
     max_transactions_bytes_per_inclusion_list: int = 8192
 
-    # EIP-8198 networking: data column retention in wall-clock ms
+    # Heze (EIP-8198) networking: data column retention in wall-clock ms
     # (2**12 epochs * 32 slots * 12s on mainnet)
     min_blob_data_retention_ms: int = 1572864000
 
@@ -189,7 +187,7 @@ class NetworkConfig:
         config.config_name = "minimal"
         config.preset_base = "minimal"
         config.slot_duration_ms = 6000
-        config.slot_duration_ms_eip8198 = 5000
+        config.slot_duration_ms_heze = 5000
         config.min_genesis_active_validator_count = 64
         config.genesis_delay = 300
         config.min_validator_withdrawability_delay = 256
@@ -205,7 +203,6 @@ class NetworkConfig:
         config.fulu_fork_version = bytes.fromhex("06000001")
         config.gloas_fork_version = bytes.fromhex("07000001")
         config.heze_fork_version = bytes.fromhex("08000001")
-        config.eip8198_fork_version = bytes.fromhex("e8198001")
         config.min_blob_data_retention_ms = 196608000
         # Timing values (same as mainnet by default, loaded from config)
         config.attestation_due_bps = 3333
@@ -245,7 +242,6 @@ class NetworkConfig:
             "fulu_fork_version",
             "gloas_fork_version",
             "heze_fork_version",
-            "eip8198_fork_version",
         }
         for key, value in data.items():
             attr_name = key.lower()
@@ -268,13 +264,12 @@ class NetworkConfig:
             f"Config loaded: fulu_fork_epoch={config.fulu_fork_epoch}, "
             f"gloas_fork_epoch={config.gloas_fork_epoch}, "
             f"heze_fork_epoch={config.heze_fork_epoch}, "
-            f"eip8198_fork_epoch={config.eip8198_fork_epoch}, "
             f"slot_durations={config.get_slot_durations()}"
         )
         return config
 
     # ------------------------------------------------------------------
-    # EIP-8198: fork-specific slot durations
+    # Heze (EIP-8198): fork-specific slot durations
     # ------------------------------------------------------------------
 
     def _validate_slot_durations(self) -> None:
@@ -291,7 +286,7 @@ class NetworkConfig:
             (fork_epoch, int(duration_ms))
             for fork_epoch, duration_ms in [
                 (0, self.slot_duration_ms),
-                (self.eip8198_fork_epoch, self.slot_duration_ms_eip8198),
+                (self.heze_fork_epoch, self.slot_duration_ms_heze),
             ]
             if fork_epoch != far_future
         ]
@@ -360,7 +355,7 @@ class NetworkConfig:
         return basis_points * self.get_slot_duration_ms_at_slot(slot) // 10000
 
     def compute_blob_data_retention_start_epoch(self, epoch: int) -> int:
-        """EIP-8198 ``compute_blob_data_retention_start_epoch``."""
+        """Heze (EIP-8198) ``compute_blob_data_retention_start_epoch``."""
         from .constants import SLOTS_PER_EPOCH
         spe = SLOTS_PER_EPOCH()
         window_ms = int(self.min_blob_data_retention_ms)
@@ -371,7 +366,7 @@ class NetworkConfig:
 
     def get_data_column_retention_start_epoch(self, epoch: int) -> int:
         """First epoch of the data column sidecar retention window at ``epoch``."""
-        if self.is_eip8198_active(epoch):
+        if self.is_heze_active(epoch):
             return self.compute_blob_data_retention_start_epoch(epoch)
         return max(epoch - int(self.min_epochs_for_data_column_sidecars_requests), 0)
 
@@ -390,8 +385,6 @@ class NetworkConfig:
 
     def get_fork_version(self, epoch: int) -> bytes:
         """Get the fork version active at the given epoch."""
-        if epoch >= self.eip8198_fork_epoch:
-            return self.eip8198_fork_version
         if epoch >= self.heze_fork_epoch:
             return self.heze_fork_version
         if epoch >= self.gloas_fork_epoch:
@@ -427,7 +420,6 @@ class NetworkConfig:
             (self.fulu_fork_epoch, self.fulu_fork_version, "fulu"),
             (self.gloas_fork_epoch, self.gloas_fork_version, "gloas"),
             (self.heze_fork_epoch, self.heze_fork_version, "heze"),
-            (self.eip8198_fork_epoch, self.eip8198_fork_version, "eip8198"),
         ]
         scheduled = [(e, v, n) for e, v, n in forks if e < FAR_FUTURE_EPOCH]
         return sorted(scheduled, key=lambda x: x[0])
@@ -449,11 +441,8 @@ class NetworkConfig:
         return epoch >= self.gloas_fork_epoch
 
     def is_heze_active(self, epoch: int) -> bool:
-        """Check if Heze (FOCIL) is active at the given epoch (EIP-8198 builds on it)."""
-        return epoch >= self.heze_fork_epoch or epoch >= self.eip8198_fork_epoch
-
-    def is_eip8198_active(self, epoch: int) -> bool:
-        return epoch >= self.eip8198_fork_epoch
+        """Check if Heze (FOCIL, quick slots) is active at the given epoch."""
+        return epoch >= self.heze_fork_epoch
 
     def fork_name_at_epoch(self, epoch: int) -> str:
         """Return the spec fork name active at the given epoch.
@@ -465,8 +454,6 @@ class NetworkConfig:
         check only tells us how SSZ was decoded, not what the spec
         thinks the active fork is.
         """
-        if epoch >= self.eip8198_fork_epoch:
-            return "eip8198"
         if epoch >= self.heze_fork_epoch:
             return "heze"
         if epoch >= self.gloas_fork_epoch:

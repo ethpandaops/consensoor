@@ -5,9 +5,6 @@ EIP-8015, drops the eth1/deposit fields from ``BeaconBlockBody`` and
 ``BeaconState``. Every container that transitively embeds them gets a
 Heze-local class so its SSZ schema follows. Everything else is the Gloas type
 re-exported unchanged.
-
-EIP-8198 (quick slots) is built on Heze and does not change any container,
-so these are also the EIP-8198 types.
 """
 
 from .base import (

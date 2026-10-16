@@ -130,8 +130,11 @@ def fork_epochs_for_case(request):
             continue
         saved[attr] = getattr(config, attr)
         setattr(config, attr, 0 if i <= idx else far)
-    saved["eip8198_fork_epoch"] = config.eip8198_fork_epoch
-    config.eip8198_fork_epoch = far
+    # pyspec leaves HEZE_FORK_EPOCH unscheduled for state tests, which keeps the
+    # slot duration schedule inert; transition cases schedule it at their fork epoch.
+    if fork == "heze" and "/transition/" not in case:
+        saved["slot_duration_ms_heze"] = config.slot_duration_ms_heze
+        config.slot_duration_ms_heze = config.slot_duration_ms
     # A case may carry its own config.yaml (e.g. GLOAS_FORK_EPOCH: 1).
     if case_path is not None and (case_path / "config.yaml").exists():
         import yaml
@@ -139,7 +142,7 @@ def fork_epochs_for_case(request):
             case_cfg = yaml.safe_load(f) or {}
         for key, value in case_cfg.items():
             attr = key.lower()
-            if attr.endswith("_fork_epoch") and hasattr(config, attr):
+            if (attr.endswith("_fork_epoch") or attr.startswith("slot_duration_ms")) and hasattr(config, attr):
                 saved.setdefault(attr, getattr(config, attr))
                 setattr(config, attr, int(value))
     try:

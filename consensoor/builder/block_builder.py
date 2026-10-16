@@ -154,7 +154,7 @@ class BlockBuilder:
             return None
 
         fork = self._get_fork_for_slot(slot)
-        # Heze/EIP-8198 blocks are Gloas-shaped; only the bid (and so the
+        # Heze blocks are Gloas-shaped; only the bid (and so the
         # body/block containers) change type.
         self._heze = get_config().is_heze_active(slot // SLOTS_PER_EPOCH())
         logger.debug(f"Building block for fork: {fork} (heze={self._heze})")

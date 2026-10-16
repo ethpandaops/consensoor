@@ -703,10 +703,9 @@ def _schedule_forks_through(fork: str) -> None:
     config = get_config()
     for i, name in enumerate(order):
         setattr(config, f"{name}_fork_epoch", 0 if i <= order.index(fork) else 2**64 - 1)
-    config.eip8198_fork_epoch = 2**64 - 1
 
 
-PREVIOUS_FORK = {"heze": "gloas", "gloas": "fulu", "eip8198": "heze"}
+PREVIOUS_FORK = {"heze": "gloas", "gloas": "fulu"}
 
 
 def discover_fork_tests(spec_tests_dir: Path):

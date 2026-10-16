@@ -302,7 +302,7 @@ def process_attestation_altair(
                     epoch_participation[index] = add_flag(
                         int(epoch_participation[index]), flag_index
                     )
-                    # [Modified in EIP8198] priced at the target epoch
+                    # [Modified in Heze:EIP8198] priced at the target epoch
                     base_reward = get_base_reward(state, index, int(data.target.epoch))
                     proposer_reward_numerator += base_reward * weight
                     will_set_new_flag = True

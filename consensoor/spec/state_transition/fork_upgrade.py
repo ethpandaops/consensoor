@@ -496,21 +496,6 @@ def upgrade_to_heze(pre: GloasBeaconState, fork_version: bytes, epoch: int):
     return post
 
 
-def upgrade_to_eip8198(pre, fork_version: bytes, epoch: int):
-    """Upgrade a Heze state to EIP-8198 (quick slots): only ``fork`` changes."""
-    from ..types.heze import BeaconState as HezeBeaconState
-
-    fields = {name: getattr(pre, name) for name in HezeBeaconState.fields().keys()}
-    fields["fork"] = Fork(
-        previous_version=Version(bytes(pre.fork.current_version)),
-        current_version=Version(fork_version),
-        epoch=Epoch(epoch),
-    )
-    post = HezeBeaconState(**fields)
-    logger.debug(f"Upgraded state to EIP-8198 at epoch {epoch}")
-    return post
-
-
 def upgrade_attestation_to_gloas(pre):
     """Upgrade a pre-Gloas (Electra/Fulu) attestation to the Gloas type.
 
@@ -586,8 +571,7 @@ def maybe_upgrade_state(state: "BeaconState", target_epoch: int) -> "BeaconState
         Upgraded state if a fork occurs, otherwise the original state
     """
     config = get_config()
-    # Several forks may share an activation epoch (e.g. HEZE and EIP8198 on
-    # a devnet); apply each in schedule order.
+    # Several forks may share an activation epoch; apply each in schedule order.
     for fork_epoch, fork_version, fork_name in config.get_fork_schedule():
         if fork_epoch != target_epoch:
             continue
@@ -607,8 +591,6 @@ def _upgrade_one(state, fork_name: str, fork_version: bytes, target_epoch: int):
         f"(version {fork_version.hex()})"
     )
 
-    from ..types.heze import BeaconState as HezeBeaconState
-
     if fork_name == "capella" and isinstance(state, BellatrixBeaconState):
         return upgrade_to_capella(state, fork_version, target_epoch)
     elif fork_name == "deneb" and isinstance(state, CapellaBeaconState):
@@ -621,15 +603,6 @@ def _upgrade_one(state, fork_name: str, fork_version: bytes, target_epoch: int):
         return upgrade_to_gloas(state, fork_version, target_epoch)
     elif fork_name == "heze" and isinstance(state, GloasBeaconState):
         return upgrade_to_heze(state, fork_version, target_epoch)
-    elif fork_name == "eip8198" and isinstance(state, GloasBeaconState):
-        # HEZE_FORK_EPOCH not scheduled before EIP8198: take the Heze step first
-        return upgrade_to_eip8198(
-            upgrade_to_heze(state, get_config().heze_fork_version, target_epoch),
-            fork_version,
-            target_epoch,
-        )
-    elif fork_name == "eip8198" and isinstance(state, HezeBeaconState):
-        return upgrade_to_eip8198(state, fork_version, target_epoch)
     else:
         logger.warning(
             f"No upgrade function for {fork_name} from state type {type(state).__name__}. "
