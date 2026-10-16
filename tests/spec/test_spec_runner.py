@@ -1535,11 +1535,19 @@ def discover_fork_choice_tests(spec_tests_dir: Path, handler_group: str):
 def _run_consensoor_fork_choice_case(case_id: str, case_path: Path, preset: str, with_fcr: bool):
     import snappy
     from consensoor.spec.constants import set_preset
-    from consensoor.spec.network_config import load_config_from_upstream, set_config
+    from consensoor.spec.network_config import NetworkConfig, set_config
     set_preset(preset)
-    set_config(load_config_from_upstream(preset))
+    config = NetworkConfig.from_yaml(Path(__file__).parent / "configs" / f"{preset}.yaml")
+    set_config(config)
     fork = case_id.split("/", 1)[0]
     _schedule_forks_through(fork)
+    if fork == "heze":
+        config.slot_duration_ms_heze = config.slot_duration_ms
+    case_config = load_yaml(case_path / "config.yaml") if (case_path / "config.yaml").exists() else None
+    for key, value in (case_config or {}).items():
+        attr = key.lower()
+        if (attr.endswith("_fork_epoch") or attr.startswith("slot_duration_ms")) and hasattr(config, attr):
+            setattr(config, attr, int(value))
     from consensoor.spec import fork_choice as fc
     from consensoor.spec import fast_confirmation as fcr
     from consensoor.spec.types.gloas import (
