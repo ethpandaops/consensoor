@@ -252,14 +252,14 @@ def get_validator_churn_limit(state: "BeaconState") -> int:
 
 
 def _slot_duration_ratio(epoch: int) -> tuple[int, int]:
-    """(duration at ``epoch``, genesis duration) per Heze's ``get_slot_durations``.
+    """(duration at ``epoch``, ``SLOT_DURATION_MS``) per Heze's ``get_slot_durations``.
 
-    Before HEZE_FORK_EPOCH only the genesis duration applies, so the ratio is 1:1
+    Before HEZE_FORK_EPOCH only ``SLOT_DURATION_MS`` applies, so the ratio is 1:1
     and every scaled formula reduces to its unscaled form.
     """
     from ...network_config import get_config
     config = get_config()
-    return config.get_slot_duration_ms(int(epoch)), config.genesis_slot_duration_ms
+    return config.get_slot_duration_ms(int(epoch)), int(config.slot_duration_ms)
 
 
 def _scale_by_slot_duration(value: int, epoch: int) -> int:

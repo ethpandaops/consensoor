@@ -288,11 +288,11 @@ def get_inactivity_penalty_deltas(
         inactivity_penalty_quotient = INACTIVITY_PENALTY_QUOTIENT_ALTAIR
 
     # [Modified in Heze:EIP8198] quadratic in the slot duration ratio of the
-    # previous epoch (reduces to BIAS * QUOTIENT with a genesis-only schedule)
+    # previous epoch (reduces to BIAS * QUOTIENT before HEZE_FORK_EPOCH)
     from ..helpers.accessors import _slot_duration_ratio
-    prev_ms, genesis_ms = _slot_duration_ratio(previous_epoch)
+    prev_ms, reference_ms = _slot_duration_ratio(previous_epoch)
     inactivity_penalty_denominator = (
-        INACTIVITY_SCORE_BIAS * inactivity_penalty_quotient * genesis_ms**2 // prev_ms**2
+        INACTIVITY_SCORE_BIAS * inactivity_penalty_quotient * reference_ms**2 // prev_ms**2
     )
     for index in get_eligible_validator_indices(state):
         if index not in matching_target_indices:
