@@ -231,6 +231,7 @@ Full BeaconState types implemented for all forks:
 | Electra | `ElectraBeaconState`, `ElectraBeaconBlock` | MaxEB, consolidations |
 | Fulu | `FuluBeaconState` | PeerDAS, proposer lookahead |
 | Gloas | `BeaconState`, `BeaconBlock` | ePBS (EIP-7732) |
+| PQ | `BeaconState`, `BeaconBlock` | leanXMSS signatures, VRF RANDAO, no sync committees (consensus-specs `_features/pq`) |
 
 Constants are organized by fork in `spec/constants.py`.
 
@@ -344,3 +345,20 @@ This is a prototype for local testing. Not intended for production use.
 ## License
 
 MIT
+
+## PQ fork (leanXMSS)
+
+A genesis state at `PQ_FORK_EPOCH: 0` (`PQ_FORK_VERSION`) starts the node on the `pq` feature fork of consensus-specs, built on Gloas. Validators and builders are keyed by 32-byte leanXMSS public keys, every signature is a 2404-byte leanXMSS signature at the leaf the spec assigns to the message, blocks carry one `proof` of the signatures of all their attestations (the reference concatenation of signatures), and the RANDAO reveal is a Merkle proof into the proposer's VRF tree.
+
+Signing and VRF proofs come from the `consensoor-xmss` shared library (Go, built on `github.com/nalepae/go-leanxmss`), loaded from `CONSENSOOR_XMSS_LIB`:
+
+```bash
+cd consensoor-xmss && go build -buildmode=c-shared -o libleanxmss.so .
+```
+
+Validator keystores stay BLS keystores. For a signing secret key `sk` (32 bytes, big-endian) the node derives:
+
+- leanXMSS seed `sha256("leanxmss-seed" || sk)`, whose public key must be the validator's `pubkey` in the state
+- VRF seed `sha256("vrf-seed" || sk)`, VRF leaf `i` = `sha256(vrf_seed || uint64_le(i))` for `i < 2**20` and 32 zero bytes above, in a sha256 Merkle tree of depth 31 whose root must be the validator's `vrf_root`
+
+The signing root signed at every leaf is recorded in `<data-dir>/xmss_leaves.txt`, and the node refuses to sign a different message at a recorded leaf.
