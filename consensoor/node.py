@@ -4828,6 +4828,22 @@ class BeaconNode:
             # Apply phase 2 (envelope processing) to state if the block has been processed
             await self._apply_execution_payload_envelope(signed_envelope)
 
+            next_slot = int(self.head_slot) + 1
+            prepared = self._prepared_payloads.get(next_slot)
+            if (
+                beacon_block_root == self.head_root
+                and prepared is not None
+                and self._wall_slot() < next_slot
+                and self.validator_client
+                and self.validator_client.is_our_proposer_slot(self.state, next_slot)
+                and self._is_head_payload_revealed(bytes(envelope.payload.block_hash))
+            ):
+                logger.info(
+                    f"Upcoming proposer for slot {next_slot}; "
+                    f"re-prepping payload on the revealed payload of slot {self.head_slot}"
+                )
+                await self._update_forkchoice_for_slot(int(self.head_slot))
+
             if self.beacon_api and slot is not None:
                 try:
                     await self.beacon_api.emit_execution_payload_available(
@@ -5723,15 +5739,34 @@ class BeaconNode:
         so sending it in payload attributes makes the EL build a payload whose
         withdrawals_root mismatches what peers' process_withdrawals expects —
         they reject the envelope, PTC votes absent, and the block is reorged
-        out. Always recompute with get_expected_withdrawals; across an epoch
-        boundary advance a throwaway copy first since the epoch transition
-        moves balances and withdrawability.
+        out. Recompute with get_expected_withdrawals when the payload builds
+        on the head block's payload; across an epoch boundary advance a
+        throwaway copy first since the epoch transition moves balances and
+        withdrawability. When the head block's payload is not revealed the
+        next block treats its parent as empty, process_withdrawals returns
+        early, and the payload must carry state.payload_expected_withdrawals.
         """
         state = self.state
         if state is None or not hasattr(state, "next_withdrawal_index"):
             return []
         from .spec.state_transition.block.withdrawals import get_expected_withdrawals
+
+        def to_json(withdrawals) -> list:
+            return [
+                {
+                    "index": hex(int(w.index)),
+                    "validatorIndex": hex(int(w.validator_index)),
+                    "address": "0x" + bytes(w.address).hex(),
+                    "amount": hex(int(w.amount)),
+                }
+                for w in withdrawals
+            ]
+
         try:
+            if hasattr(state, "latest_execution_payload_bid") and self._gloas_el_head_hash() != bytes(
+                state.latest_execution_payload_bid.block_hash
+            ):
+                return to_json(state.payload_expected_withdrawals)
             target_epoch = target_slot // SLOTS_PER_EPOCH()
             state_epoch = int(state.slot) // SLOTS_PER_EPOCH()
             if target_epoch > state_epoch:
@@ -5748,16 +5783,7 @@ class BeaconNode:
                 from .spec.state_transition.transition import process_slots
                 clone = state.copy()
                 state = process_slots(clone, int(target_slot))
-            expected = get_expected_withdrawals(state)
-            return [
-                {
-                    "index": hex(int(w.index)),
-                    "validatorIndex": hex(int(w.validator_index)),
-                    "address": "0x" + bytes(w.address).hex(),
-                    "amount": hex(int(w.amount)),
-                }
-                for w in expected.withdrawals
-            ]
+            return to_json(get_expected_withdrawals(state).withdrawals)
         except Exception as we:
             logger.warning(
                 f"expected withdrawals for slot {target_slot} failed: {we}; sending empty list"
