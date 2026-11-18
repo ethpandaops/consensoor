@@ -980,6 +980,16 @@ class BlockBuilder:
         operations = self.node.operation_pool.get_for_block(
             state, body_cls.fields()["attester_slashings"].element_cls()
         )
+        parent_requests = {}
+        bid = signed_execution_payload_bid.message
+        if bytes(bid.parent_block_hash) == bytes(state.latest_execution_payload_bid.block_hash):
+            parent_envelope = self.node.store.get_payload(
+                hash_tree_root(state.latest_block_header)
+            )
+            if parent_envelope is not None:
+                parent_requests = {
+                    "parent_execution_requests": parent_envelope.message.execution_requests
+                }
         return body_cls(
             randao_reveal=randao_reveal,
             **legacy_fields,
@@ -992,4 +1002,5 @@ class BlockBuilder:
             bls_to_execution_changes=operations["bls_to_execution_changes"],
             signed_execution_payload_bid=signed_execution_payload_bid,
             payload_attestations=payload_attestations,
+            **parent_requests,
         )
