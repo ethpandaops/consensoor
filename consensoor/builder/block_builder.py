@@ -56,6 +56,9 @@ from ..spec.constants import (
 )
 from ..spec.network_config import get_config
 from ..crypto import sign, compute_signing_root, hash_tree_root
+from ..crypto import xmss
+from ..validator import xmss_signer
+from ..spec.state_transition.helpers.pq import compute_xmss_leaf_index
 
 AnySignedBeaconBlock = Union[
     SignedBellatrixBeaconBlock,
@@ -157,7 +160,10 @@ class BlockBuilder:
         # Heze blocks are Gloas-shaped; only the bid (and so the
         # body/block containers) change type.
         self._heze = get_config().is_heze_active(slot // SLOTS_PER_EPOCH())
-        logger.debug(f"Building block for fork: {fork} (heze={self._heze})")
+        self._pq = get_config().is_pq_active(slot // SLOTS_PER_EPOCH())
+        if self._pq:
+            self._heze = False
+        logger.debug(f"Building block for fork: {fork} (heze={self._heze}, pq={self._pq})")
 
         logger.info(
             f"Building block for slot={slot}: state_slot={state.slot}, "
@@ -184,7 +190,14 @@ class BlockBuilder:
         # Use temp_state (which may be upgraded) for RANDAO and body construction
         # This ensures correct fork version is used for domain computation
         t0 = time_mod.time()
-        if randao_reveal is None:
+        if self._pq:
+            from ..spec.types.pq import VRFProof
+
+            if randao_reveal is None:
+                randao_reveal = VRFProof(*xmss_signer.vrf_proof(proposer_key, slot))
+            else:
+                randao_reveal = VRFProof.decode_bytes(bytes(randao_reveal))
+        elif randao_reveal is None:
             randao_reveal = self._compute_randao_reveal(temp_state, slot, proposer_key)
         else:
             randao_reveal = BLSSignature(randao_reveal)
@@ -202,9 +215,19 @@ class BlockBuilder:
             max_attestations = min(8, MAX_ATTESTATIONS())
         net_config = get_config()
         electra_fork_epoch = getattr(net_config, 'electra_fork_epoch', 2**64 - 1)
-        pool_attestations = self.node.attestation_pool.get_attestations_for_block(
-            slot, max_attestations * 2, electra_fork_epoch  # Get extra to account for filtering
-        )
+        attestation_proofs: dict[int, bytes] = {}
+        if self._pq:
+            from ..spec.constants import MAX_ATTESTATIONS_PQ, MAX_STARK_PROOF_SIZE, XMSS_SIGNATURE_SIZE
+
+            max_attestations = MAX_ATTESTATIONS_PQ
+            pool_attestations = []
+            for attestation, proof in self.node.pq_attestation_pool.get_attestations_for_block(slot):
+                attestation_proofs[id(attestation)] = proof
+                pool_attestations.append(attestation)
+        else:
+            pool_attestations = self.node.attestation_pool.get_attestations_for_block(
+                slot, max_attestations * 2, electra_fork_epoch  # Get extra to account for filtering
+            )
 
         # Pre-validate attestations before including in block
         # This catches attestations from forked chains that would fail BLS verification.
@@ -222,8 +245,10 @@ class BlockBuilder:
         )
         from ..spec.state_transition.helpers.predicates import is_valid_indexed_attestation
         from ..spec.state_transition.helpers.accessors import get_current_epoch
+        from ..spec.state_transition.helpers.pq import get_attestation_statements
 
         valid_attestations = []
+        proof_size = 0
         skipped_already_included = 0
         has_participation_flags = hasattr(temp_state, "previous_epoch_participation")
         current_epoch_for_state = get_current_epoch(temp_state) if has_participation_flags else None
@@ -233,7 +258,10 @@ class BlockBuilder:
                     data = att.data
                     inclusion_delay = int(temp_state.slot) - int(data.slot)
                     flag_indices = get_attestation_participation_flag_indices(
-                        temp_state, data, inclusion_delay
+                        temp_state,
+                        data,
+                        inclusion_delay,
+                        parent_slot=int(temp_state.latest_block_header.slot) if self._pq else None,
                     )
                     if not flag_indices:
                         skipped_already_included += 1
@@ -255,6 +283,19 @@ class BlockBuilder:
                         skipped_already_included += 1
                         continue
 
+                if self._pq:
+                    proof = attestation_proofs[id(att)]
+                    proof_size += len(proof)
+                    if proof_size > MAX_STARK_PROOF_SIZE:
+                        break
+                    if xmss.verify_aggregates(get_attestation_statements(temp_state, att), proof):
+                        valid_attestations.append(att)
+                        if len(valid_attestations) >= max_attestations:
+                            break
+                    else:
+                        proof_size -= len(proof)
+                        logger.debug(f"Skipping attestation with invalid proof: slot={att.data.slot}")
+                    continue
                 indexed = get_indexed_attestation(temp_state, att)
                 if is_valid_indexed_attestation(temp_state, indexed):
                     valid_attestations.append(att)
@@ -285,13 +326,27 @@ class BlockBuilder:
             signed_bid_cls = SignedExecutionPayloadBid
             if self._heze:
                 from ..spec.types.heze import SignedExecutionPayloadBid as signed_bid_cls
-            signed_execution_payload_bid = signed_bid_cls(
-                message=execution_payload_bid,
-                signature=BLSSignature(g2_point_at_infinity),
-            )
-            body = self._build_gloas_block_body(
-                temp_state, randao_reveal, signed_execution_payload_bid, attestations
-            )
+            if self._pq:
+                from ..spec.types import pq as pq_types
+
+                signed_execution_payload_bid = pq_types.SignedExecutionPayloadBid(
+                    message=execution_payload_bid
+                )
+                body = self._build_pq_block_body(
+                    temp_state,
+                    randao_reveal,
+                    signed_execution_payload_bid,
+                    attestations,
+                    xmss.merge_proofs([attestation_proofs[id(a)] for a in attestations]),
+                )
+            else:
+                signed_execution_payload_bid = signed_bid_cls(
+                    message=execution_payload_bid,
+                    signature=BLSSignature(g2_point_at_infinity),
+                )
+                body = self._build_gloas_block_body(
+                    temp_state, randao_reveal, signed_execution_payload_bid, attestations
+                )
             logger.info(
                 f"Built GLOAS block body with self-build bid: "
                 f"block_hash={execution_payload_dict['blockHash'][:18]}"
@@ -346,7 +401,16 @@ class BlockBuilder:
         from ..spec.state_transition.helpers.domain import get_domain_at_epoch
         domain = get_domain_at_epoch(state, DOMAIN_BEACON_PROPOSER, slot // SLOTS_PER_EPOCH())
         signing_root = compute_signing_root(block, domain)
-        signature = sign(proposer_key.privkey, signing_root)
+        if self._pq:
+            from ..spec.constants import LEAF_OFFSET_BEACON_PROPOSER
+
+            signature = xmss_signer.sign(
+                proposer_key,
+                compute_xmss_leaf_index(slot, LEAF_OFFSET_BEACON_PROPOSER),
+                signing_root,
+            )
+        else:
+            signature = sign(proposer_key.privkey, signing_root)
 
         signed_block = self._create_signed_block(block, signature, fork)
 
@@ -377,6 +441,16 @@ class BlockBuilder:
             )
         elif fork == "deneb":
             return DenebBeaconBlock(
+                slot=Slot(slot),
+                proposer_index=ValidatorIndex(proposer_index),
+                parent_root=Root(parent_root),
+                state_root=Root(state_root),
+                body=body,
+            )
+        elif fork == "gloas" and getattr(self, "_pq", False):
+            from ..spec.types.pq import BeaconBlock as PQBeaconBlock
+
+            return PQBeaconBlock(
                 slot=Slot(slot),
                 proposer_index=ValidatorIndex(proposer_index),
                 parent_root=Root(parent_root),
@@ -426,6 +500,10 @@ class BlockBuilder:
                 message=block,
                 signature=BLSSignature(signature),
             )
+        elif fork == "gloas" and getattr(self, "_pq", False):
+            from ..spec.types.pq import SignedBeaconBlock as SignedPQBeaconBlock
+
+            return SignedPQBeaconBlock(message=block, signature=signature)
         elif fork == "gloas":
             if getattr(self, "_heze", False):
                 from ..spec.types.heze import SignedBeaconBlock as SignedHezeBeaconBlock
@@ -640,7 +718,7 @@ class BlockBuilder:
 
     @staticmethod
     def _decode_execution_requests_hex(
-        execution_requests: list | None, gloas: bool = False
+        execution_requests: list | None, gloas: bool = False, pq: bool = False
     ) -> ExecutionRequests:
         """Turn the EL's EIP-7685 hex-string list into an SSZ ExecutionRequests.
 
@@ -686,6 +764,16 @@ class BlockBuilder:
             decoders[0x03] = (BUILDER_DEPOSIT_SIZE, BuilderDepositRequest, builder_deposits)
             decoders[0x04] = (BUILDER_EXIT_SIZE, BuilderExitRequest, builder_exits)
 
+        validator_preregistrations: list = []
+        builder_preregistrations: list = []
+        voluntary_exits: list = []
+        if pq:
+            from ..spec.types import pq as pq_types
+
+            decoders[0x07] = (96, pq_types.ValidatorPreregistrationRequest, validator_preregistrations)
+            decoders[0x08] = (64, pq_types.BuilderPreregistrationRequest, builder_preregistrations)
+            decoders[0x09] = (32, pq_types.VoluntaryExitRequest, voluntary_exits)
+
         for entry in execution_requests or []:
             if not isinstance(entry, str):
                 continue
@@ -706,6 +794,18 @@ class BlockBuilder:
                 continue
             for i in range(0, len(body), size):
                 target.append(cls.decode_bytes(body[i:i + size]))
+
+        if pq:
+            return pq_types.ExecutionRequests(
+                deposits=deposits,
+                withdrawals=withdrawals,
+                consolidations=consolidations,
+                builder_deposits=builder_deposits,
+                builder_exits=builder_exits,
+                validator_preregistrations=validator_preregistrations,
+                builder_preregistrations=builder_preregistrations,
+                voluntary_exits=voluntary_exits,
+            )
 
         if gloas:
             from ..spec.types.gloas import ExecutionRequests as GloasExecutionRequests
@@ -864,7 +964,9 @@ class BlockBuilder:
         # entry like 0x00<dep1_192><dep2_192> must produce two DepositRequests.
         # The previous one-record-per-type decode silently dropped extras
         # and produced a wrong bid root for any block with >1 deposit.
-        exec_requests_obj = self._decode_execution_requests_hex(execution_requests, gloas=True)
+        exec_requests_obj = self._decode_execution_requests_hex(
+            execution_requests, gloas=True, pq=getattr(self, "_pq", False)
+        )
         execution_requests_root = hash_tree_root(exec_requests_obj)
 
         bid_cls = ExecutionPayloadBid
@@ -905,6 +1007,39 @@ class BlockBuilder:
         )
 
         return bid
+
+    def _build_pq_block_body(
+        self,
+        state,
+        randao_reveal,
+        signed_execution_payload_bid,
+        attestations,
+        proof: bytes,
+    ):
+        from ..spec.types import pq as pq_types
+
+        operations = self.node.operation_pool.get_for_block(state, pq_types.AttesterSlashing)
+        parent_requests = {}
+        bid = signed_execution_payload_bid.message
+        if bytes(bid.parent_block_hash) == bytes(state.latest_execution_payload_bid.block_hash):
+            parent_envelope = self.node.store.get_payload(
+                hash_tree_root(state.latest_block_header)
+            )
+            if parent_envelope is not None:
+                parent_requests = {
+                    "parent_execution_requests": parent_envelope.message.execution_requests
+                }
+        return pq_types.BeaconBlockBody(
+            randao_reveal=randao_reveal,
+            eth1_data=state.eth1_data,
+            graffiti=Bytes32(self._block_graffiti()),
+            proposer_slashings=operations["proposer_slashings"],
+            attester_slashings=operations["attester_slashings"],
+            attestations=list(attestations or []),
+            signed_execution_payload_bid=signed_execution_payload_bid,
+            proof=proof,
+            **parent_requests,
+        )
 
     def _build_gloas_block_body(
         self,

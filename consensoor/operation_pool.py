@@ -117,7 +117,7 @@ class OperationPool:
             self.proposer_slashings.pop(int(slashing.signed_header_1.message.proposer_index), None)
         for slashing in body.attester_slashings:
             self.attester_slashings.pop(bytes(hash_tree_root(slashing)), None)
-        for signed_exit in body.voluntary_exits:
+        for signed_exit in getattr(body, "voluntary_exits", []):
             self.voluntary_exits.pop(int(signed_exit.message.validator_index), None)
         for signed_change in getattr(body, "bls_to_execution_changes", []):
             self.bls_to_execution_changes.pop(int(signed_change.message.validator_index), None)

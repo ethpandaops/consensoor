@@ -16,7 +16,8 @@ from ..version import get_cl_version, get_cl_commit, get_cl_client_version_info,
 
 logger = logging.getLogger(__name__)
 
-FORK_NAMES = ("phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas", "heze")
+FORK_NAMES = ("phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas", "heze", "pq")
+GLOAS_FAMILY = ("gloas", "heze", "pq")
 VALIDATOR_STATUSES = frozenset({
     "pending_initialized", "pending_queued", "active_ongoing", "active_exiting", "active_slashed",
     "exited_unslashed", "exited_slashed", "withdrawal_possible", "withdrawal_done",
@@ -1157,7 +1158,7 @@ class BeaconAPI:
         """GET /eth/v1/beacon/blinded_blocks/{block_id}"""
         _, signed_block, _, finalized = self._block(request.match_info["block_id"])
         version = self._fork_at_slot(int(signed_block.message.slot))
-        if version in ("gloas", "heze"):
+        if version in GLOAS_FAMILY:
             raise ApiError(400, f"Blinded blocks are not available from Gloas (block fork {version})")
         if hasattr(signed_block.message.body, "execution_payload"):
             signed_block = await asyncio.to_thread(self._blind, signed_block, version)
@@ -1168,7 +1169,7 @@ class BeaconAPI:
     async def post_blinded_block_v2(self, request: web.Request) -> web.Response:
         """POST /eth/v2/beacon/blinded_blocks"""
         version = self._consensus_version(request)
-        if version in ("gloas", "heze"):
+        if version in GLOAS_FAMILY:
             raise ApiError(400, "Gloas blocks have no blinded form, publish them via POST /eth/v2/beacon/blocks")
         if version not in ("phase0", "altair"):
             raise ApiError(400, "Cannot unblind the block: no builder is connected to this node")
@@ -1262,7 +1263,7 @@ class BeaconAPI:
     async def post_execution_payload_bids(self, request: web.Request) -> web.Response:
         """POST /eth/v1/beacon/execution_payload_bids"""
         version = self._consensus_version(request)
-        if version not in ("gloas", "heze"):
+        if version not in GLOAS_FAMILY:
             raise ApiError(400, "Execution payload bids are only available from Gloas")
         signed = await self._decode_body(request, self._signed_bid_type(version))
         try:
@@ -1862,7 +1863,7 @@ class BeaconAPI:
         if "builder_boost_factor" in request.query:
             self._uint(request.query["builder_boost_factor"], "builder_boost_factor")
         version = self._fork_at_slot(slot)
-        if version in ("gloas", "heze"):
+        if version in GLOAS_FAMILY:
             raise ApiError(400, "produceBlockV3 is not available from Gloas, use /eth/v4/validator/blocks")
         produced = await self._produce_block(slot, randao_reveal, graffiti)
         block = produced["block"]
@@ -1927,7 +1928,7 @@ class BeaconAPI:
             state = await self._state_at_slot(slot) or state
         epoch_start = epoch * self._spe()
         target_root = head_root if int(head_block.message.slot) <= epoch_start else self._block_root_at_or_before(epoch_start)
-        if version in ("gloas", "heze"):
+        if version in GLOAS_FAMILY:
             if int(head_block.message.slot) == slot:
                 index = 0
             else:
@@ -1960,7 +1961,7 @@ class BeaconAPI:
         if aggregate is None:
             raise ApiError(404, "No matching attestations found")
         version = self._fork_at_slot(slot)
-        if version in ("gloas", "heze"):
+        if version in GLOAS_FAMILY:
             aggregate = GloasAttestation.decode_bytes(aggregate.encode_bytes())
         return self._versioned_response(request, version, aggregate.encode_bytes(), to_json(aggregate))
 
@@ -1970,7 +1971,7 @@ class BeaconAPI:
         from ..spec.types.phase0 import SignedAggregateAndProof
         from ..spec.types.gloas import SignedAggregateAndProof as GloasSignedAggregateAndProof
 
-        if version in ("gloas", "heze"):
+        if version in GLOAS_FAMILY:
             return GloasSignedAggregateAndProof
         if version in ("electra", "fulu"):
             return SignedElectraAggregateAndProof
@@ -2750,7 +2751,9 @@ class BeaconAPI:
 
     @staticmethod
     def _signed_bid_type(version: str):
-        if version == "heze":
+        if version == "pq":
+            from ..spec.types.pq import SignedExecutionPayloadBid
+        elif version == "heze":
             from ..spec.types.heze import SignedExecutionPayloadBid
         else:
             from ..spec.types.gloas import SignedExecutionPayloadBid
@@ -2758,7 +2761,7 @@ class BeaconAPI:
 
     @staticmethod
     def _signed_block_type(version: str):
-        from ..spec.types import phase0, altair, bellatrix, capella, deneb, electra, gloas, heze
+        from ..spec.types import phase0, altair, bellatrix, capella, deneb, electra, gloas, heze, pq
 
         types = {
             "phase0": phase0.SignedPhase0BeaconBlock,
@@ -2770,6 +2773,7 @@ class BeaconAPI:
             "fulu": electra.SignedElectraBeaconBlock,
             "gloas": gloas.SignedBeaconBlock,
             "heze": heze.SignedBeaconBlock,
+            "pq": pq.SignedBeaconBlock,
         }
         if version not in types:
             raise ValueError(f"unsupported consensus version {version!r}")
@@ -3049,7 +3053,7 @@ class BeaconAPI:
         if not await request.read():
             raise ApiError(400, "Missing BuilderConfig request body")
         version = self._fork_at_slot(slot)
-        if version not in ("gloas", "heze"):
+        if version not in GLOAS_FAMILY:
             raise ApiError(400, "produceBlockV4 is only available from Gloas")
         produced = await self._produce_block(slot, randao_reveal, graffiti)
 

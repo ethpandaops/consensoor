@@ -850,7 +850,7 @@ def on_block(store: Store, signed_block) -> None:
     store.payload_timeliness_vote[block_root] = [None] * PTC_SIZE()
     store.payload_data_availability_vote[block_root] = [None] * PTC_SIZE()
 
-    notify_ptc_messages(store, state, block.body.payload_attestations)
+    notify_ptc_messages(store, state, getattr(block.body, "payload_attestations", []))
     record_block_timeliness(store, block_root)
     update_proposer_boost_root(store, head.root, block_root)
     update_checkpoints(store, cp(state.current_justified_checkpoint), cp(state.finalized_checkpoint))
@@ -862,6 +862,13 @@ def on_attestation(store: Store, attestation, is_from_block: bool = False) -> No
     target = cp(attestation.data.target)
     store_target_checkpoint_state(store, target)
     target_state = store.checkpoint_states[target]
+    if not hasattr(attestation, "signature"):
+        from .state_transition.helpers.attestation import get_attesting_indices
+
+        attesting_indices = sorted(int(i) for i in get_attesting_indices(target_state, attestation))
+        assert len(attesting_indices) > 0
+        update_latest_messages(store, attesting_indices, attestation)
+        return
     indexed_attestation = get_indexed_attestation(target_state, attestation)
     assert is_valid_indexed_attestation(target_state, indexed_attestation)
     update_latest_messages(store, [int(i) for i in indexed_attestation.attesting_indices], attestation)
@@ -944,7 +951,21 @@ def on_payload_attestation_message(store: Store, ptc_message, is_from_block: boo
     validator_index = int(ptc_message.validator_index)
     ptc_indices = [i for i, v in enumerate(ptc) if int(v) == validator_index]
     assert len(ptc_indices) > 0
-    if not is_from_block:
+    if hasattr(state, "aggregation_committee_window"):
+        from .constants import DOMAIN_PTC_ATTESTER, LEAF_OFFSET_PTC_ATTESTER
+        from .state_transition.helpers.domain import compute_signing_root, get_domain
+        from .state_transition.helpers.misc import compute_epoch_at_slot
+        from .state_transition.helpers.pq import compute_xmss_leaf_index, verify_xmss
+
+        assert int(data.slot) == get_current_slot(store)
+        domain = get_domain(state, DOMAIN_PTC_ATTESTER, compute_epoch_at_slot(int(data.slot)))
+        assert verify_xmss(
+            state.validators[validator_index].pubkey,
+            compute_xmss_leaf_index(int(data.slot), LEAF_OFFSET_PTC_ATTESTER),
+            compute_signing_root(data, domain),
+            ptc_message.signature,
+        )
+    elif not is_from_block:
         assert int(data.slot) == get_current_slot(store)
         assert is_valid_indexed_payload_attestation(
             state,
@@ -979,7 +1000,7 @@ def on_block_with_state(store: Store, signed_block, post_state) -> bool:
     store.payload_timeliness_vote[block_root] = [None] * PTC_SIZE()
     store.payload_data_availability_vote[block_root] = [None] * PTC_SIZE()
     try:
-        notify_ptc_messages(store, post_state, block.body.payload_attestations)
+        notify_ptc_messages(store, post_state, getattr(block.body, "payload_attestations", []))
     except Exception as e:  # PTC bookkeeping must never break import
         logger.debug(f"notify_ptc_messages failed for {block_root.hex()[:12]}: {e}")
     record_block_timeliness(store, block_root)

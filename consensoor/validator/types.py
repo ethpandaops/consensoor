@@ -11,6 +11,8 @@ class ValidatorKey:
     pubkey: bytes
     privkey: int
     validator_index: Optional[int] = None
+    xmss_seed: Optional[bytes] = None
+    vrf_seed: Optional[bytes] = None
 
 
 @dataclass

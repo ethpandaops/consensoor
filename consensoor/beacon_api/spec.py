@@ -47,6 +47,8 @@ def build_spec_response() -> dict:
         "GLOAS_FORK_EPOCH": str(net_config.gloas_fork_epoch),
         "HEZE_FORK_VERSION": to_hex(net_config.heze_fork_version, 4),
         "HEZE_FORK_EPOCH": str(net_config.heze_fork_epoch),
+        "PQ_FORK_VERSION": to_hex(net_config.pq_fork_version, 4),
+        "PQ_FORK_EPOCH": str(net_config.pq_fork_epoch),
         "SLOT_DURATION_MS": str(net_config.slot_duration_ms),
         "SECONDS_PER_SLOT": str(net_config.slot_duration_ms // 1000),
         # Intra-slot timing (basis points of the slot)
@@ -195,6 +197,30 @@ def build_spec_response() -> dict:
         "MAX_TRANSACTIONS_BYTES_PER_INCLUSION_LIST": str(net_config.max_transactions_bytes_per_inclusion_list),
         "SLOT_DURATION_MS_HEZE": str(net_config.slot_duration_ms_heze),
         "MIN_BLOB_DATA_RETENTION_MS": str(net_config.min_blob_data_retention_ms),
+        "AGGREGATORS_PER_COMMITTEE": str(constants.AGGREGATORS_PER_COMMITTEE),
+        "XMSS_SIGNATURE_SIZE": str(constants.XMSS_SIGNATURE_SIZE),
+        "XMSS_RESERVED_LEAVES": str(constants.XMSS_RESERVED_LEAVES),
+        "XMSS_ATTESTATION_LEAVES": str(constants.XMSS_ATTESTATION_LEAVES),
+        "XMSS_BUILDER_BID_LEAVES": str(constants.XMSS_BUILDER_BID_LEAVES),
+        "XMSS_LEAVES_PER_SLOT": str(constants.XMSS_LEAVES_PER_SLOT),
+        "VRF_TREE_DEPTH": str(constants.VRF_TREE_DEPTH),
+        "MAX_COMMITTEES_PER_SLOT_PQ": str(constants.MAX_COMMITTEES_PER_SLOT_PQ()),
+        "MIN_ATTESTATION_INCLUSION_DELAY_PQ": str(constants.MIN_ATTESTATION_INCLUSION_DELAY_PQ),
+        "MAX_STARK_PROOF_SIZE": str(constants.MAX_STARK_PROOF_SIZE),
+        "MAX_ATTESTATIONS_PQ": str(constants.MAX_ATTESTATIONS_PQ),
+        "MAX_VALIDATOR_PREREGISTRATION_REQUESTS_PER_PAYLOAD": str(
+            constants.MAX_VALIDATOR_PREREGISTRATION_REQUESTS_PER_PAYLOAD
+        ),
+        "MAX_BUILDER_PREREGISTRATION_REQUESTS_PER_PAYLOAD": str(
+            constants.MAX_BUILDER_PREREGISTRATION_REQUESTS_PER_PAYLOAD
+        ),
+        "MAX_VOLUNTARY_EXIT_REQUESTS_PER_PAYLOAD": str(constants.MAX_VOLUNTARY_EXIT_REQUESTS_PER_PAYLOAD),
+        "PREREGISTRATIONS_LIMIT": str(constants.PREREGISTRATIONS_LIMIT),
+        "PREREGISTRATION_EXPIRY_SLOTS": str(constants.PREREGISTRATION_EXPIRY_SLOTS),
+        "UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY": str(
+            net_config.unregistered_validator_withdrawability_delay
+        ),
+        "ATTESTATION_SUBNET_COUNT_PQ": str(net_config.attestation_subnet_count_pq),
         # Networking constants
         "MAX_PAYLOAD_SIZE": str(net_config.max_payload_size),
         "MAX_REQUEST_BLOCKS": str(net_config.max_request_blocks),

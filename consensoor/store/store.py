@@ -105,6 +105,8 @@ class Store:
         logger.info(f"Fork detection: type={type_name}, module={module_name}")
 
         # Check module name for fork-specific modules
+        if module_name.endswith(".pq"):
+            return "pq"
         if "heze" in module_name.lower():
             return "heze"
         if "gloas" in module_name.lower():
@@ -170,6 +172,7 @@ class Store:
         from ..spec.types.fulu import FuluBeaconState
         from ..spec.types.gloas import BeaconState as GloasBeaconState
         from ..spec.types.heze import BeaconState as HezeBeaconState
+        from ..spec.types.pq import BeaconState as PQBeaconState
         from ..spec.types.electra import ElectraBeaconState
         from ..spec.types.deneb import DenebBeaconState
         from ..spec.types.capella import CapellaBeaconState
@@ -181,6 +184,7 @@ class Store:
             "fulu": FuluBeaconState,
             "gloas": GloasBeaconState,
             "heze": HezeBeaconState,
+            "pq": PQBeaconState,
             "electra": ElectraBeaconState,
             "deneb": DenebBeaconState,
             "capella": CapellaBeaconState,
@@ -193,6 +197,7 @@ class Store:
         """Get all signed beacon block types for deserialization."""
         from ..spec.types.gloas import SignedBeaconBlock as GloasSignedBeaconBlock
         from ..spec.types.heze import SignedBeaconBlock as HezeSignedBeaconBlock
+        from ..spec.types.pq import SignedBeaconBlock as PQSignedBeaconBlock
         from ..spec.types.electra import SignedElectraBeaconBlock
         from ..spec.types.deneb import SignedDenebBeaconBlock
         from ..spec.types.capella import SignedCapellaBeaconBlock
@@ -204,6 +209,7 @@ class Store:
             "fulu": SignedElectraBeaconBlock,
             "gloas": GloasSignedBeaconBlock,
             "heze": HezeSignedBeaconBlock,
+            "pq": PQSignedBeaconBlock,
             "electra": SignedElectraBeaconBlock,
             "deneb": SignedDenebBeaconBlock,
             "capella": SignedCapellaBeaconBlock,
@@ -379,8 +385,14 @@ class Store:
         try:
             data = self._db.get(PREFIX_PAYLOAD + root)
             if data:
-                from ..spec.types.gloas import SignedExecutionPayloadEnvelope
-                envelope = SignedExecutionPayloadEnvelope.decode_bytes(data)
+                from ..spec.network_config import get_config
+                from ..spec.types.select import GLOAS, PQ
+
+                types = PQ if get_config().pq_fork_epoch != 2**64 - 1 else GLOAS
+                try:
+                    envelope = types.SignedExecutionPayloadEnvelope.decode_bytes(data)
+                except Exception:
+                    envelope = GLOAS.SignedExecutionPayloadEnvelope.decode_bytes(data)
                 self._payload_cache[root] = envelope
                 return envelope
         except Exception as e:

@@ -37,6 +37,13 @@ Phase0AggregationBits = Bitlist[MAX_VALIDATORS_PER_COMMITTEE()]
 ElectraAggregationBits = Bitlist[MAX_VALIDATORS_PER_COMMITTEE() * MAX_COMMITTEES_PER_SLOT()]
 ElectraCommitteeBits = Bitvector[MAX_COMMITTEES_PER_SLOT()]
 from ..crypto import sign_async as bls_sign_async, hash_tree_root
+from ..spec.constants import LEAF_OFFSET_PROPOSER_PREFERENCES, LEAF_OFFSET_PTC_ATTESTER
+from ..spec.state_transition.helpers.pq import (
+    compute_xmss_attestation_leaf_index,
+    compute_xmss_leaf_index,
+    is_pq_state,
+)
+from . import xmss_signer
 from .types import ValidatorKey, ProposerDuty, AttesterDuty
 from .shuffling import get_beacon_proposer_index
 from .. import metrics
@@ -51,6 +58,19 @@ class ValidatorClient:
         self.keys = {k.pubkey: k for k in keys}
         self.pubkeys = set(k.pubkey for k in keys)
         self._validator_indices: dict[bytes, int] = {}
+
+    def use_xmss_keys(self) -> None:
+        for key in self.keys.values():
+            xmss_signer.derive(key)
+        self.keys = {k.pubkey: k for k in self.keys.values()}
+        self.pubkeys = set(self.keys)
+        self._validator_indices = {}
+
+    def prepare_xmss_leaves(self, slot: int) -> None:
+        epoch = slot // SLOTS_PER_EPOCH()
+        for key in self.keys.values():
+            xmss_signer.prepare(key, compute_xmss_attestation_leaf_index(epoch))
+            xmss_signer.prepare(key, compute_xmss_leaf_index(slot, 0))
 
     def has_key(self, pubkey: bytes) -> bool:
         """Check if we have a key for this pubkey."""
@@ -240,6 +260,28 @@ class ValidatorClient:
 
             domain = get_domain_at_epoch(state, DOMAIN_BEACON_ATTESTER, epoch)
 
+            if is_pq_state(state):
+                from ..spec.types.pq import SingleAttestation
+
+                attestation_data = AttestationData(
+                    slot=slot,
+                    index=0,
+                    beacon_block_root=head_root,
+                    source=source,
+                    target=target,
+                )
+                signing_root = compute_signing_root(attestation_data, domain)
+                signature = await xmss_signer.sign_async(
+                    key, compute_xmss_attestation_leaf_index(epoch), signing_root
+                )
+                metrics.record_attestation_produced()
+                return SingleAttestation(
+                    committee_index=committee_index,
+                    attester_index=duty.validator_index,
+                    data=attestation_data,
+                    signature=signature,
+                )
+
             if self._is_electra_fork(state):
                 # Electra+ attestations use committee_bits
                 attestation_data = AttestationData(
@@ -402,6 +444,19 @@ class ValidatorClient:
             epoch = compute_epoch_at_slot(slot)
             domain = get_domain_at_epoch(state, DOMAIN_PTC_ATTESTER, epoch)
             signing_root = compute_signing_root(data, domain)
+            if is_pq_state(state):
+                from ..spec.types.pq import PayloadAttestationMessage as PQPayloadAttestationMessage
+
+                signature = await xmss_signer.sign_async(
+                    validator_key,
+                    compute_xmss_leaf_index(slot, LEAF_OFFSET_PTC_ATTESTER),
+                    signing_root,
+                )
+                return PQPayloadAttestationMessage(
+                    validator_index=validator_key.validator_index,
+                    data=data,
+                    signature=signature,
+                )
             signature = await bls_sign_async(validator_key.privkey, signing_root)
 
             return PayloadAttestationMessage(
@@ -453,6 +508,15 @@ class ValidatorClient:
                 bytes(state.genesis_validators_root),
             )
             signing_root = compute_signing_root(preferences, domain)
+            if is_pq_state(state):
+                from ..spec.types.pq import SignedProposerPreferences as PQSignedProposerPreferences
+
+                signature = await xmss_signer.sign_async(
+                    validator_key,
+                    compute_xmss_leaf_index(proposal_slot, LEAF_OFFSET_PROPOSER_PREFERENCES),
+                    signing_root,
+                )
+                return PQSignedProposerPreferences(message=preferences, signature=signature)
             signature = await bls_sign_async(validator_key.privkey, signing_root)
 
             return SignedProposerPreferences(
