@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 
 from .crypto import hash_tree_root
 from .spec.constants import (
-    MAX_ATTESTATIONS_PQ,
+    MAX_STARK_PROOF_SIZE,
     MIN_ATTESTATION_INCLUSION_DELAY_PQ,
     SLOTS_PER_EPOCH,
     XMSS_SIGNATURE_SIZE,
@@ -13,6 +13,8 @@ from .spec.constants import (
 from .spec.types.pq import Attestation, CommitteeBits
 
 logger = logging.getLogger(__name__)
+
+MAX_PROOF_SIGNATURES = MAX_STARK_PROOF_SIZE // XMSS_SIGNATURE_SIZE
 
 
 @dataclass
@@ -80,17 +82,22 @@ class PQAttestationPool:
         return bits[0] if len(bits) == 1 else -1
 
     @staticmethod
-    def _build(data, committees: list[tuple[int, CommitteeVotes]]):
+    def _build(data, committees: list[tuple[int, CommitteeVotes]], budget: int = MAX_PROOF_SIGNATURES):
         aggregation_bits: list[bool] = []
         committee_bits = CommitteeBits()
         proof = b""
         for committee_index, votes in committees:
+            if budget <= 0:
+                break
             committee_bits[committee_index] = True
             for position in range(len(votes.committee)):
-                signature = votes.signatures.get(position)
+                signature = votes.signatures.get(position) if budget > 0 else None
                 aggregation_bits.append(signature is not None)
                 if signature is not None:
                     proof += signature
+                    budget -= 1
+        if not proof:
+            return None
         attestation = Attestation(
             aggregation_bits=aggregation_bits,
             data=data,
@@ -107,22 +114,25 @@ class PQAttestationPool:
             return None
         return self._build(entry.data, [(int(committee_index), votes)])
 
-    def get_attestations_for_block(self, current_slot: int) -> list[tuple[Attestation, bytes]]:
-        spe = SLOTS_PER_EPOCH()
-        min_slot = max(0, current_slot - 2 * spe)
-        result = []
-        for entry in self._entries.values():
-            if entry.slot + MIN_ATTESTATION_INCLUSION_DELAY_PQ > current_slot or entry.slot < min_slot:
-                continue
-            committees = [
-                (index, votes)
-                for index, votes in sorted(entry.committees.items())
-                if votes.signatures
-            ]
-            if committees:
-                result.append(self._build(entry.data, committees))
-        result.sort(key=lambda pair: int(pair[0].data.slot), reverse=True)
-        return result[: 4 * MAX_ATTESTATIONS_PQ]
+    def get_block_candidates(self, current_slot: int) -> list[bytes]:
+        min_slot = max(0, current_slot - 2 * SLOTS_PER_EPOCH())
+        candidates = [
+            (entry.slot, root)
+            for root, entry in self._entries.items()
+            if min_slot <= entry.slot <= current_slot - MIN_ATTESTATION_INCLUSION_DELAY_PQ
+            and any(votes.signatures for votes in entry.committees.values())
+        ]
+        candidates.sort(reverse=True)
+        return [root for _, root in candidates]
+
+    def build_for_block(self, data_root: bytes, budget: int):
+        entry = self._entries.get(bytes(data_root))
+        if entry is None:
+            return None
+        committees = [
+            (index, votes) for index, votes in sorted(entry.committees.items()) if votes.signatures
+        ]
+        return self._build(entry.data, committees, min(budget, MAX_PROOF_SIGNATURES))
 
     def get_attestations(self, slot: int | None = None, committee_index: int | None = None) -> list:
         result = []
@@ -132,8 +142,9 @@ class PQAttestationPool:
             for index, votes in sorted(entry.committees.items()):
                 if committee_index is not None and index != int(committee_index):
                     continue
-                if votes.signatures:
-                    result.append(self._build(entry.data, [(index, votes)])[0])
+                built = self._build(entry.data, [(index, votes)])
+                if built is not None:
+                    result.append(built[0])
         return result
 
     def remove_included(self, attestations: list, state) -> int:

@@ -367,3 +367,45 @@ def test_deposits_and_requests(genesis, pq_config):
     assert [entry[:4] for entry in encoded] == ["0x07", "0x09"]
     decoded = BlockBuilder._decode_execution_requests_hex(encoded, gloas=True, pq=True)
     assert decoded.hash_tree_root() == requests.hash_tree_root()
+
+
+def test_pool_caps_signatures_per_proof(pq_config):
+    from consensoor.pq_attestation_pool import MAX_PROOF_SIGNATURES, PQAttestationPool
+    from consensoor.spec.types import pq
+    from consensoor.spec.types.phase0 import AttestationData
+
+    assert MAX_PROOF_SIGNATURES == 436
+    pool = PQAttestationPool()
+    data = AttestationData(slot=3)
+    for committee_index, committee in ((0, [10, 11, 12]), (1, [20, 21])):
+        for validator_index in committee:
+            single = pq.SingleAttestation(
+                committee_index=committee_index,
+                attester_index=validator_index,
+                data=data,
+                signature=bytes([validator_index]) * 2404,
+            )
+            assert pool.add_single(single, committee)
+            assert not pool.add_single(single, committee)
+
+    assert pool.get_block_candidates(4) == []
+    (root,) = pool.get_block_candidates(5)
+    attestation, proof = pool.build_for_block(root, 100)
+    assert list(attestation.aggregation_bits) == [True] * 5
+    assert list(attestation.committee_bits) == [True, True, False, False]
+    assert len(proof) == 5 * 2404
+
+    attestation, proof = pool.build_for_block(root, 2)
+    assert list(attestation.aggregation_bits) == [True, True, False]
+    assert list(attestation.committee_bits) == [True, False, False, False]
+    assert proof == bytes([10]) * 2404 + bytes([11]) * 2404
+
+    attestation, proof = pool.build_for_block(root, 4)
+    assert list(attestation.aggregation_bits) == [True, True, True, True, False]
+    assert pool.build_for_block(root, 0) is None
+
+    single_committee, committee_proof = pool.get_aggregate(3, root, 1)
+    assert pool.committee_of(single_committee) == 1
+    other = PQAttestationPool()
+    assert other.add_aggregate(single_committee, committee_proof, [20, 21]) == 2
+    assert other.size == 2

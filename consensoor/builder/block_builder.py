@@ -217,13 +217,13 @@ class BlockBuilder:
         electra_fork_epoch = getattr(net_config, 'electra_fork_epoch', 2**64 - 1)
         attestation_proofs: dict[int, bytes] = {}
         if self._pq:
-            from ..spec.constants import MAX_ATTESTATIONS_PQ, MAX_STARK_PROOF_SIZE, XMSS_SIGNATURE_SIZE
+            from ..spec.constants import MAX_ATTESTATIONS_PQ, XMSS_SIGNATURE_SIZE
+
+            from ..pq_attestation_pool import MAX_PROOF_SIGNATURES
 
             max_attestations = MAX_ATTESTATIONS_PQ
-            pool_attestations = []
-            for attestation, proof in self.node.pq_attestation_pool.get_attestations_for_block(slot):
-                attestation_proofs[id(attestation)] = proof
-                pool_attestations.append(attestation)
+            pool_attestations = self.node.pq_attestation_pool.get_block_candidates(slot)
+            signature_budget = MAX_PROOF_SIGNATURES
         else:
             pool_attestations = self.node.attestation_pool.get_attestations_for_block(
                 slot, max_attestations * 2, electra_fork_epoch  # Get extra to account for filtering
@@ -248,12 +248,16 @@ class BlockBuilder:
         from ..spec.state_transition.helpers.pq import get_attestation_statements
 
         valid_attestations = []
-        proof_size = 0
         skipped_already_included = 0
         has_participation_flags = hasattr(temp_state, "previous_epoch_participation")
         current_epoch_for_state = get_current_epoch(temp_state) if has_participation_flags else None
         for att in pool_attestations:
             try:
+                if self._pq:
+                    built = self.node.pq_attestation_pool.build_for_block(att, signature_budget)
+                    if built is None:
+                        continue
+                    att, proof = built
                 if has_participation_flags:
                     data = att.data
                     inclusion_delay = int(temp_state.slot) - int(data.slot)
@@ -284,16 +288,13 @@ class BlockBuilder:
                         continue
 
                 if self._pq:
-                    proof = attestation_proofs[id(att)]
-                    proof_size += len(proof)
-                    if proof_size > MAX_STARK_PROOF_SIZE:
-                        break
                     if xmss.verify_aggregates(get_attestation_statements(temp_state, att), proof):
+                        attestation_proofs[id(att)] = proof
                         valid_attestations.append(att)
-                        if len(valid_attestations) >= max_attestations:
+                        signature_budget -= len(proof) // XMSS_SIGNATURE_SIZE
+                        if len(valid_attestations) >= max_attestations or signature_budget <= 0:
                             break
                     else:
-                        proof_size -= len(proof)
                         logger.debug(f"Skipping attestation with invalid proof: slot={att.data.slot}")
                     continue
                 indexed = get_indexed_attestation(temp_state, att)
