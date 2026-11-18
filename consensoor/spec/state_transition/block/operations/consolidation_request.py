@@ -45,11 +45,22 @@ def process_consolidation_request(
         consolidation_request: Consolidation request from execution layer
     """
     from ....types.electra import PendingConsolidation
+    from ...helpers.pq import is_legacy_pubkey, is_pq_state
+
+    is_pq = is_pq_state(state)
+    if is_pq and (
+        is_legacy_pubkey(consolidation_request.source_pubkey)
+        or is_legacy_pubkey(consolidation_request.target_pubkey)
+    ):
+        return
+
+    def request_pubkey(pubkey) -> bytes:
+        return bytes(pubkey)[16:] if is_pq else bytes(pubkey)
 
     # Check if this is a valid switch-to-compounding request
     if is_valid_switch_to_compounding_request(state, consolidation_request):
         validator_pubkeys = [bytes(v.pubkey) for v in state.validators]
-        request_source_pubkey = bytes(consolidation_request.source_pubkey)
+        request_source_pubkey = request_pubkey(consolidation_request.source_pubkey)
         source_index = validator_pubkeys.index(request_source_pubkey)
         switch_to_compounding_validator(state, source_index)
         return
@@ -67,8 +78,8 @@ def process_consolidation_request(
         return
 
     validator_pubkeys = [bytes(v.pubkey) for v in state.validators]
-    request_source_pubkey = bytes(consolidation_request.source_pubkey)
-    request_target_pubkey = bytes(consolidation_request.target_pubkey)
+    request_source_pubkey = request_pubkey(consolidation_request.source_pubkey)
+    request_target_pubkey = request_pubkey(consolidation_request.target_pubkey)
 
     # Verify pubkeys exist
     if request_source_pubkey not in validator_pubkeys:

@@ -40,3 +40,5 @@ tests/spec-tests-nightly/
 
 # Local devnet/kurtosis args files (machine-specific, kept out of the repo)
 devnet/
+*.dylib
+consensoor-xmss/libleanxmss.h

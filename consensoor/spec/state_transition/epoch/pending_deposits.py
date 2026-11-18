@@ -21,6 +21,12 @@ from ..helpers.accessors import (
     get_activation_churn_limit_gloas,
 )
 from ..helpers.mutators import increase_balance
+from ..helpers.pq import (
+    compute_deposit_pubkey,
+    compute_deposit_vrf_root,
+    is_legacy_pubkey,
+    is_pq_state,
+)
 from ..helpers.predicates import (
     has_compounding_withdrawal_credential,
     has_execution_withdrawal_credential,
@@ -60,6 +66,7 @@ def process_pending_deposits(state: "BeaconState") -> None:
 
     # [Modified in Fulu] former deposit mechanism removed; no Eth1 bridge wait
     is_post_fulu = hasattr(state, "proposer_lookahead")
+    is_pq = is_pq_state(state)
 
     for deposit in state.pending_deposits:
         # Do not process deposit requests if Eth1 bridge deposits are not yet applied
@@ -82,7 +89,7 @@ def process_pending_deposits(state: "BeaconState") -> None:
         is_validator_exited = False
         is_validator_withdrawn = False
         validator_pubkeys = [bytes(v.pubkey) for v in state.validators]
-        pubkey = bytes(deposit.pubkey)
+        pubkey = compute_deposit_pubkey(deposit.pubkey) if is_pq else bytes(deposit.pubkey)
 
         if pubkey in validator_pubkeys:
             validator_index = validator_pubkeys.index(pubkey)
@@ -90,7 +97,7 @@ def process_pending_deposits(state: "BeaconState") -> None:
             is_validator_exited = int(validator.exit_epoch) < FAR_FUTURE_EPOCH
             is_validator_withdrawn = int(validator.withdrawable_epoch) < next_epoch
 
-        if is_validator_withdrawn:
+        if is_validator_withdrawn or (is_pq and is_legacy_pubkey(deposit.pubkey)):
             # Deposited balance will never become active. Increase balance but do not consume churn
             apply_pending_deposit(state, deposit)
         elif is_validator_exited:
@@ -129,6 +136,9 @@ def apply_pending_deposit(state: "BeaconState", deposit: "PendingDeposit") -> bo
     Returns:
         True if the deposit was valid and applied (for new validators)
     """
+    if is_pq_state(state):
+        return _apply_pending_deposit_pq(state, deposit)
+
     validator_pubkeys = [bytes(v.pubkey) for v in state.validators]
     pubkey = bytes(deposit.pubkey)
 
@@ -205,3 +215,43 @@ def _add_validator_from_deposit(state: "BeaconState", deposit: "PendingDeposit")
     state.previous_epoch_participation.append(0)
     state.current_epoch_participation.append(0)
     state.inactivity_scores.append(0)
+
+
+def _apply_pending_deposit_pq(state: "BeaconState", deposit: "PendingDeposit") -> bool:
+    from ...constants import MIN_VALIDATOR_WITHDRAWABILITY_DELAY
+    from ...types.pq import Validator
+
+    pubkey = compute_deposit_pubkey(deposit.pubkey)
+    validator_pubkeys = [bytes(v.pubkey) for v in state.validators]
+    if pubkey in validator_pubkeys:
+        increase_balance(state, validator_pubkeys.index(pubkey), int(deposit.amount))
+        return False
+
+    amount = int(deposit.amount)
+    validator = Validator(
+        pubkey=pubkey,
+        vrf_root=compute_deposit_vrf_root(deposit),
+        withdrawal_credentials=deposit.withdrawal_credentials,
+        effective_balance=0,
+        slashed=False,
+        activation_eligibility_epoch=FAR_FUTURE_EPOCH,
+        activation_epoch=FAR_FUTURE_EPOCH,
+        exit_epoch=FAR_FUTURE_EPOCH,
+        withdrawable_epoch=FAR_FUTURE_EPOCH,
+    )
+    if is_compounding_withdrawal_credential(deposit.withdrawal_credentials):
+        max_effective = MAX_EFFECTIVE_BALANCE_ELECTRA
+    else:
+        max_effective = MAX_EFFECTIVE_BALANCE
+    validator.effective_balance = min(amount - amount % EFFECTIVE_BALANCE_INCREMENT, max_effective)
+    if is_legacy_pubkey(deposit.pubkey):
+        epoch = get_current_epoch(state)
+        validator.exit_epoch = epoch
+        validator.withdrawable_epoch = epoch + MIN_VALIDATOR_WITHDRAWABILITY_DELAY
+
+    state.validators.append(validator)
+    state.balances.append(amount)
+    state.previous_epoch_participation.append(0)
+    state.current_epoch_participation.append(0)
+    state.inactivity_scores.append(0)
+    return True

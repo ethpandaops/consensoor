@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from ....constants import (
     BUILDER_INDEX_SELF_BUILD,
     DOMAIN_BEACON_BUILDER,
+    XMSS_SIGNATURE_SIZE,
 )
 from ...helpers.accessors import (
     get_current_epoch,
@@ -19,7 +20,8 @@ from ...helpers.misc import compute_epoch_at_slot
 from ...helpers.predicates import is_active_builder, is_valid_indexed_payload_attestation
 from ...helpers.domain import compute_signing_root, compute_domain
 from ...helpers.ptc import get_indexed_payload_attestation
-from .....crypto import bls_verify
+from ...helpers.pq import is_builder_bid_leaf_index, is_pq_state, verify_xmss
+from .....crypto import bls_verify, xmss
 
 if TYPE_CHECKING:
     from ....types.gloas import BeaconState, PayloadAttestation
@@ -41,14 +43,20 @@ def process_execution_payload_bid(state: "BeaconState", signed_bid) -> None:
     bid = signed_bid.message
     builder_index = int(bid.builder_index)
     amount = int(bid.value)
+    is_pq = is_pq_state(state)
 
     # For self-builds, amount must be zero regardless of withdrawal credential prefix
     if builder_index == BUILDER_INDEX_SELF_BUILD:
         assert amount == 0, "Self-build bid must have zero value"
-        g2_point_at_infinity = b"\xc0" + b"\x00" * 95
-        assert bytes(signed_bid.signature) == g2_point_at_infinity, (
-            "Self-build bid must use point-at-infinity signature"
-        )
+        if is_pq:
+            assert bytes(signed_bid.signature) == b"\x00" * XMSS_SIGNATURE_SIZE, (
+                "Self-build bid must use the empty signature"
+            )
+        else:
+            g2_point_at_infinity = b"\xc0" + b"\x00" * 95
+            assert bytes(signed_bid.signature) == g2_point_at_infinity, (
+                "Self-build bid must use point-at-infinity signature"
+            )
     else:
         assert is_active_builder(state, builder_index), "Builder is not active"
         assert int(state.builders[builder_index].version) == PAYLOAD_BUILDER_VERSION, (
@@ -60,11 +68,18 @@ def process_execution_payload_bid(state: "BeaconState", signed_bid) -> None:
         )
         signing_root = compute_signing_root(bid, domain)
         builder = state.builders[builder_index]
-        assert bls_verify(
-            [bytes(builder.pubkey)],
-            signing_root,
-            bytes(signed_bid.signature),
-        ), "Invalid execution payload bid signature"
+        if is_pq:
+            leaf_index = xmss.get_leaf_index(bytes(signed_bid.signature))
+            assert is_builder_bid_leaf_index(leaf_index), "Bid signed at a leaf not reserved for bids"
+            assert verify_xmss(
+                builder.pubkey, leaf_index, signing_root, signed_bid.signature
+            ), "Invalid execution payload bid signature"
+        else:
+            assert bls_verify(
+                [bytes(builder.pubkey)],
+                signing_root,
+                bytes(signed_bid.signature),
+            ), "Invalid execution payload bid signature"
 
     blob_params = get_blob_parameters(get_current_epoch(state))
     assert len(bid.blob_kzg_commitments) <= blob_params.max_blobs_per_block, (
@@ -145,6 +160,23 @@ def apply_parent_execution_payload(state: "BeaconState", requests) -> None:
     # [New in Gloas:EIP8282]
     assert len(requests.builder_deposits) <= MAX_BUILDER_DEPOSIT_REQUESTS_PER_PAYLOAD
     assert len(requests.builder_exits) <= MAX_BUILDER_EXIT_REQUESTS_PER_PAYLOAD
+    is_pq = is_pq_state(state)
+    if is_pq:
+        from ....constants import (
+            MAX_BUILDER_PREREGISTRATION_REQUESTS_PER_PAYLOAD,
+            MAX_VALIDATOR_PREREGISTRATION_REQUESTS_PER_PAYLOAD,
+            MAX_VOLUNTARY_EXIT_REQUESTS_PER_PAYLOAD,
+        )
+
+        assert (
+            len(requests.validator_preregistrations)
+            <= MAX_VALIDATOR_PREREGISTRATION_REQUESTS_PER_PAYLOAD
+        )
+        assert (
+            len(requests.builder_preregistrations)
+            <= MAX_BUILDER_PREREGISTRATION_REQUESTS_PER_PAYLOAD
+        )
+        assert len(requests.voluntary_exits) <= MAX_VOLUNTARY_EXIT_REQUESTS_PER_PAYLOAD
 
     # [Modified in Gloas] (specs #5695)
     current_epoch = get_current_epoch(state)
@@ -175,6 +207,19 @@ def apply_parent_execution_payload(state: "BeaconState", requests) -> None:
         process_builder_deposit_request(state, op)
     for op in requests.builder_exits:
         process_builder_exit_request(state, op)
+    if is_pq:
+        from .pq import (
+            process_builder_preregistration_request,
+            process_validator_preregistration_request,
+            process_voluntary_exit_request,
+        )
+
+        for op in requests.validator_preregistrations:
+            process_validator_preregistration_request(state, op)
+        for op in requests.builder_preregistrations:
+            process_builder_preregistration_request(state, op)
+        for op in requests.voluntary_exits:
+            process_voluntary_exit_request(state, op)
 
     state.execution_payload_availability[parent_slot % SLOTS_PER_HISTORICAL_ROOT()] = True
     state.latest_block_hash = parent_bid.block_hash
@@ -189,16 +234,13 @@ def process_parent_execution_payload(state: "BeaconState", block) -> None:
     apply the parent execution_requests.
     """
     from .....crypto import hash_tree_root
-    # Gloas ExecutionRequests (adds EIP-8282 builder request fields)
-    from ....types.gloas import ExecutionRequests
-
     bid = block.body.signed_execution_payload_bid.message
     parent_bid = state.latest_execution_payload_bid
     requests = block.body.parent_execution_requests
 
     if bytes(bid.parent_block_hash) != bytes(parent_bid.block_hash):
         # Parent was EMPTY - no execution requests expected
-        assert requests == ExecutionRequests(), "Parent execution requests must be empty"
+        assert requests == type(requests)(), "Parent execution requests must be empty"
         return
 
     # Parent was FULL - verify the bid commitment and apply the payload

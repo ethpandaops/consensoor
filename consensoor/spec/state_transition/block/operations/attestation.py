@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from ....constants import (
     SLOTS_PER_EPOCH,
     MIN_ATTESTATION_INCLUSION_DELAY,
+    MIN_ATTESTATION_INCLUSION_DELAY_PQ,
     TIMELY_SOURCE_FLAG_INDEX,
     TIMELY_TARGET_FLAG_INDEX,
     TIMELY_HEAD_FLAG_INDEX,
@@ -33,6 +34,7 @@ from ...helpers.attestation import (
     is_attestation_same_slot,
 )
 from ...helpers.misc import compute_epoch_at_slot
+from ...helpers.pq import is_pq_state
 
 
 def _is_gloas_state(state) -> bool:
@@ -168,7 +170,12 @@ def process_attestation_altair(
          and hasattr(state.latest_execution_payload_header, "blob_gas_used"))
         or hasattr(state, "execution_payload_availability")
     )
-    if is_deneb_or_later:
+    is_pq = is_pq_state(state)
+    if is_pq:
+        assert int(data.slot) + MIN_ATTESTATION_INCLUSION_DELAY_PQ <= int(state.slot), (
+            "Attestation inclusion delay out of bounds"
+        )
+    elif is_deneb_or_later:
         assert int(data.slot) + MIN_ATTESTATION_INCLUSION_DELAY <= int(state.slot), (
             "Attestation inclusion delay out of bounds"
         )
@@ -252,11 +259,11 @@ def process_attestation_altair(
             "Attestation source doesn't match previous justified checkpoint"
         )
 
-    # Verify indexed attestation
-    indexed_attestation = get_indexed_attestation(state, attestation)
-    assert is_valid_indexed_attestation(state, indexed_attestation), (
-        "Invalid indexed attestation"
-    )
+    if not is_pq:
+        indexed_attestation = get_indexed_attestation(state, attestation)
+        assert is_valid_indexed_attestation(state, indexed_attestation), (
+            "Invalid indexed attestation"
+        )
 
     # Get attesting indices
     attesting_indices = get_attesting_indices(state, attestation)

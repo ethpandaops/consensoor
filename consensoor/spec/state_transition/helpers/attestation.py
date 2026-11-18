@@ -13,6 +13,7 @@ from ...constants import (
     TIMELY_HEAD_FLAG_INDEX,
     SLOTS_PER_HISTORICAL_ROOT,
     MIN_ATTESTATION_INCLUSION_DELAY,
+    MIN_ATTESTATION_INCLUSION_DELAY_PQ,
 )
 from .accessors import (
     get_current_epoch,
@@ -169,7 +170,7 @@ def get_attesting_indices(
 
 
 def get_indexed_attestation(
-    state: "BeaconState", attestation: "Attestation"
+    state: "BeaconState", attestation: "Attestation", proof: bytes = b""
 ) -> "IndexedAttestation":
     """Convert an attestation to an indexed attestation.
 
@@ -181,6 +182,15 @@ def get_indexed_attestation(
         IndexedAttestation with sorted indices
     """
     attesting_indices = get_attesting_indices(state, attestation)
+
+    if not hasattr(attestation, "signature"):
+        from ...types.pq import IndexedAttestation
+
+        return IndexedAttestation(
+            attesting_indices=sorted(attesting_indices),
+            data=attestation.data,
+            proof=proof,
+        )
 
     # Use fork-appropriate IndexedAttestation type
     from ...types.gloas import Attestation as GloasAttestation
@@ -250,6 +260,10 @@ def get_attestation_participation_flag_indices(
                 # Outside of block processing the bid in the state is still
                 # the parent block's bid, so its slot is the parent's slot.
                 parent_slot = int(state.latest_execution_payload_bid.slot)
+            if hasattr(state, "aggregation_committee_window"):
+                from .pq import get_latest_block_slot
+
+                parent_slot = get_latest_block_slot(state, int(data.slot), parent_slot)
             slot_index = parent_slot % SLOTS_PER_HISTORICAL_ROOT()
             payload_index = int(state.execution_payload_availability[slot_index])
             payload_matches = int(data.index) == payload_index
@@ -275,7 +289,12 @@ def get_attestation_participation_flag_indices(
         participation_flags.append(TIMELY_TARGET_FLAG_INDEX)
 
     # Head flag - must be timely (inclusion delay of MIN_ATTESTATION_INCLUSION_DELAY)
-    if is_matching_head and inclusion_delay == MIN_ATTESTATION_INCLUSION_DELAY:
+    min_inclusion_delay = (
+        MIN_ATTESTATION_INCLUSION_DELAY_PQ
+        if hasattr(state, "aggregation_committee_window")
+        else MIN_ATTESTATION_INCLUSION_DELAY
+    )
+    if is_matching_head and inclusion_delay == min_inclusion_delay:
         participation_flags.append(TIMELY_HEAD_FLAG_INDEX)
 
     return participation_flags

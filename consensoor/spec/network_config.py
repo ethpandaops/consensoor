@@ -78,6 +78,10 @@ class NetworkConfig:
     gloas_fork_epoch: int = 2**64 - 1
     heze_fork_version: bytes = field(default_factory=lambda: bytes.fromhex("08000000"))
     heze_fork_epoch: int = 2**64 - 1
+    pq_fork_version: bytes = field(default_factory=lambda: bytes.fromhex("e0000000"))
+    pq_fork_epoch: int = 2**64 - 1
+    unregistered_validator_withdrawability_delay: int = 16384
+    attestation_subnet_count_pq: int = 16
 
     terminal_total_difficulty: int = 2**256 - 1
     terminal_block_hash: bytes = field(default_factory=lambda: b"\x00" * 32)
@@ -203,6 +207,7 @@ class NetworkConfig:
         config.fulu_fork_version = bytes.fromhex("06000001")
         config.gloas_fork_version = bytes.fromhex("07000001")
         config.heze_fork_version = bytes.fromhex("08000001")
+        config.pq_fork_version = bytes.fromhex("e0000001")
         config.min_blob_data_retention_ms = 196608000
         # Timing values (same as mainnet by default, loaded from config)
         config.attestation_due_bps = 3333
@@ -242,6 +247,7 @@ class NetworkConfig:
             "fulu_fork_version",
             "gloas_fork_version",
             "heze_fork_version",
+            "pq_fork_version",
         }
         for key, value in data.items():
             attr_name = key.lower()
@@ -264,6 +270,7 @@ class NetworkConfig:
             f"Config loaded: fulu_fork_epoch={config.fulu_fork_epoch}, "
             f"gloas_fork_epoch={config.gloas_fork_epoch}, "
             f"heze_fork_epoch={config.heze_fork_epoch}, "
+            f"pq_fork_epoch={config.pq_fork_epoch}, "
             f"slot_durations={config.get_slot_durations()}"
         )
         return config
@@ -385,6 +392,8 @@ class NetworkConfig:
 
     def get_fork_version(self, epoch: int) -> bytes:
         """Get the fork version active at the given epoch."""
+        if epoch >= self.pq_fork_epoch:
+            return self.pq_fork_version
         if epoch >= self.heze_fork_epoch:
             return self.heze_fork_version
         if epoch >= self.gloas_fork_epoch:
@@ -420,6 +429,7 @@ class NetworkConfig:
             (self.fulu_fork_epoch, self.fulu_fork_version, "fulu"),
             (self.gloas_fork_epoch, self.gloas_fork_version, "gloas"),
             (self.heze_fork_epoch, self.heze_fork_version, "heze"),
+            (self.pq_fork_epoch, self.pq_fork_version, "pq"),
         ]
         scheduled = [(e, v, n) for e, v, n in forks if e < FAR_FUTURE_EPOCH]
         return sorted(scheduled, key=lambda x: x[0])
@@ -444,6 +454,9 @@ class NetworkConfig:
         """Check if Heze (FOCIL, quick slots) is active at the given epoch."""
         return epoch >= self.heze_fork_epoch
 
+    def is_pq_active(self, epoch: int) -> bool:
+        return epoch >= self.pq_fork_epoch
+
     def fork_name_at_epoch(self, epoch: int) -> str:
         """Return the spec fork name active at the given epoch.
 
@@ -454,6 +467,8 @@ class NetworkConfig:
         check only tells us how SSZ was decoded, not what the spec
         thinks the active fork is.
         """
+        if epoch >= self.pq_fork_epoch:
+            return "pq"
         if epoch >= self.heze_fork_epoch:
             return "heze"
         if epoch >= self.gloas_fork_epoch:

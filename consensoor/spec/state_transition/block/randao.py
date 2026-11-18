@@ -10,6 +10,7 @@ from ..helpers.accessors import get_current_epoch, get_randao_mix
 from ..helpers.domain import get_domain, compute_signing_root
 from ..helpers.beacon_committee import get_beacon_proposer_index
 from ..helpers.math import xor
+from ..helpers.pq import is_pq_state, is_valid_vrf_proof
 from ....crypto import bls_verify, sha256
 
 if TYPE_CHECKING:
@@ -30,6 +31,16 @@ def process_randao(state: "BeaconState", body: "BeaconBlockBody") -> None:
     """
     epoch = get_current_epoch(state)
     proposer_index = get_beacon_proposer_index(state)
+
+    if is_pq_state(state):
+        assert is_valid_vrf_proof(
+            state, proposer_index, int(state.slot), body.randao_reveal
+        ), "Invalid RANDAO reveal VRF proof"
+        prev_randao = bytes(get_randao_mix(state, epoch))
+        mix = sha256(prev_randao + bytes(body.randao_reveal[0]) + DOMAIN_RANDAO)
+        state.randao_mixes[epoch % EPOCHS_PER_HISTORICAL_VECTOR()] = mix
+        return
+
     proposer = state.validators[proposer_index]
 
     # Verify RANDAO reveal signature

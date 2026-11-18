@@ -252,13 +252,20 @@ def queue_excess_active_balance(state: "BeaconState", index: int) -> None:
         validator = state.validators[index]
         # Use G2 point at infinity as signature placeholder
         # and GENESIS_SLOT to distinguish from a pending deposit request
-        g2_point_at_infinity = b"\xc0" + b"\x00" * 95
+        if hasattr(state, "aggregation_committee_window"):
+            from ...constants import XMSS_DEPOSIT_PREFIX
+
+            pubkey = XMSS_DEPOSIT_PREFIX + bytes(validator.pubkey)
+            signature = b"\x00" * 96
+        else:
+            pubkey = validator.pubkey
+            signature = b"\xc0" + b"\x00" * 95
         state.pending_deposits.append(
             PendingDeposit(
-                pubkey=validator.pubkey,
+                pubkey=pubkey,
                 withdrawal_credentials=validator.withdrawal_credentials,
                 amount=excess_balance,
-                signature=g2_point_at_infinity,
+                signature=signature,
                 slot=GENESIS_SLOT,
             )
         )

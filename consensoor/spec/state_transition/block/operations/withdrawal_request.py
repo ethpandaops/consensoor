@@ -45,6 +45,12 @@ def process_withdrawal_request(
     """
     from ....types.electra import PendingPartialWithdrawal
 
+    from ...helpers.pq import is_legacy_pubkey, is_pq_state
+
+    is_pq = is_pq_state(state)
+    if is_pq and is_legacy_pubkey(withdrawal_request.validator_pubkey):
+        return
+
     amount = int(withdrawal_request.amount)
     is_full_exit_request = amount == FULL_EXIT_REQUEST_AMOUNT
 
@@ -58,6 +64,8 @@ def process_withdrawal_request(
     # Find validator by pubkey
     validator_pubkeys = [bytes(v.pubkey) for v in state.validators]
     request_pubkey = bytes(withdrawal_request.validator_pubkey)
+    if is_pq:
+        request_pubkey = request_pubkey[16:]
 
     if request_pubkey not in validator_pubkeys:
         return

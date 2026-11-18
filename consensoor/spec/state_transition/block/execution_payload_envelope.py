@@ -12,9 +12,11 @@ from typing import TYPE_CHECKING
 from ...constants import (
     DOMAIN_BEACON_BUILDER,
     BUILDER_INDEX_SELF_BUILD,
+    LEAF_OFFSET_EXECUTION_PAYLOAD_ENVELOPE,
 )
 from ..helpers.domain import get_domain, compute_signing_root
 from ..helpers.misc import compute_time_at_slot
+from ..helpers.pq import compute_xmss_leaf_index, is_pq_state, verify_xmss
 from ....crypto import bls_verify, hash_tree_root
 from ...network_config import get_config
 
@@ -46,6 +48,11 @@ def verify_execution_payload_envelope_signature(
     signing_root = compute_signing_root(
         signed_envelope.message, get_domain(state, DOMAIN_BEACON_BUILDER)
     )
+    if is_pq_state(state):
+        leaf_index = compute_xmss_leaf_index(
+            int(state.latest_block_header.slot), LEAF_OFFSET_EXECUTION_PAYLOAD_ENVELOPE
+        )
+        return verify_xmss(pubkey, leaf_index, signing_root, signed_envelope.signature)
     return bls_verify([bytes(pubkey)], signing_root, bytes(signed_envelope.signature))
 
 

@@ -29,7 +29,16 @@ COPY consensoor-p2p-rs/ consensoor-p2p-rs/
 
 RUN cd consensoor-p2p-rs && python3 -m maturin build --release --out /tmp/wheels
 
-# --- Stage 3: runtime --------------------------------------------------------
+# --- Stage 3: build the leanXMSS signing library ------------------------------
+FROM golang:1.26 AS xmss-builder
+
+WORKDIR /app
+
+COPY consensoor-xmss/ consensoor-xmss/
+
+RUN cd consensoor-xmss && go build -buildmode=c-shared -o /tmp/libleanxmss.so .
+
+# --- Stage 4: runtime --------------------------------------------------------
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -40,6 +49,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY --from=builder /app/dist/*.whl /tmp/
 COPY --from=rust-builder /tmp/wheels/*.whl /tmp/
+COPY --from=xmss-builder /tmp/libleanxmss.so /usr/local/lib/libleanxmss.so
+ENV CONSENSOOR_XMSS_LIB=/usr/local/lib/libleanxmss.so
 
 # Install consensoor + its runtime deps + the native Rust p2p wheel.
 # We deliberately do NOT install py-libp2p anymore — consensoor's host.py

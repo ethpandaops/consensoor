@@ -36,10 +36,28 @@ def process_deposit_request(
     """
     from ....types.electra import PendingDeposit
     from ....constants import UNSET_DEPOSIT_REQUESTS_START_INDEX
+    from ...helpers.pq import (
+        compute_deposit_pubkey,
+        get_active_validator_preregistration,
+        is_pq_state,
+        remove_validator_preregistration,
+    )
 
     # Gloas: builder onboarding moved to BuilderDepositRequest (EIP-8282);
     # all deposit requests are queued as pending deposits, without setting
     # deposit_requests_start_index.
+    if is_pq_state(state):
+        pubkey = compute_deposit_pubkey(deposit_request.pubkey)
+        preregistration = get_active_validator_preregistration(state, pubkey)
+        if preregistration is not None:
+            if bytes(deposit_request.withdrawal_credentials) != bytes(
+                preregistration.withdrawal_credentials
+            ):
+                return
+            if bytes(deposit_request.signature)[:32] != bytes(preregistration.vrf_root):
+                return
+            remove_validator_preregistration(state, pubkey)
+
     if _is_gloas_state(state):
         state.pending_deposits.append(
             PendingDeposit(

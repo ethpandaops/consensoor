@@ -10,6 +10,7 @@ from ...constants import (
     DOMAIN_BEACON_ATTESTER,
     DOMAIN_PTC_ATTESTER,
     MAX_COMMITTEES_PER_SLOT,
+    MAX_COMMITTEES_PER_SLOT_PQ,
     MAX_EFFECTIVE_BALANCE_ELECTRA,
     MIN_SEED_LOOKAHEAD,
     PTC_SIZE,
@@ -104,7 +105,9 @@ def process_ptc_window(state: "BeaconState") -> None:
     committees_per_slot = max(
         1,
         min(
-            MAX_COMMITTEES_PER_SLOT(),
+            MAX_COMMITTEES_PER_SLOT_PQ()
+            if hasattr(state, "aggregation_committee_window")
+            else MAX_COMMITTEES_PER_SLOT(),
             total_active // spe // TARGET_COMMITTEE_SIZE(),
         ),
     )

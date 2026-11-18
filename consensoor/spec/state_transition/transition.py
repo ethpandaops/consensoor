@@ -89,6 +89,20 @@ def verify_block_signature(
     domain = get_domain(state, DOMAIN_BEACON_PROPOSER)
     signing_root = compute_signing_root(signed_block.message, domain)
 
+    from .helpers.pq import is_pq_state
+
+    if is_pq_state(state):
+        from .helpers.pq import compute_xmss_leaf_index, verify_xmss
+        from ..constants import LEAF_OFFSET_BEACON_PROPOSER
+
+        leaf_index = compute_xmss_leaf_index(
+            int(signed_block.message.slot), LEAF_OFFSET_BEACON_PROPOSER
+        )
+        assert verify_xmss(
+            proposer.pubkey, leaf_index, signing_root, signed_block.signature
+        ), "Invalid block signature"
+        return
+
     assert bls_verify(
         [bytes(proposer.pubkey)],
         signing_root,
@@ -328,6 +342,14 @@ def process_epoch(state: "BeaconState") -> None:
         process_ptc_window(state)
         timings['ptc_window'] = time.time() - t0
 
+    if hasattr(state, "aggregation_committee_window"):
+        from .epoch.aggregation_committee_window import process_aggregation_committee_window
+        from .block.operations.pq import process_preregistration_expiry
+        t0 = time.time()
+        process_aggregation_committee_window(state)
+        process_preregistration_expiry(state)
+        timings['aggregation_committee_window'] = time.time() - t0
+
     # Log slow operations (>10ms)
     slow_ops = {k: v*1000 for k, v in timings.items() if v > 0.01}
     if slow_ops:
@@ -451,8 +473,14 @@ def process_operations(
 
     # Determine fork-appropriate limits
     is_electra = hasattr(state, "pending_deposits")
+    is_pq = hasattr(body, "proof")
     max_attester_slashings = MAX_ATTESTER_SLASHINGS if is_electra else MAX_ATTESTER_SLASHINGS_PRE_ELECTRA
     max_attestations = MAX_ATTESTATIONS_ELECTRA() if is_electra else MAX_ATTESTATIONS()
+    if is_pq:
+        from ..constants import MAX_ATTESTATIONS_PQ, MAX_ATTESTER_SLASHINGS_ELECTRA
+
+        max_attester_slashings = MAX_ATTESTER_SLASHINGS_ELECTRA
+        max_attestations = MAX_ATTESTATIONS_PQ
 
     # Verify operation counts don't exceed limits
     assert len(body.proposer_slashings) <= MAX_PROPOSER_SLASHINGS, (
@@ -470,9 +498,10 @@ def process_operations(
         assert len(body.deposits) <= MAX_DEPOSITS, (
             f"Too many deposits: {len(body.deposits)}"
         )
-    assert len(body.voluntary_exits) <= MAX_VOLUNTARY_EXITS, (
-        f"Too many voluntary exits: {len(body.voluntary_exits)}"
-    )
+    if not is_pq:
+        assert len(body.voluntary_exits) <= MAX_VOLUNTARY_EXITS, (
+            f"Too many voluntary exits: {len(body.voluntary_exits)}"
+        )
 
     # Process proposer slashings
     for proposer_slashing in body.proposer_slashings:
@@ -486,6 +515,9 @@ def process_operations(
     # [Modified in alpha.13] Gloas passes the parent block's slot (specs #5473)
     for attestation in body.attestations:
         process_attestation(state, attestation, parent_slot=parent_slot)
+
+    if is_pq:
+        process_stark(state, body)
 
     # Process deposits
     if not has_deposits:
@@ -529,7 +561,7 @@ def process_operations(
         process_deposit(state, deposit)
 
     # Process voluntary exits
-    for voluntary_exit in body.voluntary_exits:
+    for voluntary_exit in body.voluntary_exits if not is_pq else []:
         process_voluntary_exit(state, voluntary_exit)
 
     # Process BLS to execution changes (Capella+)
@@ -564,3 +596,13 @@ def process_operations(
         )
         for payload_attestation in body.payload_attestations:
             process_payload_attestation(state, payload_attestation)
+
+
+def process_stark(state: "BeaconState", body) -> None:
+    from .helpers.pq import get_attestation_statements
+    from ...crypto import xmss
+
+    statements = []
+    for attestation in body.attestations:
+        statements.extend(get_attestation_statements(state, attestation))
+    assert xmss.verify_aggregates(statements, bytes(body.proof)), "Invalid attestation proof"

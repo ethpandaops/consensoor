@@ -18,6 +18,13 @@ from ...helpers.predicates import is_active_builder
 from ...helpers.mutators import initiate_builder_exit
 from ...helpers.domain import compute_domain, compute_signing_root
 from ...helpers.misc import compute_epoch_at_slot
+from ...helpers.pq import (
+    compute_deposit_pubkey,
+    get_active_builder_preregistration,
+    is_legacy_pubkey,
+    is_pq_state,
+    remove_builder_preregistration,
+)
 from .....crypto import bls_verify
 
 if TYPE_CHECKING:
@@ -64,7 +71,10 @@ def add_builder_to_registry(
     amount: int,
     slot: int,
 ) -> None:
-    from ....types.gloas import Builder
+    if is_pq_state(state):
+        from ....types.pq import Builder
+    else:
+        from ....types.gloas import Builder
 
     builder = Builder(
         pubkey=pubkey,
@@ -98,6 +108,10 @@ def process_builder_deposit_request(
     if not is_builder_withdrawal_credential(bytes(request.withdrawal_credentials)):
         return
 
+    if is_pq_state(state):
+        _process_builder_deposit_request_pq(state, request)
+        return
+
     builder_pubkeys = [b.pubkey for b in state.builders]
     if request.pubkey not in builder_pubkeys:
         if is_valid_builder_deposit_signature(request):
@@ -123,15 +137,50 @@ def process_builder_deposit_request(
         builder.balance = int(builder.balance) + int(request.amount)
 
 
+def _process_builder_deposit_request_pq(
+    state: "BeaconState", request: "BuilderDepositRequest"
+) -> None:
+    from ....constants import PAYLOAD_BUILDER_VERSION
+
+    pubkey = compute_deposit_pubkey(request.pubkey)
+    preregistration = get_active_builder_preregistration(state, pubkey)
+    if preregistration is not None:
+        if bytes(request.withdrawal_credentials) != bytes(preregistration.withdrawal_credentials):
+            return
+        remove_builder_preregistration(state, pubkey)
+
+    builder_pubkeys = [bytes(b.pubkey) for b in state.builders]
+    if pubkey not in builder_pubkeys:
+        builder_index = get_index_for_new_builder(state)
+        add_builder_to_registry(
+            state,
+            pubkey,
+            PAYLOAD_BUILDER_VERSION,
+            bytes(request.withdrawal_credentials)[12:],
+            int(request.amount),
+            int(state.slot),
+        )
+        if is_legacy_pubkey(request.pubkey):
+            initiate_builder_exit(state, builder_index)
+    else:
+        builder = state.builders[builder_pubkeys.index(pubkey)]
+        if int(builder.withdrawable_epoch) != FAR_FUTURE_EPOCH and int(builder.balance) == 0:
+            builder.withdrawable_epoch = get_current_epoch(state) + MIN_BUILDER_WITHDRAWABILITY_DELAY()
+        builder.balance = int(builder.balance) + int(request.amount)
+
+
 def process_builder_exit_request(
     state: "BeaconState", request: "BuilderExitRequest"
 ) -> None:
     """Process a builder exit request (EIP-8282)."""
-    builder_pubkeys = [b.pubkey for b in state.builders]
-    if request.pubkey not in builder_pubkeys:
+    request_pubkey = bytes(request.pubkey)
+    if is_pq_state(state):
+        request_pubkey = request_pubkey[16:]
+    builder_pubkeys = [bytes(b.pubkey) for b in state.builders]
+    if request_pubkey not in builder_pubkeys:
         return
 
-    builder_index = builder_pubkeys.index(request.pubkey)
+    builder_index = builder_pubkeys.index(request_pubkey)
     builder = state.builders[builder_index]
 
     if not is_active_builder(state, builder_index):

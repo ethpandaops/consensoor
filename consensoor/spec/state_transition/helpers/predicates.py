@@ -185,8 +185,14 @@ def is_valid_indexed_attestation(
         logger.warning("IndexedAttestation validation failed: no indices")
         return False
     # Redundant with the SSZ list bound, kept as defense in depth.
-    from ...constants import MAX_VALIDATORS_PER_COMMITTEE, MAX_COMMITTEES_PER_SLOT
-    if len(indices) > MAX_VALIDATORS_PER_COMMITTEE() * MAX_COMMITTEES_PER_SLOT():
+    from ...constants import (
+        MAX_VALIDATORS_PER_COMMITTEE,
+        MAX_COMMITTEES_PER_SLOT,
+        MAX_COMMITTEES_PER_SLOT_PQ,
+    )
+    is_pq = hasattr(indexed_attestation, "proof")
+    max_committees = MAX_COMMITTEES_PER_SLOT_PQ() if is_pq else MAX_COMMITTEES_PER_SLOT()
+    if len(indices) > MAX_VALIDATORS_PER_COMMITTEE() * max_committees:
         logger.warning(
             f"IndexedAttestation validation failed: too many indices ({len(indices)})"
         )
@@ -214,6 +220,15 @@ def is_valid_indexed_attestation(
     )
 
     signing_root = compute_signing_root(indexed_attestation.data, domain)
+
+    if is_pq:
+        from .pq import compute_xmss_attestation_leaf_index
+        from ....crypto import xmss
+
+        leaf_index = compute_xmss_attestation_leaf_index(target_epoch)
+        return xmss.verify_aggregates(
+            [(pubkeys, leaf_index, signing_root)], bytes(indexed_attestation.proof)
+        )
 
     sig_valid = bls_verify(pubkeys, signing_root, bytes(indexed_attestation.signature))
     if not sig_valid:
@@ -473,6 +488,8 @@ def is_valid_switch_to_compounding_request(
 
     # Verify pubkey exists
     source_pubkey = bytes(consolidation_request.source_pubkey)
+    if hasattr(state, "aggregation_committee_window"):
+        source_pubkey = source_pubkey[16:]
     validator_pubkeys = [bytes(v.pubkey) for v in state.validators]
     if source_pubkey not in validator_pubkeys:
         return False

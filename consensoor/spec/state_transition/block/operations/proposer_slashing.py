@@ -17,6 +17,9 @@ if TYPE_CHECKING:
     from ....types import BeaconState
     from ....types.phase0 import ProposerSlashing
 
+from ....constants import LEAF_OFFSET_BEACON_PROPOSER
+from ...helpers.pq import compute_xmss_leaf_index, is_pq_state, verify_xmss
+
 
 def process_proposer_slashing(
     state: "BeaconState", proposer_slashing: "ProposerSlashing"
@@ -64,6 +67,14 @@ def process_proposer_slashing(
             compute_epoch_at_slot(int(signed_header.message.slot)),
         )
         signing_root = compute_signing_root(signed_header.message, domain)
+        if is_pq_state(state):
+            leaf_index = compute_xmss_leaf_index(
+                int(signed_header.message.slot), LEAF_OFFSET_BEACON_PROPOSER
+            )
+            assert verify_xmss(
+                proposer.pubkey, leaf_index, signing_root, signed_header.signature
+            ), "Invalid proposer slashing signature"
+            continue
         assert bls_verify(
             [bytes(proposer.pubkey)],
             signing_root,

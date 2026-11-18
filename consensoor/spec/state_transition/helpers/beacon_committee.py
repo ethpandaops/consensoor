@@ -12,6 +12,7 @@ from ...constants import (
     SHUFFLE_ROUND_COUNT,
     TARGET_COMMITTEE_SIZE,
     MAX_COMMITTEES_PER_SLOT,
+    MAX_COMMITTEES_PER_SLOT_PQ,
     DOMAIN_BEACON_PROPOSER,
     DOMAIN_BEACON_ATTESTER,
     MAX_EFFECTIVE_BALANCE,
@@ -282,7 +283,9 @@ def get_committee_count_per_slot(state: "BeaconState", epoch: int) -> int:
     return max(
         1,
         min(
-            MAX_COMMITTEES_PER_SLOT(),
+            MAX_COMMITTEES_PER_SLOT_PQ()
+            if hasattr(state, "aggregation_committee_window")
+            else MAX_COMMITTEES_PER_SLOT(),
             len(active_validators) // SLOTS_PER_EPOCH() // TARGET_COMMITTEE_SIZE(),
         ),
     )

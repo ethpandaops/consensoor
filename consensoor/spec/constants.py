@@ -501,6 +501,71 @@ def MAX_TRANSACTIONS_BYTES_PER_INCLUSION_LIST() -> int:
 
 
 # =============================================================================
+# PQ (leanXMSS signatures)
+# =============================================================================
+
+AGGREGATORS_PER_COMMITTEE: Final[int] = 4
+
+XMSS_PUBKEY_SIZE: Final[int] = 32
+XMSS_SIGNATURE_SIZE: Final[int] = 2404
+XMSS_RESERVED_LEAVES: Final[int] = 2**15
+XMSS_ATTESTATION_LEAVES: Final[int] = 2**29
+XMSS_BUILDER_BID_LEAVES: Final[int] = 2**30
+XMSS_LEAVES_PER_SLOT: Final[int] = 2**3
+
+VRF_TREE_DEPTH: Final[int] = 31
+
+LEAF_OFFSET_BEACON_PROPOSER: Final[int] = 0
+LEAF_OFFSET_AGGREGATE_AND_PROOF: Final[int] = 1
+LEAF_OFFSET_PTC_ATTESTER: Final[int] = 2
+LEAF_OFFSET_PROPOSER_PREFERENCES: Final[int] = 3
+LEAF_OFFSET_EXECUTION_PAYLOAD_ENVELOPE: Final[int] = 4
+
+XMSS_DEPOSIT_PREFIX: Final[bytes] = b"\x00" * 16
+LEGACY_XMSS_PUBKEY_DOMAIN: Final[bytes] = b"\x00"
+LEGACY_VRF_ROOT_DOMAIN: Final[bytes] = b"\x01"
+
+VALIDATOR_PREREGISTRATION_REQUEST_TYPE: Final[bytes] = b"\x07"
+BUILDER_PREREGISTRATION_REQUEST_TYPE: Final[bytes] = b"\x08"
+VOLUNTARY_EXIT_REQUEST_TYPE: Final[bytes] = b"\x09"
+
+
+def MAX_COMMITTEES_PER_SLOT_PQ() -> int:
+    return 16 if _config.preset == "mainnet" else 4
+
+
+MIN_ATTESTATION_INCLUSION_DELAY_PQ: Final[int] = 2
+MAX_STARK_PROOF_SIZE: Final[int] = 2**20
+MAX_ATTESTATIONS_PQ: Final[int] = 16
+MAX_VALIDATOR_PREREGISTRATION_REQUESTS_PER_PAYLOAD: Final[int] = 2**6
+MAX_BUILDER_PREREGISTRATION_REQUESTS_PER_PAYLOAD: Final[int] = 2**2
+PREREGISTRATIONS_LIMIT: Final[int] = 2**19
+PREREGISTRATION_EXPIRY_SLOTS: Final[int] = 2**18
+MAX_VOLUNTARY_EXIT_REQUESTS_PER_PAYLOAD: Final[int] = 2**4
+
+
+def MAX_SIGNED_AGGREGATE_AND_PROOF_SIZE_PQ() -> int:
+    return 1055231 if _config.preset == "mainnet" else 1052158
+
+
+def MAX_ATTESTER_SLASHING_SIZE_PQ() -> int:
+    return 2621720 if _config.preset == "mainnet" else 2228504
+
+
+MAX_SIGNED_EXECUTION_PAYLOAD_BID_SIZE_PQ: Final[int] = 199240
+
+
+def ATTESTATION_SUBNET_COUNT_PQ() -> int:
+    from .network_config import get_config
+    return get_config().attestation_subnet_count_pq
+
+
+def UNREGISTERED_VALIDATOR_WITHDRAWABILITY_DELAY() -> int:
+    from .network_config import get_config
+    return get_config().unregistered_validator_withdrawability_delay
+
+
+# =============================================================================
 # Networking Constants
 # =============================================================================
 
