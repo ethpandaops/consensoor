@@ -4853,6 +4853,28 @@ class BeaconNode:
             if int(msg.validator_index) not in ptc:
                 return
             if is_pq_state(self.state):
+                from .crypto import xmss
+                from .spec.constants import (
+                    DOMAIN_PTC_ATTESTER,
+                    LEAF_OFFSET_PTC_ATTESTER,
+                    SLOTS_PER_EPOCH,
+                )
+                from .spec.state_transition.helpers.domain import (
+                    compute_signing_root,
+                    get_domain_at_epoch,
+                )
+
+                domain = get_domain_at_epoch(
+                    self.state, DOMAIN_PTC_ATTESTER, slot // SLOTS_PER_EPOCH()
+                )
+                if not await xmss.verify_async(
+                    bytes(self.state.validators[int(msg.validator_index)].pubkey),
+                    compute_xmss_leaf_index(slot, LEAF_OFFSET_PTC_ATTESTER),
+                    compute_signing_root(msg.data, domain),
+                    bytes(msg.signature),
+                ):
+                    self._record_peer_event(from_peer, "gossip_invalid_payload_attestation")
+                    return
                 self._fc_on_payload_attestation(msg)
                 if self.beacon_api:
                     self.beacon_api.emit_payload_attestation_message(msg)

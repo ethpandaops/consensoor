@@ -146,6 +146,40 @@ def test_block_builder_and_validator_client(genesis, pq_config, tmp_path):
     asyncio.run(run())
     assert int(node.state.finalized_checkpoint.epoch) >= 2
 
+    from consensoor.spec.constants import (
+        BUILDER_INDEX_SELF_BUILD,
+        DOMAIN_BEACON_BUILDER,
+        LEAF_OFFSET_EXECUTION_PAYLOAD_ENVELOPE,
+    )
+    from consensoor.spec.state_transition.block.execution_payload_envelope import (
+        verify_execution_payload_envelope_signature,
+    )
+    from consensoor.spec.state_transition.helpers.domain import compute_signing_root, get_domain
+    from consensoor.spec.state_transition.helpers.pq import compute_xmss_leaf_index
+    from consensoor.spec.types import pq
+
+    state = node.state
+    proposer_index = int(state.latest_block_header.proposer_index)
+    proposer_key = next(k for k in client.keys.values() if k.validator_index == proposer_index)
+    envelope = pq.ExecutionPayloadEnvelope(builder_index=BUILDER_INDEX_SELF_BUILD)
+    signing_root = compute_signing_root(envelope, get_domain(state, DOMAIN_BEACON_BUILDER))
+    slot = int(state.latest_block_header.slot)
+    signature = xmss_signer.sign(
+        proposer_key,
+        compute_xmss_leaf_index(slot, LEAF_OFFSET_EXECUTION_PAYLOAD_ENVELOPE),
+        signing_root,
+    )
+    signed_envelope = pq.SignedExecutionPayloadEnvelope(message=envelope, signature=signature)
+    assert verify_execution_payload_envelope_signature(state, signed_envelope)
+    wrong_leaf = xmss_signer.sign(
+        proposer_key,
+        compute_xmss_leaf_index(slot + 100, LEAF_OFFSET_EXECUTION_PAYLOAD_ENVELOPE),
+        signing_root,
+    )
+    assert not verify_execution_payload_envelope_signature(
+        state, pq.SignedExecutionPayloadEnvelope(message=envelope, signature=wrong_leaf)
+    )
+
     key = next(iter(client.keys.values()))
     with pytest.raises(xmss_signer.LeafReuseError):
         xmss_signer.sign(key, 2**15, b"\x01" * 32)
