@@ -151,3 +151,185 @@ def test_block_builder_and_validator_client(genesis, pq_config, tmp_path):
         xmss_signer.sign(key, 2**15, b"\x01" * 32)
         xmss_signer.sign(key, 2**15, b"\x02" * 32)
     assert (tmp_path / "xmss_leaves.txt").read_text().count("\n") > 0
+
+
+def test_container_shapes(pq_config):
+    from consensoor.spec.types import pq
+
+    assert list(pq.BeaconBlockBody.fields()) == [
+        "randao_reveal",
+        "eth1_data",
+        "graffiti",
+        "proposer_slashings",
+        "attester_slashings",
+        "attestations",
+        "deposits",
+        "signed_execution_payload_bid",
+        "parent_execution_requests",
+        "proof",
+    ]
+    state_fields = list(pq.BeaconState.fields())
+    assert len(state_fields) == 47
+    assert "current_sync_committee" not in state_fields
+    assert state_fields[-3:] == [
+        "validator_preregistrations",
+        "builder_preregistrations",
+        "aggregation_committee_window",
+    ]
+    assert list(pq.Attestation.fields()) == ["aggregation_bits", "data", "committee_bits"]
+    assert list(pq.ExecutionRequests.fields())[-3:] == [
+        "validator_preregistrations",
+        "builder_preregistrations",
+        "voluntary_exits",
+    ]
+    assert len(pq.Validator().encode_bytes()) == 32 + 32 + 32 + 8 + 1 + 8 * 4
+    assert len(pq.SingleAttestation().encode_bytes()) == 8 + 8 + 128 + 2404
+    assert len(pq.PayloadAttestationMessage().encode_bytes()) == 8 + 42 + 2404
+    assert len(pq.VRFProof().encode_bytes()) == 32 * 32
+    assert len(pq.CommitteeBits()) == 4
+
+
+def test_generator_genesis_fixture(pq_config):
+    from consensoor.spec.state_transition.helpers.pq import initialize_aggregation_committee_window
+    from consensoor.spec.types import pq
+
+    state = pq.BeaconState.decode_bytes((Path(__file__).parent / "fixtures" / "pq" / "genesis.ssz").read_bytes())
+    assert bytes(state.hash_tree_root()).hex() == (
+        "cc0e5639191cf4d1b7d459b8e1d3a7d6aa86eaa37cc63b6f02a9ea6145c15736"
+    )
+    body = pq.BeaconBlockBody(
+        signed_execution_payload_bid=pq.SignedExecutionPayloadBid(
+            message=state.latest_execution_payload_bid
+        )
+    )
+    assert bytes(body.hash_tree_root()) == bytes(state.latest_block_header.body_root)
+    assert bytes(state.latest_execution_payload_bid.execution_requests_root) == bytes(
+        pq.ExecutionRequests().hash_tree_root()
+    )
+    window = [[[int(v) for v in c] for c in cs] for cs in state.aggregation_committee_window]
+    assert window == initialize_aggregation_committee_window(state)
+
+
+def test_leaf_indexes():
+    from consensoor.spec.state_transition.helpers import pq as helpers
+
+    assert helpers.compute_xmss_attestation_leaf_index(0) == 2**15
+    assert helpers.compute_xmss_attestation_leaf_index(7) == 2**15 + 7
+    base = 2**15 + 2**29 + 2**30
+    assert helpers.compute_xmss_leaf_index(0, 0) == base
+    assert helpers.compute_xmss_leaf_index(5, 4) == base + 44
+    assert not helpers.is_builder_bid_leaf_index(2**15 + 2**29 - 1)
+    assert helpers.is_builder_bid_leaf_index(2**15 + 2**29)
+    assert helpers.is_builder_bid_leaf_index(base - 1)
+    assert not helpers.is_builder_bid_leaf_index(base)
+    assert helpers.is_legacy_pubkey(b"\x80" + b"\x00" * 47)
+    assert not helpers.is_legacy_pubkey(b"\x00" * 16 + b"\x11" * 32)
+    assert helpers.compute_deposit_pubkey(b"\x00" * 16 + b"\x11" * 32) == b"\x11" * 32
+
+
+def test_vrf_proof_opens_root():
+    import hashlib
+
+    from consensoor.spec.state_transition.helpers.predicates import is_valid_merkle_branch
+
+    seed = xmss.vrf_seed_from_privkey(42)
+    root = xmss.vrf_root(seed)
+    for slot in (0, 1, 1023, 1024, 2**20 - 1, 2**20, 2**31 - 1):
+        proof = xmss.vrf_proof(seed, slot)
+        assert len(proof) == 32
+        expected_leaf = (
+            hashlib.sha256(seed + slot.to_bytes(8, "little")).digest() if slot < 2**20 else bytes(32)
+        )
+        assert proof[0] == expected_leaf
+        assert is_valid_merkle_branch(proof[0], proof[1:], 31, slot, root)
+        if slot < 2**20:
+            assert not is_valid_merkle_branch(proof[0], proof[1:], 31, slot ^ 1, root)
+
+
+def test_stark_stand_in_checks_leaf_and_signature():
+    seeds = [xmss.seed_from_privkey(sk) for sk in (1, 2)]
+    pubkeys = [xmss.public_key(seed) for seed in seeds]
+    message = b"\x07" * 32
+    leaf = 2**15 + 3
+    signatures = [xmss.sign(seed, leaf, message) for seed in seeds]
+    proof = xmss.prove_aggregates([signatures])
+    assert xmss.get_leaf_index(signatures[0]) == leaf
+    assert xmss.verify_aggregates([(pubkeys, leaf, message)], proof)
+    assert xmss.verify_aggregates([(pubkeys[:1], leaf, message), (pubkeys[1:], leaf, message)], proof)
+    assert not xmss.verify_aggregates([(pubkeys, leaf + 1, message)], proof)
+    assert not xmss.verify_aggregates([(pubkeys, leaf, b"\x08" * 32)], proof)
+    assert not xmss.verify_aggregates([(pubkeys[::-1], leaf, message)], proof)
+    assert not xmss.verify_aggregates([(pubkeys, leaf, message)], proof[:-1])
+    assert not xmss.verify_aggregates([(pubkeys, leaf, message)], proof + signatures[0])
+    tampered = bytearray(proof)
+    tampered[100] ^= 1
+    assert not xmss.verify_aggregates([(pubkeys, leaf, message)], bytes(tampered))
+    other_leaf = xmss.sign(seeds[0], leaf + 1, message)
+    assert not xmss.verify(pubkeys[0], leaf, message, other_leaf)
+    assert xmss.verify(pubkeys[0], leaf + 1, message, other_leaf)
+
+
+def test_deposits_and_requests(genesis, pq_config):
+    from consensoor.builder import BlockBuilder
+    from consensoor.node import BeaconNode
+    from consensoor.spec.constants import FAR_FUTURE_EPOCH
+    from consensoor.spec.state_transition.block.operations import process_deposit_request
+    from consensoor.spec.state_transition.block.operations.pq import (
+        process_validator_preregistration_request,
+        process_voluntary_exit_request,
+    )
+    from consensoor.spec.state_transition.epoch.pending_deposits import apply_pending_deposit
+    from consensoor.spec.types import pq
+    from consensoor.spec.types.electra import DepositRequest
+    from . import pq_helpers
+
+    state = pq_helpers.copy_state(genesis)
+    credentials = b"\x01" + b"\x00" * 11 + b"\x22" * 20
+    new_key = b"\x33" * 32
+    vrf_root = b"\x44" * 32
+
+    process_validator_preregistration_request(
+        state,
+        pq.ValidatorPreregistrationRequest(
+            pubkey=new_key, withdrawal_credentials=credentials, vrf_root=vrf_root
+        ),
+    )
+    assert len(state.validator_preregistrations) == 1
+
+    def deposit(pubkey48, creds, sig):
+        return DepositRequest(
+            pubkey=pubkey48, withdrawal_credentials=creds, amount=32 * 10**9, signature=sig, index=0
+        )
+
+    process_deposit_request(state, deposit(b"\x00" * 16 + new_key, b"\x01" + b"\x00" * 31, vrf_root + b"\x00" * 64))
+    assert len(state.pending_deposits) == 0
+    process_deposit_request(state, deposit(b"\x00" * 16 + new_key, credentials, vrf_root + b"\x00" * 64))
+    assert len(state.pending_deposits) == 1
+    assert len(state.validator_preregistrations) == 0
+
+    count = len(state.validators)
+    apply_pending_deposit(state, state.pending_deposits[0])
+    assert len(state.validators) == count + 1
+    assert bytes(state.validators[count].pubkey) == new_key
+    assert bytes(state.validators[count].vrf_root) == vrf_root
+    assert int(state.validators[count].exit_epoch) == FAR_FUTURE_EPOCH
+
+    legacy = b"\xa0" + b"\x55" * 47
+    process_deposit_request(state, deposit(legacy, credentials, b"\x00" * 96))
+    apply_pending_deposit(state, state.pending_deposits[1])
+    assert len(state.validators) == count + 2
+    assert int(state.validators[count + 1].exit_epoch) == 0
+
+    process_voluntary_exit_request(state, pq.VoluntaryExitRequest(pubkey=state.validators[0].pubkey))
+    assert int(state.validators[0].exit_epoch) == FAR_FUTURE_EPOCH
+
+    requests = pq.ExecutionRequests(
+        validator_preregistrations=[
+            pq.ValidatorPreregistrationRequest(pubkey=new_key, withdrawal_credentials=credentials, vrf_root=vrf_root)
+        ],
+        voluntary_exits=[pq.VoluntaryExitRequest(pubkey=new_key)],
+    )
+    encoded = BeaconNode._encode_execution_requests(requests)
+    assert [entry[:4] for entry in encoded] == ["0x07", "0x09"]
+    decoded = BlockBuilder._decode_execution_requests_hex(encoded, gloas=True, pq=True)
+    assert decoded.hash_tree_root() == requests.hash_tree_root()

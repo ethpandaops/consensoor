@@ -548,6 +548,10 @@ class BeaconAPI:
     def _status_matches(status: str, wanted: set[str]) -> bool:
         return not wanted or status in wanted or status.split("_")[0] in wanted
 
+    @staticmethod
+    def _pubkey_size(state) -> int:
+        return 32 if hasattr(state, "aggregation_committee_window") else 48
+
     def _validator_indices(self, state, ids) -> list[int]:
         """Indices of the validators named by ``ids`` (indices or pubkeys) that
         exist in ``state``; all validators when ``ids`` is empty."""
@@ -560,7 +564,7 @@ class BeaconAPI:
         for raw in ids:
             raw = str(raw)
             if raw.startswith("0x"):
-                pubkey = self._hex_bytes(raw, "validator ID", 48)
+                pubkey = self._hex_bytes(raw, "validator ID", self._pubkey_size(state))
                 if pubkeys is None:
                     pubkeys = {bytes(v.pubkey): i for i, v in enumerate(state.validators)}
                 index = pubkeys.get(pubkey)
@@ -792,16 +796,18 @@ class BeaconAPI:
 
     async def post_validator_identities(self, request: web.Request) -> web.Response:
         """POST /eth/v1/beacon/states/{state_id}/validator_identities"""
-        from ..spec.types.base import Container, List, uint64, BLSPubkey
+        from ..spec.types.base import Container, List, uint64, BLSPubkey, Bytes32
         from ..spec.constants import VALIDATOR_REGISTRY_LIMIT
-
-        class ValidatorIdentity(Container):
-            index: uint64
-            pubkey: BLSPubkey
-            activation_epoch: uint64
 
         ids = await self._json_list_body(request, required=False)
         state, finalized = await self._request_state(request)
+        pubkey_type = Bytes32 if self._pubkey_size(state) == 32 else BLSPubkey
+
+        class ValidatorIdentity(Container):
+            index: uint64
+            pubkey: pubkey_type
+            activation_epoch: uint64
+
         indices = await asyncio.to_thread(self._validator_indices, state, ids)
         identities = [
             ValidatorIdentity(
@@ -836,7 +842,7 @@ class BeaconAPI:
         wanted_indices, wanted_pubkeys = set(), set()
         for i in ids:
             if isinstance(i, str) and i.startswith("0x"):
-                wanted_pubkeys.add(self._hex_bytes(i, "builder ID", 48))
+                wanted_pubkeys.add(self._hex_bytes(i, "builder ID", self._pubkey_size(state)))
             else:
                 wanted_indices.add(self._uint(i, "builder ID"))
 
@@ -1536,7 +1542,13 @@ class BeaconAPI:
         slot = self._query_uint(request, "slot")
         committee_index = self._query_uint(request, "committee_index")
         attestations = await self._run_on_node_loop_fn(
-            self.node.attestation_pool.get_attestations, slot, committee_index
+            (
+                self.node.pq_attestation_pool
+                if get_network_config().pq_fork_epoch != 2**64 - 1
+                else self.node.attestation_pool
+            ).get_attestations,
+            slot,
+            committee_index,
         )
         version = self._fork_at_slot(slot if slot is not None else self.node.head_slot)
         return web.json_response(
