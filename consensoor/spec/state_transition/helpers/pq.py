@@ -18,7 +18,7 @@ from ...constants import (
     XMSS_LEAVES_PER_SLOT,
     XMSS_RESERVED_LEAVES,
 )
-from ....crypto import sha256, xmss
+from ....crypto import keccak256, sha256, xmss
 
 if TYPE_CHECKING:
     from ...types.pq import BeaconState
@@ -78,16 +78,14 @@ def is_builder_bid_leaf_index(leaf_index: int) -> bool:
 
 
 def is_valid_vrf_proof(state: "BeaconState", validator_index: int, slot: int, proof) -> bool:
-    from .predicates import is_valid_merkle_branch
-
     nodes = [bytes(node) for node in proof]
-    return is_valid_merkle_branch(
-        leaf=nodes[0],
-        branch=nodes[1:],
-        depth=VRF_TREE_DEPTH,
-        index=int(slot),
-        root=bytes(state.validators[validator_index].vrf_root),
-    )
+    value = nodes[0]
+    for height in range(VRF_TREE_DEPTH):
+        if int(slot) >> height & 1:
+            value = keccak256(nodes[height + 1] + value)
+        else:
+            value = keccak256(value + nodes[height + 1])
+    return value == bytes(state.validators[validator_index].vrf_root)
 
 
 def compute_aggregation_committee(state: "BeaconState", slot: int, index: int) -> list[int]:

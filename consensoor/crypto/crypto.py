@@ -8,6 +8,8 @@ import hashlib
 import logging
 from typing import Sequence
 
+from Crypto.Hash import keccak as _keccak
+
 logger = logging.getLogger(__name__)
 
 # Try to use blspy (fast) first, fall back to py_ecc (slow)
@@ -30,6 +32,11 @@ except ImportError:
 def sha256(data: bytes) -> bytes:
     """Compute SHA256 hash."""
     return hashlib.sha256(data).digest()
+
+
+def keccak256(data: bytes) -> bytes:
+    """Compute Keccak-256 hash."""
+    return _keccak.new(digest_bits=256, data=data).digest()
 
 
 def hash_tree_root(obj) -> bytes:

@@ -5,6 +5,7 @@ Uses blspy (fast C/assembly) when available, falls back to py_ecc (pure Python).
 
 from .crypto import (
     sha256,
+    keccak256,
     hash_tree_root,
     compute_signing_root,
     sign,
@@ -30,6 +31,7 @@ from .crypto import (
 
 __all__ = [
     "sha256",
+    "keccak256",
     "hash_tree_root",
     "compute_signing_root",
     "sign",

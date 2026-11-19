@@ -6,12 +6,12 @@ package main
 import "C"
 
 import (
-	"crypto/sha256"
 	"encoding/binary"
 	"sync"
 	"unsafe"
 
 	leanxmss "github.com/nalepae/go-leanxmss"
+	"golang.org/x/crypto/sha3"
 )
 
 const (
@@ -125,7 +125,17 @@ func hashPair(left, right *[32]byte) [32]byte {
 	copy(buf[:32], left[:])
 	copy(buf[32:], right[:])
 
-	return sha256.Sum256(buf[:])
+	return keccak256(buf[:])
+}
+
+func keccak256(data []byte) [32]byte {
+	var out [32]byte
+
+	h := sha3.NewLegacyKeccak256()
+	h.Write(data)
+	h.Sum(out[:0])
+
+	return out
 }
 
 func vrfChunk(seed *[seedSize]byte, chunk uint64) [vrfChunkDepth + 1][][32]byte {
@@ -138,7 +148,7 @@ func vrfChunk(seed *[seedSize]byte, chunk uint64) [vrfChunkDepth + 1][][32]byte 
 
 	for i := range leaves {
 		binary.LittleEndian.PutUint64(buf[seedSize:], chunk<<vrfChunkDepth+uint64(i))
-		leaves[i] = sha256.Sum256(buf[:])
+		leaves[i] = keccak256(buf[:])
 	}
 
 	levels[0] = leaves

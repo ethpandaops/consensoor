@@ -265,22 +265,27 @@ def test_leaf_indexes():
 
 
 def test_vrf_proof_opens_root():
-    import hashlib
+    from consensoor.crypto import keccak256
 
-    from consensoor.spec.state_transition.helpers.predicates import is_valid_merkle_branch
+    def opens(proof, slot, root):
+        value = proof[0]
+        for height in range(31):
+            if slot >> height & 1:
+                value = keccak256(proof[height + 1] + value)
+            else:
+                value = keccak256(value + proof[height + 1])
+        return value == root
 
     seed = xmss.vrf_seed_from_privkey(42)
     root = xmss.vrf_root(seed)
     for slot in (0, 1, 1023, 1024, 2**20 - 1, 2**20, 2**31 - 1):
         proof = xmss.vrf_proof(seed, slot)
         assert len(proof) == 32
-        expected_leaf = (
-            hashlib.sha256(seed + slot.to_bytes(8, "little")).digest() if slot < 2**20 else bytes(32)
-        )
+        expected_leaf = keccak256(seed + slot.to_bytes(8, "little")) if slot < 2**20 else bytes(32)
         assert proof[0] == expected_leaf
-        assert is_valid_merkle_branch(proof[0], proof[1:], 31, slot, root)
+        assert opens(proof, slot, root)
         if slot < 2**20:
-            assert not is_valid_merkle_branch(proof[0], proof[1:], 31, slot ^ 1, root)
+            assert not opens(proof, slot ^ 1, root)
 
 
 def test_stark_stand_in_checks_leaf_and_signature():
