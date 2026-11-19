@@ -2784,7 +2784,7 @@ class BeaconNode:
             k.validator_index for k in self.validator_client.keys.values()
             if k.validator_index is not None
         }
-        our_in_ptc = [vi for vi in ptc if vi in our_indices]
+        our_in_ptc = sorted({int(vi) for vi in ptc if vi in our_indices})
         if not our_in_ptc:
             return
 
