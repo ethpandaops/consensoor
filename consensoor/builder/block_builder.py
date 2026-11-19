@@ -1,5 +1,6 @@
 """Block builder for creating valid beacon blocks."""
 
+import asyncio
 import logging
 from typing import Optional, TYPE_CHECKING, Union
 
@@ -215,15 +216,12 @@ class BlockBuilder:
             max_attestations = min(8, MAX_ATTESTATIONS())
         net_config = get_config()
         electra_fork_epoch = getattr(net_config, 'electra_fork_epoch', 2**64 - 1)
-        attestation_proofs: dict[int, bytes] = {}
+        attestation_children: dict[int, list] = {}
         if self._pq:
-            from ..spec.constants import MAX_ATTESTATIONS_PQ, XMSS_SIGNATURE_SIZE
-
-            from ..pq_attestation_pool import MAX_PROOF_SIGNATURES
+            from ..spec.constants import MAX_ATTESTATIONS_PQ, MAX_STARK_PROOF_SIZE
 
             max_attestations = MAX_ATTESTATIONS_PQ
             pool_attestations = self.node.pq_attestation_pool.get_block_candidates(slot)
-            signature_budget = MAX_PROOF_SIGNATURES
         else:
             pool_attestations = self.node.attestation_pool.get_attestations_for_block(
                 slot, max_attestations * 2, electra_fork_epoch  # Get extra to account for filtering
@@ -254,10 +252,19 @@ class BlockBuilder:
         for att in pool_attestations:
             try:
                 if self._pq:
-                    built = self.node.pq_attestation_pool.build_for_block(att, signature_budget)
+                    built = await asyncio.to_thread(
+                        self.node.pq_attestation_pool.build_for_block,
+                        att,
+                        lambda child, signatures: xmss.prove_aggregates(
+                            get_attestation_statements(temp_state, child), [signatures]
+                        ),
+                        lambda child, child_proof: xmss.verify_aggregates(
+                            get_attestation_statements(temp_state, child), child_proof
+                        ),
+                    )
                     if built is None:
                         continue
-                    att, proof = built
+                    att, children = built
                 if has_participation_flags:
                     data = att.data
                     inclusion_delay = int(temp_state.slot) - int(data.slot)
@@ -288,14 +295,13 @@ class BlockBuilder:
                         continue
 
                 if self._pq:
-                    if xmss.verify_aggregates(get_attestation_statements(temp_state, att), proof):
-                        attestation_proofs[id(att)] = proof
-                        valid_attestations.append(att)
-                        signature_budget -= len(proof) // XMSS_SIGNATURE_SIZE
-                        if len(valid_attestations) >= max_attestations or signature_budget <= 0:
-                            break
-                    else:
-                        logger.debug(f"Skipping attestation with invalid proof: slot={att.data.slot}")
+                    attestation_children[id(att)] = [
+                        (get_attestation_statements(temp_state, child), child_proof)
+                        for child, child_proof in children
+                    ]
+                    valid_attestations.append(att)
+                    if len(valid_attestations) >= max_attestations:
+                        break
                     continue
                 indexed = get_indexed_attestation(temp_state, att)
                 if is_valid_indexed_attestation(temp_state, indexed):
@@ -313,6 +319,23 @@ class BlockBuilder:
             )
 
         attestations = valid_attestations
+        attestation_proof = b""
+        if self._pq:
+            while attestations:
+                try:
+                    attestation_proof = await asyncio.to_thread(
+                        xmss.merge_proofs,
+                        [child for a in attestations for child in attestation_children[id(a)]],
+                    )
+                except Exception as e:
+                    logger.warning(f"Cannot merge attestation proofs, proposing without attestations: {e}")
+                    attestations = []
+                    break
+                if len(attestation_proof) <= MAX_STARK_PROOF_SIZE:
+                    break
+                attestations = attestations[:-1]
+            if not attestations:
+                attestation_proof = b""
         logger.info(f"Pre-validated {len(attestations)} of {len(pool_attestations)} attestations")
 
         # Build block body - GLOAS uses different structure (ePBS)
@@ -338,7 +361,7 @@ class BlockBuilder:
                     randao_reveal,
                     signed_execution_payload_bid,
                     attestations,
-                    xmss.merge_proofs([attestation_proofs[id(a)] for a in attestations]),
+                    attestation_proof,
                 )
             else:
                 signed_execution_payload_bid = signed_bid_cls(

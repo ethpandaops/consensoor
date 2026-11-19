@@ -3113,7 +3113,9 @@ class BeaconNode:
             return
         from .spec.constants import DOMAIN_AGGREGATE_AND_PROOF
         from .spec.state_transition.helpers.domain import get_domain_at_epoch, compute_signing_root
-        from .spec.state_transition.helpers.pq import is_aggregator
+        from .crypto import xmss
+        from .spec.state_transition.helpers.beacon_committee import get_beacon_committee
+        from .spec.state_transition.helpers.pq import get_attestation_statements, is_aggregator
         from .spec.types import pq as pq_types
 
         state = self.state
@@ -3128,12 +3130,20 @@ class BeaconNode:
                 if not is_aggregator(state, slot, committee_index, duty.validator_index):
                     continue
                 key = self.validator_client.get_key(duty.pubkey)
-                aggregate = self.pq_attestation_pool.get_aggregate(
+                inputs = self.pq_attestation_pool.get_aggregate_inputs(
                     slot, attested[committee_index], committee_index
                 )
-                if key is None or aggregate is None:
+                if key is None or inputs is None:
                     continue
-                attestation, proof = aggregate
+                attestation, signatures = inputs
+                proof = await asyncio.to_thread(
+                    xmss.prove_aggregates, get_attestation_statements(state, attestation), [signatures]
+                )
+                self.pq_attestation_pool.add_aggregate(
+                    attestation,
+                    proof,
+                    [int(v) for v in get_beacon_committee(state, slot, committee_index)],
+                )
                 aggregate_and_proof = pq_types.AggregateAndProof(
                     aggregator_index=duty.validator_index,
                     aggregate=attestation,

@@ -1,3 +1,5 @@
+ARG LEANVM_SIDECAR_IMAGE=ethdreamer/lighthouse:pq
+
 # --- Stage 1: build consensoor wheel -----------------------------------------
 FROM python:3.12-slim AS builder
 
@@ -38,7 +40,10 @@ COPY consensoor-xmss/ consensoor-xmss/
 
 RUN cd consensoor-xmss && go build -buildmode=c-shared -o /tmp/libleanxmss.so .
 
-# --- Stage 4: runtime --------------------------------------------------------
+# --- Stage 4: leanVM aggregation prover ---------------------------------------
+FROM ${LEANVM_SIDECAR_IMAGE} AS leanvm
+
+# --- Stage 5: runtime --------------------------------------------------------
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -51,6 +56,8 @@ COPY --from=builder /app/dist/*.whl /tmp/
 COPY --from=rust-builder /tmp/wheels/*.whl /tmp/
 COPY --from=xmss-builder /tmp/libleanxmss.so /usr/local/lib/libleanxmss.so
 ENV CONSENSOOR_XMSS_LIB=/usr/local/lib/libleanxmss.so
+COPY --from=leanvm /usr/local/bin/leanvm-sidecar /usr/local/bin/leanvm-sidecar
+COPY docker-entrypoint.sh /usr/local/bin/consensoor-entrypoint
 
 # Install consensoor + its runtime deps + the native Rust p2p wheel.
 # We deliberately do NOT install py-libp2p anymore — consensoor's host.py
@@ -70,5 +77,5 @@ EXPOSE 9000/tcp
 EXPOSE 5052/tcp
 EXPOSE 8008/tcp
 
-ENTRYPOINT ["consensoor"]
+ENTRYPOINT ["consensoor-entrypoint"]
 CMD ["run", "--help"]

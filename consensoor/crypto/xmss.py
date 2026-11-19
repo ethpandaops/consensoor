@@ -7,6 +7,8 @@ import os
 from pathlib import Path
 from typing import Optional, Sequence
 
+from . import leanvm
+
 PUBKEY_SIZE = 32
 SIGNATURE_SIZE = 2404
 MESSAGE_SIZE = 32
@@ -15,6 +17,8 @@ VRF_PROOF_LENGTH = 32
 
 SEED_DOMAIN = b"leanxmss-seed"
 VRF_SEED_DOMAIN = b"vrf-seed"
+
+Statement = tuple[Sequence[bytes], int, bytes]
 
 _lib: Optional[ctypes.CDLL] = None
 
@@ -124,20 +128,44 @@ def vrf_proof(vrf_seed: bytes, slot: int) -> list[bytes]:
     return [out.raw[i * 32:(i + 1) * 32] for i in range(VRF_PROOF_LENGTH)]
 
 
-def prove_aggregates(signatures: Sequence[Sequence[bytes]]) -> bytes:
+def _claims(statements: Sequence[Statement]) -> list[tuple[bytes, bytes]]:
+    return [(bytes(pubkey), bytes(message)) for pubkeys, _, message in statements for pubkey in pubkeys]
+
+
+def prove_aggregates(statements: Sequence[Statement], signatures: Sequence[Sequence[bytes]]) -> bytes:
+    if len(statements) != len(signatures):
+        raise ValueError("one signature group per statement is required")
+    for (pubkeys, leaf_index, _), group in zip(statements, signatures):
+        if len(pubkeys) != len(group):
+            raise ValueError("one signature per public key is required")
+        if any(get_leaf_index(signature) != leaf_index for signature in group):
+            raise ValueError("signature made at another leaf than its statement")
+    if leanvm.enabled():
+        return leanvm.prove(
+            _claims(statements),
+            [
+                (bytes(pubkey), bytes(message), bytes(signature))
+                for (pubkeys, _, message), group in zip(statements, signatures)
+                for pubkey, signature in zip(pubkeys, group)
+            ],
+        )
     return b"".join(bytes(s) for group in signatures for s in group)
 
 
-def merge_proofs(proofs: Sequence[bytes]) -> bytes:
-    return b"".join(bytes(proof) for proof in proofs)
+def merge_proofs(children: Sequence[tuple[Sequence[Statement], bytes]]) -> bytes:
+    if leanvm.enabled():
+        return leanvm.merge([(_claims(statements), proof) for statements, proof in children])
+    return b"".join(bytes(proof) for _, proof in children)
 
 
-def verify_aggregates(statements: Sequence[tuple[Sequence[bytes], int, bytes]], proof: bytes) -> bool:
+def verify_aggregates(statements: Sequence[Statement], proof: bytes) -> bool:
     from .crypto import bls_verification_enabled
 
     if not bls_verification_enabled():
         return True
     proof = bytes(proof)
+    if leanvm.enabled():
+        return leanvm.check(_claims(statements), proof)
     offset = 0
     for pubkeys, leaf_index, message in statements:
         for pubkey in pubkeys:

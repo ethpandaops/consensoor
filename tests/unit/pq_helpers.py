@@ -134,7 +134,8 @@ def sign_attestations(state, slot: int, head_root: bytes):
             committee_bits=committee_bits,
         )
         proof = xmss.prove_aggregates(
-            [[xmss.sign(seeds[int(v)], leaf_index, signing_root) for v in committee]]
+            [([bytes(state.validators[int(v)].pubkey) for v in committee], leaf_index, signing_root)],
+            [[xmss.sign(seeds[int(v)], leaf_index, signing_root) for v in committee]],
         )
         result.append((attestation, proof))
     return result
@@ -180,7 +181,7 @@ def build_block(state, slot: int, attestations=()):
         randao_reveal=xmss.vrf_proof(xmss.vrf_seed_from_privkey(sk), slot),
         signed_execution_payload_bid=pq.SignedExecutionPayloadBid(message=bid),
         attestations=[attestation for attestation, _ in attestations],
-        proof=xmss.merge_proofs([proof for _, proof in attestations]),
+        proof=xmss.merge_proofs([([], proof) for _, proof in attestations]),
     )
     block = pq.BeaconBlock(
         slot=slot,

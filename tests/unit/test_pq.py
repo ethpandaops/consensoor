@@ -136,12 +136,15 @@ def test_block_builder_and_validator_client(genesis, pq_config, tmp_path):
 
             aggregators = get_aggregation_committee(node.state, slot, 0)
             assert 0 < len(aggregators) <= 4
-            attestation, proof = node.pq_attestation_pool.get_aggregate(
+            attestation, signatures = node.pq_attestation_pool.get_aggregate_inputs(
                 slot, hash_tree_root(single.data), 0
             )
             from consensoor.crypto import xmss as xmss_lib
 
-            assert xmss_lib.verify_aggregates(get_attestation_statements(node.state, attestation), proof)
+            statements = get_attestation_statements(node.state, attestation)
+            assert xmss_lib.verify_aggregates(
+                statements, xmss_lib.prove_aggregates(statements, [signatures])
+            )
 
     asyncio.run(run())
     assert int(node.state.finalized_checkpoint.epoch) >= 2
@@ -286,7 +289,9 @@ def test_stark_stand_in_checks_leaf_and_signature():
     message = b"\x07" * 32
     leaf = 2**15 + 3
     signatures = [xmss.sign(seed, leaf, message) for seed in seeds]
-    proof = xmss.prove_aggregates([signatures])
+    proof = xmss.prove_aggregates([(pubkeys, leaf, message)], [signatures])
+    with pytest.raises(ValueError):
+        xmss.prove_aggregates([(pubkeys, leaf + 1, message)], [signatures])
     assert xmss.get_leaf_index(signatures[0]) == leaf
     assert xmss.verify_aggregates([(pubkeys, leaf, message)], proof)
     assert xmss.verify_aggregates([(pubkeys[:1], leaf, message), (pubkeys[1:], leaf, message)], proof)
@@ -369,16 +374,15 @@ def test_deposits_and_requests(genesis, pq_config):
     assert decoded.hash_tree_root() == requests.hash_tree_root()
 
 
-def test_pool_caps_signatures_per_proof(pq_config):
-    from consensoor.pq_attestation_pool import MAX_PROOF_SIGNATURES, PQAttestationPool
+def test_pool_prefers_the_larger_proof_per_committee(pq_config):
+    from consensoor.pq_attestation_pool import PQAttestationPool
     from consensoor.spec.types import pq
     from consensoor.spec.types.phase0 import AttestationData
 
-    assert MAX_PROOF_SIGNATURES == 436
     pool = PQAttestationPool()
     data = AttestationData(slot=3)
     for committee_index, committee in ((0, [10, 11, 12]), (1, [20, 21])):
-        for validator_index in committee:
+        for validator_index in committee[:2]:
             single = pq.SingleAttestation(
                 committee_index=committee_index,
                 attester_index=validator_index,
@@ -390,22 +394,63 @@ def test_pool_caps_signatures_per_proof(pq_config):
 
     assert pool.get_block_candidates(4) == []
     (root,) = pool.get_block_candidates(5)
-    attestation, proof = pool.build_for_block(root, 100)
-    assert list(attestation.aggregation_bits) == [True] * 5
+    proved = []
+
+    def prove(child, signatures):
+        proved.append(pool.committee_of(child))
+        return b"".join(signatures)
+
+    attestation, children = pool.build_for_block(root, prove)
+    assert proved == [0, 1]
+    assert list(attestation.aggregation_bits) == [True, True, False, True, True]
     assert list(attestation.committee_bits) == [True, True, False, False]
-    assert len(proof) == 5 * 2404
+    assert [len(proof) for _, proof in children] == [2 * 2404, 2 * 2404]
+    assert [pool.committee_of(child) for child, _ in children] == [0, 1]
+    assert pool.size == 4
 
-    attestation, proof = pool.build_for_block(root, 2)
-    assert list(attestation.aggregation_bits) == [True, True, False]
-    assert list(attestation.committee_bits) == [True, False, False, False]
-    assert proof == bytes([10]) * 2404 + bytes([11]) * 2404
+    pool.build_for_block(root, prove)
+    assert proved == [0, 1]
 
-    attestation, proof = pool.build_for_block(root, 4)
-    assert list(attestation.aggregation_bits) == [True, True, True, True, False]
-    assert pool.build_for_block(root, 0) is None
+    full = pq.Attestation(
+        aggregation_bits=[True, True, True], data=data, committee_bits=[True, False, False, False]
+    )
+    assert pool.add_aggregate(full, b"proof", [10, 11, 12])
+    assert not pool.add_aggregate(full, b"other", [10, 11, 12])
+    attestation, children = pool.build_for_block(root, prove)
+    assert list(attestation.aggregation_bits) == [True] * 5
+    assert children[0][1] == b"proof"
+    assert pool.size == 5
 
-    single_committee, committee_proof = pool.get_aggregate(3, root, 1)
+    assert pool.build_for_block(root, prove, lambda child, proof: proof != b"proof")[1][0][1] != b"proof"
+
+    single_committee, signatures = pool.get_aggregate_inputs(3, root, 1)
     assert pool.committee_of(single_committee) == 1
-    other = PQAttestationPool()
-    assert other.add_aggregate(single_committee, committee_proof, [20, 21]) == 2
-    assert other.size == 2
+    assert signatures == [bytes([20]) * 2404, bytes([21]) * 2404]
+
+
+def test_sidecar_claims_are_sorted_and_deduplicated():
+    from consensoor.crypto import leanvm
+
+    low = b"\x03" * 31 + b"\x02"
+    claims = leanvm.normalize_claims(
+        [
+            (b"\x09" * 32, b"\xaa" * 32),
+            (b"\x03" * 32, b"\xaa" * 32),
+            (low, b"\xaa" * 32),
+            (b"\x03" * 32, b"\x11" * 32),
+            (b"\x01" * 32, b"\x11" * 32),
+            (b"\x09" * 32, b"\xaa" * 32),
+        ]
+    )
+    assert claims == [
+        (b"\x01" * 32, b"\x11" * 32),
+        (low, b"\xaa" * 32),
+        (b"\x03" * 32, b"\x11" * 32),
+        (b"\x03" * 32, b"\xaa" * 32),
+        (b"\x09" * 32, b"\xaa" * 32),
+    ]
+    encoded = leanvm.encode_claims(claims)
+    assert len(encoded) == 8 + 5 * 64 + 8 + 1
+    assert encoded[:8] == (5).to_bytes(8, "little") and encoded[-9:] == bytes(9)
+    assert leanvm.decode_claims(encoded) == claims
+    assert leanvm.encode_claims([]) == bytes(17)
