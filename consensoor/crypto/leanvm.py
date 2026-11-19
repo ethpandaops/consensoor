@@ -1,9 +1,15 @@
 """Client for the leanvm-sidecar aggregation prover (protocol version 1)."""
 
+import atexit
+import logging
 import os
+import shutil
 import socket
 import struct
+import subprocess
+import tempfile
 import threading
+import time
 from typing import Optional, Sequence
 
 MAGIC = b"leanvmsc"
@@ -16,6 +22,11 @@ DEFAULT_LOG_INV_RATE = 2
 PROVE_TIMEOUT = 300.0
 VERIFY_TIMEOUT = 30.0
 RESPONSE_ROOM = 16 << 20
+
+SIDECAR_BINARY = "leanvm-sidecar"
+SIDECAR_START_TIMEOUT = 120.0
+
+logger = logging.getLogger(__name__)
 
 Claim = tuple[bytes, bytes]
 Child = tuple[Sequence[Claim], bytes]
@@ -38,6 +49,30 @@ def configure(socket_path: Optional[str]) -> None:
     _socket_path = socket_path or None
     for connection in (_prove_connection, _verify_connection):
         connection.close()
+
+
+def start_sidecar() -> bool:
+    if enabled():
+        return True
+    binary = shutil.which(SIDECAR_BINARY)
+    if binary is None or os.environ.get("CONSENSOOR_LEANVM_SIDECAR") == "0":
+        return False
+    path = os.path.join(tempfile.mkdtemp(prefix="leanvm."), "prover.sock")
+    process = subprocess.Popen(
+        [binary, "--socket", path, "--threads", os.environ.get("LEANVM_THREADS", "0")]
+    )
+    atexit.register(process.terminate)
+    deadline = time.monotonic() + SIDECAR_START_TIMEOUT
+    while not os.path.exists(path):
+        if process.poll() is not None:
+            raise SidecarError("leanvm-sidecar exited before creating its socket")
+        if time.monotonic() > deadline:
+            process.terminate()
+            raise SidecarError("leanvm-sidecar did not create its socket in time")
+        time.sleep(0.1)
+    configure(path)
+    logger.info(f"Started {binary} on {path}")
+    return True
 
 
 def enabled() -> bool:

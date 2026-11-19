@@ -358,6 +358,13 @@ class BeaconNode:
         # Genesis state has to land before P2P starts (fork_version,
         # genesis_validators_root, fork_digest are derived from it).
         await self._load_genesis_state()
+        if get_config().pq_fork_epoch != 2**64 - 1:
+            from .crypto import leanvm
+
+            if await asyncio.to_thread(leanvm.start_sidecar):
+                logger.info("Aggregating leanXMSS signatures with the leanVM sidecar")
+            else:
+                logger.warning("No leanVM sidecar, attestation proofs are concatenated signatures")
 
         # Bring P2P up BEFORE the slow validator-key load. The rust libp2p
         # stack accepts inbound connections immediately and other clients
