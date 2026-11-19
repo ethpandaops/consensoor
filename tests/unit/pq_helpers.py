@@ -25,6 +25,7 @@ def build_genesis_state(validator_count: int = VALIDATOR_COUNT):
     from consensoor.spec.types.gloas import ExecutionPayloadBid
     from consensoor.spec.types.phase0 import BeaconBlockHeader
 
+    xmss.vrf_set_filled_leaves(2**20)
     config = get_config()
     validators = []
     for index in range(validator_count):

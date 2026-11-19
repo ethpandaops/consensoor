@@ -24,6 +24,8 @@ const (
 	vrfChunkDepth = 10
 	vrfLeafCount  = 1 << vrfLeafDepth
 	vrfProofSize  = (vrfTreeDepth + 1) * 32
+	vrfStateSize  = 4 + vrfTreeDepth*32
+	vrfForkDepth  = 16
 )
 
 var (
@@ -106,19 +108,21 @@ func xmss_verify(publicKey *C.uint8_t, leafIndex C.uint32_t, message *C.uint8_t,
 type vrfTree struct {
 	seed   [seedSize]byte
 	levels [vrfLeafDepth - vrfChunkDepth + 1][][32]byte
+	upper  [vrfTreeDepth - vrfLeafDepth][32]byte
 }
 
 var (
-	vrfMu    sync.Mutex
-	vrfTrees = map[[seedSize]byte]*vrfTree{}
-	vrfZeros = func() (zeros [vrfTreeDepth + 1][32]byte) {
-		for i := 1; i <= vrfTreeDepth; i++ {
-			zeros[i] = hashPair(&zeros[i-1], &zeros[i-1])
-		}
-
-		return zeros
-	}()
+	vrfMu     sync.Mutex
+	vrfTrees  = map[[seedSize]byte]*vrfTree{}
+	vrfFilled = uint64(1) << vrfTreeDepth
+	vrfZeros  [vrfTreeDepth][32]byte
 )
+
+func init() {
+	for level := 1; level < vrfTreeDepth; level++ {
+		vrfZeros[level] = hashPair(&vrfZeros[level-1], &vrfZeros[level-1])
+	}
+}
 
 func hashPair(left, right *[32]byte) [32]byte {
 	var buf [64]byte
@@ -167,7 +171,51 @@ func vrfChunk(seed *[seedSize]byte, chunk uint64) [vrfChunkDepth + 1][][32]byte 
 	return levels
 }
 
-func buildVRFTree(seed [seedSize]byte) *vrfTree {
+func vrfLeaf(seed *[seedSize]byte, index uint64) [32]byte {
+	var buf [seedSize + 8]byte
+	copy(buf[:seedSize], seed[:])
+	binary.LittleEndian.PutUint64(buf[seedSize:], index)
+
+	return keccak256(buf[:])
+}
+
+func vrfNode(seed *[seedSize]byte, height int, index uint64) [32]byte {
+	if index<<height >= vrfFilled {
+		return vrfZeros[height]
+	}
+
+	if height == 0 {
+		return vrfLeaf(seed, index)
+	}
+
+	if height <= vrfForkDepth {
+		left := vrfNode(seed, height-1, 2*index)
+		right := vrfNode(seed, height-1, 2*index+1)
+
+		return hashPair(&left, &right)
+	}
+
+	var (
+		wg   sync.WaitGroup
+		left [32]byte
+	)
+
+	wg.Add(1)
+
+	go func() {
+		defer wg.Done()
+
+		left = vrfNode(seed, height-1, 2*index)
+	}()
+
+	right := vrfNode(seed, height-1, 2*index+1)
+
+	wg.Wait()
+
+	return hashPair(&left, &right)
+}
+
+func buildVRFTree(seed [seedSize]byte, upper *[vrfTreeDepth - vrfLeafDepth][32]byte) *vrfTree {
 	tree := &vrfTree{seed: seed}
 	roots := make([][32]byte, 1<<(vrfLeafDepth-vrfChunkDepth))
 
@@ -188,12 +236,27 @@ func buildVRFTree(seed [seedSize]byte) *vrfTree {
 		tree.levels[level] = nodes
 	}
 
+	if upper != nil {
+		tree.upper = *upper
+
+		return tree
+	}
+
+	for level := vrfLeafDepth; level < vrfTreeDepth; level++ {
+		tree.upper[level-vrfLeafDepth] = vrfNode(&seed, level, 1)
+	}
+
 	return tree
 }
 
-func vrfTreeOf(seed *C.uint8_t) *vrfTree {
-	var s [seedSize]byte
+func seedOf(seed *C.uint8_t) (s [seedSize]byte) {
 	copy(s[:], unsafe.Slice((*byte)(unsafe.Pointer(seed)), seedSize))
+
+	return s
+}
+
+func vrfTreeOf(seed *C.uint8_t) *vrfTree {
+	s := seedOf(seed)
 
 	vrfMu.Lock()
 	tree, ok := vrfTrees[s]
@@ -203,7 +266,7 @@ func vrfTreeOf(seed *C.uint8_t) *vrfTree {
 		return tree
 	}
 
-	tree = buildVRFTree(s)
+	tree = buildVRFTree(s, nil)
 
 	vrfMu.Lock()
 	vrfTrees[s] = tree
@@ -219,7 +282,7 @@ func (t *vrfTree) subtreeRoot() [32]byte {
 func (t *vrfTree) root() [32]byte {
 	node := t.subtreeRoot()
 	for level := vrfLeafDepth; level < vrfTreeDepth; level++ {
-		node = hashPair(&node, &vrfZeros[level])
+		node = hashPair(&node, &t.upper[level-vrfLeafDepth])
 	}
 
 	return node
@@ -228,35 +291,76 @@ func (t *vrfTree) root() [32]byte {
 func (t *vrfTree) proof(slot uint64) [vrfTreeDepth + 1][32]byte {
 	var proof [vrfTreeDepth + 1][32]byte
 
-	inside := slot < vrfLeafCount
+	if slot >= vrfLeafCount {
+		proof[0] = vrfNode(&t.seed, 0, slot)
+		for level := 0; level < vrfTreeDepth; level++ {
+			proof[level+1] = vrfNode(&t.seed, level, (slot>>level)^1)
+		}
 
-	var chunk [vrfChunkDepth + 1][][32]byte
-	if inside {
-		chunk = vrfChunk(&t.seed, slot>>vrfChunkDepth)
-		proof[0] = chunk[0][slot&(1<<vrfChunkDepth-1)]
+		return proof
 	}
+
+	chunk := vrfChunk(&t.seed, slot>>vrfChunkDepth)
+	proof[0] = chunk[0][slot&(1<<vrfChunkDepth-1)]
 
 	for level := 0; level < vrfTreeDepth; level++ {
 		sibling := (slot >> level) ^ 1
 
 		switch {
-		case inside && level < vrfChunkDepth:
+		case level < vrfChunkDepth:
 			proof[level+1] = chunk[level][sibling&(uint64(len(chunk[level]))-1)]
-		case inside && level < vrfLeafDepth:
+		case level < vrfLeafDepth:
 			proof[level+1] = t.levels[level-vrfChunkDepth][sibling]
-		case sibling == 0 && level >= vrfLeafDepth:
-			node := t.subtreeRoot()
-			for l := vrfLeafDepth; l < level; l++ {
-				node = hashPair(&node, &vrfZeros[l])
-			}
-
-			proof[level+1] = node
 		default:
-			proof[level+1] = vrfZeros[level]
+			proof[level+1] = t.upper[level-vrfLeafDepth]
 		}
 	}
 
 	return proof
+}
+
+//export vrf_set_filled_leaves
+func vrf_set_filled_leaves(leaves C.uint64_t) C.int {
+	if leaves < vrfLeafCount || leaves > 1<<vrfTreeDepth {
+		return 1
+	}
+
+	vrfMu.Lock()
+	vrfFilled = uint64(leaves)
+	vrfTrees = map[[seedSize]byte]*vrfTree{}
+	vrfMu.Unlock()
+
+	return 0
+}
+
+//export vrf_load_state
+func vrf_load_state(seed *C.uint8_t, state *C.uint8_t) C.int {
+	s := seedOf(seed)
+	encoded := unsafe.Slice((*byte)(unsafe.Pointer(state)), vrfStateSize)
+
+	if binary.LittleEndian.Uint32(encoded[:4]) != 0 {
+		return 1
+	}
+
+	var upper [vrfTreeDepth - vrfLeafDepth][32]byte
+	for level := vrfLeafDepth; level < vrfTreeDepth; level++ {
+		copy(upper[level-vrfLeafDepth][:], encoded[4+level*32:])
+	}
+
+	tree := buildVRFTree(s, &upper)
+	proof := tree.proof(0)
+
+	for level := range vrfLeafDepth {
+		if string(proof[level+1][:]) != string(encoded[4+level*32:4+(level+1)*32]) {
+			return 1
+		}
+	}
+
+	vrfMu.Lock()
+	vrfTrees[s] = tree
+	vrfMu.Unlock()
+
+	return 0
 }
 
 //export vrf_root

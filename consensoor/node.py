@@ -678,6 +678,21 @@ class BeaconNode:
             justified=int(self.state.current_justified_checkpoint.epoch),
         )
 
+    async def _load_vrf_states(self) -> None:
+        keys = list(self.validator_client.keys.values())
+        loaded = 0
+        if self.config.vrf_state_url:
+            loaded = await asyncio.to_thread(
+                xmss_signer.load_vrf_states, keys, self.state, self.config.vrf_state_url
+            )
+            logger.info(f"Loaded {loaded} VRF tree states from {self.config.vrf_state_url}")
+        missing = sum(1 for key in keys if key.validator_index is not None and not key.vrf_state_loaded)
+        if missing:
+            logger.warning(
+                f"{missing} validators have no VRF tree state: each hashes its 2**31 leaves "
+                f"before its first proposal, which takes minutes"
+            )
+
     async def _load_validator_keys(self) -> None:
         """Load validator keys if configured."""
         if not self.config.validator_keys_spec:
@@ -706,6 +721,8 @@ class BeaconNode:
             if self.state:
                 self.validator_client.update_validator_indices(self.state)
                 self._update_custody_group_count_from_state()
+                if is_pq_state(self.state):
+                    await self._load_vrf_states()
         except Exception as e:
             logger.error(f"Failed to load validator keys: {e}")
             self.validator_client = ValidatorClient([])

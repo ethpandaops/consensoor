@@ -15,6 +15,7 @@ class Config:
     engine_api_url: str = "http://localhost:8551"
     jwt_secret_path: str = ""
     validator_keys_spec: str = ""
+    vrf_state_url: str = ""
     fee_recipient: str = "0x" + "00" * 20
     graffiti: str = "consensoor"
     genesis_state_path: str = ""

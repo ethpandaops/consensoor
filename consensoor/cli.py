@@ -222,6 +222,13 @@ def cli():
     envvar="CONSENSOOR_EMIT_PAYLOAD_ATTRIBUTES",
 )
 @click.option(
+    "--vrf-state-url",
+    default=None,
+    help="URL of a file of precomputed VRF tree states, 1028 bytes per validator "
+         "(VRF root, then the compact state at slot 0), fetched by range for our validators.",
+    envvar="CONSENSOOR_VRF_STATE_URL",
+)
+@click.option(
     "--target-gas-limit",
     type=int,
     default=None,
@@ -253,6 +260,7 @@ def run(
     engine_force_json: bool,
     fast_confirmation: bool,
     emit_payload_attributes: bool,
+    vrf_state_url: Optional[str],
     target_gas_limit: int,
 ):
     """Run the consensus layer node."""
@@ -277,6 +285,7 @@ def run(
         engine_api_url=engine_api_url,
         jwt_secret_path=jwt_secret or "",
         validator_keys_spec=validator_keys or "",
+        vrf_state_url=vrf_state_url or "",
         fee_recipient=fee_recipient,
         graffiti=graffiti,
         genesis_state_path=genesis_state,

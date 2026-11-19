@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import threading
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -78,6 +79,58 @@ def sign(key: ValidatorKey, leaf_index: int, signing_root: bytes) -> bytes:
 
 async def sign_async(key: ValidatorKey, leaf_index: int, signing_root: bytes) -> bytes:
     return await asyncio.to_thread(sign, key, leaf_index, signing_root)
+
+
+VRF_RECORD_SIZE = 32 + xmss.VRF_STATE_SIZE
+
+
+def _fetch(url: str, first: Optional[int] = None, last: Optional[int] = None) -> bytes:
+    headers = {}
+    if first is not None:
+        headers["Range"] = f"bytes={first * VRF_RECORD_SIZE}-{(last + 1) * VRF_RECORD_SIZE - 1}"
+    with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=120) as response:
+        if first is not None and response.status != 206:
+            raise ValueError(f"range request answered with status {response.status}")
+        return response.read()
+
+
+def load_vrf_states(keys: list[ValidatorKey], state, url: str) -> int:
+    """Load the precomputed VRF tree state of each key whose VRF root the file at url holds."""
+    wanted = {}
+    for key in keys:
+        if key.validator_index is not None and key.vrf_seed is not None and not key.vrf_state_loaded:
+            wanted[bytes(state.validators[key.validator_index].vrf_root)] = key
+    if not wanted:
+        return 0
+    records = {}
+    indices = [key.validator_index for key in wanted.values()]
+    first = min(indices)
+    try:
+        data = _fetch(url, first, max(indices))
+        for root, key in wanted.items():
+            offset = (key.validator_index - first) * VRF_RECORD_SIZE
+            if data[offset:offset + 32] == root and len(data) >= offset + VRF_RECORD_SIZE:
+                records[root] = data[offset:offset + VRF_RECORD_SIZE]
+    except Exception as e:
+        logger.warning(f"Cannot fetch VRF states by range, fetching the whole file: {e}")
+    if len(records) < len(wanted):
+        try:
+            data = _fetch(url)
+            for offset in range(0, len(data) - VRF_RECORD_SIZE + 1, VRF_RECORD_SIZE):
+                root = data[offset:offset + 32]
+                if root in wanted and root not in records:
+                    records[root] = data[offset:offset + VRF_RECORD_SIZE]
+        except Exception as e:
+            logger.warning(f"Cannot fetch VRF states from {url}: {e}")
+    loaded = 0
+    for root, record in records.items():
+        key = wanted[root]
+        if xmss.vrf_load_state(key.vrf_seed, record[32:]) and xmss.vrf_root(key.vrf_seed) == root:
+            key.vrf_state_loaded = True
+            loaded += 1
+        else:
+            logger.warning(f"VRF state of validator {key.validator_index} does not match its seed")
+    return loaded
 
 
 def vrf_proof(key: ValidatorKey, slot: int) -> list[bytes]:

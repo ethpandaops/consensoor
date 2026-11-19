@@ -276,16 +276,27 @@ def test_vrf_proof_opens_root():
                 value = keccak256(value + proof[height + 1])
         return value == root
 
-    seed = xmss.vrf_seed_from_privkey(42)
-    root = xmss.vrf_root(seed)
-    for slot in (0, 1, 1023, 1024, 2**20 - 1, 2**20, 2**31 - 1):
-        proof = xmss.vrf_proof(seed, slot)
-        assert len(proof) == 32
-        expected_leaf = keccak256(seed + slot.to_bytes(8, "little")) if slot < 2**20 else bytes(32)
-        assert proof[0] == expected_leaf
-        assert opens(proof, slot, root)
-        if slot < 2**20:
+    fixture = (Path(__file__).parent / "fixtures" / "vrf_state.bin").read_bytes()
+    seed, root, state = fixture[:32], fixture[32:64], fixture[64:]
+    xmss.vrf_set_filled_leaves(2**31)
+    try:
+        assert not xmss.vrf_load_state(seed, state[:4] + bytes(32) + state[36:])
+        assert xmss.vrf_load_state(seed, state)
+        assert xmss.vrf_root(seed) == root
+        for slot in (0, 1, 1023, 1024, 2**20 - 1):
+            proof = xmss.vrf_proof(seed, slot)
+            assert len(proof) == 32
+            assert proof[0] == keccak256(seed + slot.to_bytes(8, "little"))
+            assert opens(proof, slot, root)
             assert not opens(proof, slot ^ 1, root)
+    finally:
+        xmss.vrf_set_filled_leaves(2**20)
+    sparse_seed = xmss.vrf_seed_from_privkey(42)
+    sparse_root = xmss.vrf_root(sparse_seed)
+    for slot in (0, 2**20 - 1, 2**20, 2**31 - 1):
+        proof = xmss.vrf_proof(sparse_seed, slot)
+        assert proof[0] == (keccak256(sparse_seed + slot.to_bytes(8, "little")) if slot < 2**20 else bytes(32))
+        assert opens(proof, slot, sparse_root)
 
 
 def test_stark_stand_in_checks_leaf_and_signature():

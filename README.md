@@ -359,6 +359,8 @@ cd consensoor-xmss && go build -buildmode=c-shared -o libleanxmss.so .
 Validator keystores stay BLS keystores. For a signing secret key `sk` (32 bytes, big-endian) the node derives:
 
 - leanXMSS seed `sha256("leanxmss-seed" || sk)`, whose public key must be the validator's `pubkey` in the state
-- VRF seed `sha256("vrf-seed" || sk)`, VRF leaf `i` = `keccak256(vrf_seed || uint64_le(i))` for `i < 2**20` and 32 zero bytes above, in a keccak256 Merkle tree of depth 31 whose root must be the validator's `vrf_root`
+- VRF seed `sha256("vrf-seed" || sk)`, VRF leaf `i` = `keccak256(vrf_seed || uint64_le(i))` for every slot, in a keccak256 Merkle tree of depth 31 whose root must be the validator's `vrf_root`, as `compute_vrf_root` of the specification has it
+
+A VRF tree has `2**31` leaves, so the node keeps only the tree of the first `2**20` slots and the 11 hashes above it. `--vrf-state-url` names a file of precomputed states, 1028 bytes per validator index (the VRF root, then the compact state at slot 0: 4 zero bytes and the 31 siblings of leaf 0), from which the node fetches the range of its validators. A validator without one hashes its whole tree before its first proposal, which takes minutes.
 
 The signing root signed at every leaf is recorded in `<data-dir>/xmss_leaves.txt`, and the node refuses to sign a different message at a recorded leaf.

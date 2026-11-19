@@ -13,6 +13,7 @@ class ValidatorKey:
     validator_index: Optional[int] = None
     xmss_seed: Optional[bytes] = None
     vrf_seed: Optional[bytes] = None
+    vrf_state_loaded: bool = False
 
 
 @dataclass

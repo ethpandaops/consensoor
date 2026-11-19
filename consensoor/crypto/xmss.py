@@ -14,6 +14,7 @@ SIGNATURE_SIZE = 2404
 MESSAGE_SIZE = 32
 LEAF_INDEX_SIZE = 4
 VRF_PROOF_LENGTH = 32
+VRF_STATE_SIZE = 4 + 31 * 32
 
 SEED_DOMAIN = b"leanxmss-seed"
 VRF_SEED_DOMAIN = b"vrf-seed"
@@ -65,6 +66,10 @@ def _load() -> ctypes.CDLL:
     lib.vrf_root.restype = None
     lib.vrf_proof.argtypes = [ctypes.c_char_p, ctypes.c_uint64, ctypes.c_char_p]
     lib.vrf_proof.restype = None
+    lib.vrf_set_filled_leaves.argtypes = [ctypes.c_uint64]
+    lib.vrf_set_filled_leaves.restype = ctypes.c_int
+    lib.vrf_load_state.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    lib.vrf_load_state.restype = ctypes.c_int
     _lib = lib
     return lib
 
@@ -120,6 +125,17 @@ def vrf_root(vrf_seed: bytes) -> bytes:
     out = ctypes.create_string_buffer(32)
     _load().vrf_root(vrf_seed, out)
     return out.raw
+
+
+def vrf_set_filled_leaves(leaves: int) -> None:
+    """Zero the VRF leaves from ``leaves`` on, which only tests do: such a tree is not the specification's."""
+    if _load().vrf_set_filled_leaves(leaves) != 0:
+        raise ValueError(f"cannot fill {leaves} VRF leaves")
+
+
+def vrf_load_state(vrf_seed: bytes, state: bytes) -> bool:
+    assert len(state) == VRF_STATE_SIZE
+    return _load().vrf_load_state(vrf_seed, state) == 0
 
 
 def vrf_proof(vrf_seed: bytes, slot: int) -> list[bytes]:
