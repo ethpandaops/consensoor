@@ -1,6 +1,7 @@
 """Beacon API HTTP server."""
 
 import asyncio
+import bisect
 import json
 import logging
 import queue
@@ -62,6 +63,8 @@ class BeaconAPI:
         self._lc_finality_update = None
         self._lc_best_updates: dict[int, object] = {}
         self._blinded_types: dict[str, tuple] = {}
+        self._finalized_slots: list[int] = []
+        self._finalized_roots: list[bytes] = []
         self.runner: Optional[web.AppRunner] = None
         self._event_subscribers: list[asyncio.Queue] = []
         self._last_head_slot: int = 0
@@ -404,6 +407,10 @@ class BeaconAPI:
         state = node.state
         if slot < int(state.slot) <= slot + SLOTS_PER_HISTORICAL_ROOT():
             return bytes(state.block_roots[slot % SLOTS_PER_HISTORICAL_ROOT()])
+        self._index_finalized_chain()
+        if self._finalized_slots and slot <= self._finalized_slots[-1]:
+            position = bisect.bisect_right(self._finalized_slots, slot) - 1
+            return self._finalized_roots[position] if position >= 0 else None
         root = bytes(node.head_root)
         while True:
             block = node.store.get_block(root)
@@ -412,6 +419,27 @@ class BeaconAPI:
             if int(block.message.slot) <= slot:
                 return root
             root = bytes(block.message.parent_root)
+
+    def _index_finalized_chain(self) -> None:
+        node = self.node
+        root = bytes(node.state.finalized_checkpoint.root)
+        if self._finalized_roots and root == self._finalized_roots[-1]:
+            return
+        indexed = self._finalized_slots[-1] if self._finalized_slots else -1
+        slots: list[int] = []
+        roots: list[bytes] = []
+        while True:
+            block = node.store.get_block(root)
+            if block is None:
+                break
+            block_slot = int(block.message.slot)
+            if block_slot <= indexed:
+                break
+            slots.append(block_slot)
+            roots.append(root)
+            root = bytes(block.message.parent_root)
+        self._finalized_slots.extend(reversed(slots))
+        self._finalized_roots.extend(reversed(roots))
 
     def _canonical_root_at_slot(self, slot: int) -> Optional[bytes]:
         root = self._block_root_at_or_before(slot)
