@@ -712,6 +712,13 @@ class BeaconNode:
             logger.info(f"Loaded {len(keys)} validator keys")
             if self.state is not None and is_pq_state(self.state):
                 xmss_signer.configure(self.config.data_dir)
+                if self.config.xmss_cache_url:
+                    cached = await asyncio.to_thread(
+                        xmss_signer.load_xmss_caches, keys, self.state, self.config.xmss_cache_url
+                    )
+                    logger.info(
+                        f"Loaded the XMSS trees of {cached}/{len(keys)} keys from {self.config.xmss_cache_url}"
+                    )
                 await asyncio.to_thread(self.validator_client.use_xmss_keys)
                 await asyncio.to_thread(
                     self.validator_client.prepare_xmss_leaves, max(self._wall_slot(), 0)

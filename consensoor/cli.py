@@ -229,6 +229,13 @@ def cli():
     envvar="CONSENSOOR_VRF_STATE_URL",
 )
 @click.option(
+    "--xmss-cache-url",
+    default=None,
+    help="URL or path of the published XMSS tree cache, 14696 bytes per genesis validator index "
+         "(top tree and bottom trees 0 and 24576), fetched by range for our validators.",
+    envvar="CONSENSOOR_XMSS_CACHE_URL",
+)
+@click.option(
     "--target-gas-limit",
     type=int,
     default=None,
@@ -261,6 +268,7 @@ def run(
     fast_confirmation: bool,
     emit_payload_attributes: bool,
     vrf_state_url: Optional[str],
+    xmss_cache_url: Optional[str],
     target_gas_limit: int,
 ):
     """Run the consensus layer node."""
@@ -286,6 +294,7 @@ def run(
         jwt_secret_path=jwt_secret or "",
         validator_keys_spec=validator_keys or "",
         vrf_state_url=vrf_state_url or "",
+        xmss_cache_url=xmss_cache_url or "",
         fee_recipient=fee_recipient,
         graffiti=graffiti,
         genesis_state_path=genesis_state,
