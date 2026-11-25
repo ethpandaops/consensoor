@@ -98,7 +98,7 @@ def _fetch(
                 return f.read()
             f.seek(first * record_size)
             return f.read((last + 1 - first) * record_size)
-    headers = {"Accept-Encoding": "identity"}
+    headers = {"Accept-Encoding": "identity", "User-Agent": "consensoor"}
     if first is not None:
         headers["Range"] = f"bytes={first * record_size}-{(last + 1) * record_size - 1}"
     with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=120) as response:
