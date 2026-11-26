@@ -59,6 +59,33 @@ func xmss_public_key(seed *C.uint8_t, publicKeyOut *C.uint8_t) {
 	copy(unsafe.Slice((*byte)(unsafe.Pointer(publicKeyOut)), publicKeySize), privateKey(seed).PublicKey().Bytes())
 }
 
+//export xmss_seed_public_param
+func xmss_seed_public_param(seed *C.uint8_t, paramOut *C.uint8_t) {
+	param := leanxmss.SeedPublicParam(seedOf(seed))
+	copy(unsafe.Slice((*byte)(unsafe.Pointer(paramOut)), len(param)), param[:])
+}
+
+//export xmss_load_cache
+func xmss_load_cache(seed *C.uint8_t, publicKey *C.uint8_t, cache *C.uint8_t, cacheLen C.size_t) C.int {
+	pk, err := leanxmss.PublicKeyFromBytes(unsafe.Slice((*byte)(unsafe.Pointer(publicKey)), publicKeySize))
+	if err != nil {
+		return 1
+	}
+
+	s := seedOf(seed)
+
+	key, err := leanxmss.NewKeyFromCache(s, pk, C.GoBytes(unsafe.Pointer(cache), C.int(cacheLen)))
+	if err != nil {
+		return 1
+	}
+
+	keysMu.Lock()
+	keys[s] = key
+	keysMu.Unlock()
+
+	return 0
+}
+
 //export xmss_prepare
 func xmss_prepare(seed *C.uint8_t, leafIndex C.uint32_t) C.int {
 	if err := privateKey(seed).Prepare(uint32(leafIndex)); err != nil {

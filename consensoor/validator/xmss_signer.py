@@ -82,16 +82,69 @@ async def sign_async(key: ValidatorKey, leaf_index: int, signing_root: bytes) ->
 
 
 VRF_RECORD_SIZE = 32 + xmss.VRF_STATE_SIZE
+MAX_XMSS_CACHE_RECORDS = 10_000
 
 
-def _fetch(url: str, first: Optional[int] = None, last: Optional[int] = None) -> bytes:
-    headers = {}
+def _fetch(
+    url: str,
+    first: Optional[int] = None,
+    last: Optional[int] = None,
+    record_size: int = VRF_RECORD_SIZE,
+) -> bytes:
+    if "://" not in url or url.startswith("file://"):
+        path = url[len("file://"):] if url.startswith("file://") else url
+        with open(path, "rb") as f:
+            if first is None:
+                return f.read()
+            f.seek(first * record_size)
+            return f.read((last + 1 - first) * record_size)
+    headers = {"Accept-Encoding": "identity", "User-Agent": "consensoor"}
     if first is not None:
-        headers["Range"] = f"bytes={first * VRF_RECORD_SIZE}-{(last + 1) * VRF_RECORD_SIZE - 1}"
+        headers["Range"] = f"bytes={first * record_size}-{(last + 1) * record_size - 1}"
     with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=120) as response:
         if first is not None and response.status != 206:
             raise ValueError(f"range request answered with status {response.status}")
         return response.read()
+
+
+def load_xmss_caches(keys: list[ValidatorKey], state, url: str) -> int:
+    """Load the XMSS trees of each key from its record in the published tree cache at url.
+
+    The records follow the validator indices of the genesis, 14,696 bytes each, and hold no public key:
+    a key's record is the one of the validator whose XMSS public key ends with the key's public parameter.
+    """
+    pubkeys = [bytes(v.pubkey) for v in list(state.validators)[:MAX_XMSS_CACHE_RECORDS]]
+    by_param: dict[bytes, int] = {}
+    ambiguous = set()
+    for index, pubkey in enumerate(pubkeys):
+        param = pubkey[-xmss.PUBLIC_PARAM_SIZE:]
+        if param in by_param:
+            ambiguous.add(param)
+        by_param[param] = index
+    wanted: dict[int, ValidatorKey] = {}
+    for key in keys:
+        if key.xmss_seed is None:
+            key.xmss_seed = xmss.seed_from_privkey(key.privkey)
+        param = xmss.seed_public_param(key.xmss_seed)
+        if param in by_param and param not in ambiguous:
+            wanted[by_param[param]] = key
+    if not wanted:
+        return 0
+    first, last = min(wanted), max(wanted)
+    size = xmss.TREE_CACHE_RECORD_SIZE
+    try:
+        data = _fetch(url, first, last, size)
+    except Exception as e:
+        logger.warning(f"Cannot fetch the XMSS tree cache from {url}: {e}")
+        return 0
+    loaded = 0
+    for index, key in wanted.items():
+        record = data[(index - first) * size:(index - first + 1) * size]
+        if len(record) == size and xmss.load_cache(key.xmss_seed, pubkeys[index], record):
+            loaded += 1
+        else:
+            logger.warning(f"XMSS tree cache record {index} does not match its key, building the key")
+    return loaded
 
 
 def load_vrf_states(keys: list[ValidatorKey], state, url: str) -> int:

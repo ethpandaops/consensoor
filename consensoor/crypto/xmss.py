@@ -10,6 +10,8 @@ from typing import Optional, Sequence
 from . import leanvm
 
 PUBKEY_SIZE = 32
+PUBLIC_PARAM_SIZE = 16
+TREE_CACHE_RECORD_SIZE = 4096 + 2 * 5300
 SIGNATURE_SIZE = 2404
 MESSAGE_SIZE = 32
 LEAF_INDEX_SIZE = 4
@@ -56,6 +58,10 @@ def _load() -> ctypes.CDLL:
         )
     lib.xmss_public_key.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
     lib.xmss_public_key.restype = None
+    lib.xmss_seed_public_param.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+    lib.xmss_seed_public_param.restype = None
+    lib.xmss_load_cache.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
+    lib.xmss_load_cache.restype = ctypes.c_int
     lib.xmss_prepare.argtypes = [ctypes.c_char_p, ctypes.c_uint32]
     lib.xmss_prepare.restype = ctypes.c_int
     lib.xmss_sign.argtypes = [ctypes.c_char_p, ctypes.c_uint32, ctypes.c_char_p, ctypes.c_char_p]
@@ -86,6 +92,17 @@ def public_key(seed: bytes) -> bytes:
     out = ctypes.create_string_buffer(PUBKEY_SIZE)
     _load().xmss_public_key(seed, out)
     return out.raw
+
+
+def seed_public_param(seed: bytes) -> bytes:
+    out = ctypes.create_string_buffer(PUBLIC_PARAM_SIZE)
+    _load().xmss_seed_public_param(seed, out)
+    return out.raw
+
+
+def load_cache(seed: bytes, pubkey: bytes, cache: bytes) -> bool:
+    assert len(pubkey) == PUBKEY_SIZE
+    return _load().xmss_load_cache(seed, pubkey, cache, len(cache)) == 0
 
 
 def prepare(seed: bytes, leaf_index: int) -> None:
